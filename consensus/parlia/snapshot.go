@@ -316,7 +316,7 @@ func (s *Snapshot) apply(headers []*types.Header, chain consensus.ChainHeaderRea
 			return nil, errUnauthorizedValidator(validator.String())
 		}
 		if chainConfig.IsBohr(header.Number, header.Time) {
-			if snap.SignRecently(validator) {
+			if snap.SignRecently(validator) && chainConfig.Parlia.Slash {
 				return nil, errRecentlySigned
 			}
 		} else {

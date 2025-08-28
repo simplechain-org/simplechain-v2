@@ -332,6 +332,13 @@ func (p *Parlia) IsSystemContract(to *common.Address) bool {
 	return isToSystemContract(*to)
 }
 
+func (p *Parlia) IsSlash() bool {
+	if p.chainConfig.Parlia == nil {
+		return false
+	}
+	return p.chainConfig.Parlia.Slash
+}
+
 // Author implements consensus.Engine, returning the SystemAddress
 func (p *Parlia) Author(header *types.Header) (common.Address, error) {
 	return header.Coinbase, nil
@@ -946,7 +953,7 @@ func (p *Parlia) verifySeal(chain consensus.ChainHeaderReader, header *types.Hea
 		return errUnauthorizedValidator(signer.String())
 	}
 
-	if snap.SignRecently(signer) {
+	if snap.SignRecently(signer) && p.IsSlash() {
 		return errRecentlySigned
 	}
 
@@ -1420,7 +1427,7 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 			}
 		}
 
-		if !signedRecently {
+		if !signedRecently && p.IsSlash() {
 			log.Trace("slash validator", "block hash", header.Hash(), "address", spoiledVal)
 			err = p.slash(spoiledVal, state, header, cx, txs, receipts, systemTxs, usedGas, false, tracer)
 			if err != nil {
@@ -1522,7 +1529,7 @@ func (p *Parlia) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *
 				}
 			}
 		}
-		if !signedRecently {
+		if !signedRecently && p.IsSlash() {
 			err = p.slash(spoiledVal, state, header, cx, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
 			if err != nil {
 				// it is possible that slash validator failed because of the slash channel is disabled.
@@ -1700,7 +1707,7 @@ func (p *Parlia) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 	}
 
 	// If we're amongst the recent signers, wait for the next block
-	if snap.SignRecently(val) {
+	if snap.SignRecently(val) && p.IsSlash() {
 		log.Info("Signed recently, must wait for others")
 		return nil
 	}

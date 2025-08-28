@@ -467,7 +467,7 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 					log.Debug("Not allowed to propose block", "err", err)
 					continue
 				}
-				if signedRecent {
+				if signedRecent && p.IsSlash() {
 					timer.Reset(recommit)
 					log.Info("Signed recently, must wait")
 					continue

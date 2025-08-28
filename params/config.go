@@ -193,7 +193,9 @@ var (
 		MaxwellTime:         newUint64(1751250600), // 2025-06-30 02:30:00 AM UTC
 		FermiTime:           nil,
 
-		Parlia: &ParliaConfig{},
+		Parlia: &ParliaConfig{
+			Slash: false,
+		},
 		BlobScheduleConfig: &BlobScheduleConfig{
 			Cancun: DefaultCancunBlobConfig,
 			Prague: DefaultPragueBlobConfigBSC,
@@ -240,7 +242,9 @@ var (
 		MaxwellTime:         newUint64(1748243100), // 2025-05-26 07:05:00 AM UTC
 		FermiTime:           nil,
 
-		Parlia: &ParliaConfig{},
+		Parlia: &ParliaConfig{
+			Slash: false,
+		},
 		BlobScheduleConfig: &BlobScheduleConfig{
 			Cancun: DefaultCancunBlobConfig,
 			Prague: DefaultPragueBlobConfigBSC,
@@ -289,7 +293,9 @@ var (
 		// TODO: set them to `0` when passed on the mainnet
 		FermiTime: nil,
 
-		Parlia: &ParliaConfig{},
+		Parlia: &ParliaConfig{
+			Slash: false,
+		},
 		BlobScheduleConfig: &BlobScheduleConfig{
 			Cancun: DefaultCancunBlobConfig,
 			Prague: DefaultPragueBlobConfigBSC,
@@ -328,7 +334,9 @@ var (
 		FeynmanFixTime:      newUint64(0),
 		CancunTime:          newUint64(0),
 
-		Parlia: &ParliaConfig{},
+		Parlia: &ParliaConfig{
+			Slash: false,
+		},
 		BlobScheduleConfig: &BlobScheduleConfig{
 			Cancun: DefaultCancunBlobConfig,
 		},
@@ -673,6 +681,7 @@ func (c CliqueConfig) String() string {
 
 // ParliaConfig is the consensus engine configs for proof-of-staked-authority based sealing.
 type ParliaConfig struct {
+	Slash bool `json:"slash"`
 }
 
 // String implements the stringer interface, returning the consensus engine details.
