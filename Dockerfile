@@ -22,11 +22,11 @@ RUN cd /go-ethereum && go run build/ci.go install -static ./cmd/geth
 # Pull Geth into a second stage deploy alpine container
 FROM alpine:3.21
 
-ARG BSC_USER=bsc
+ARG BSC_USER=sipc2
 ARG BSC_USER_UID=1000
 ARG BSC_USER_GID=1000
 
-ENV BSC_HOME=/bsc
+ENV BSC_HOME=/home/sipc2
 ENV HOME=${BSC_HOME}
 ENV DATA_DIR=/data
 
