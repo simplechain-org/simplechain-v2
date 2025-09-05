@@ -37,7 +37,7 @@ services:
       timeout: 3s
     volumes:
       - data:/data
-      - config:/bsc/config
+      - config:/home/sipc2/config
 
 volumes:
   config:
@@ -45,10 +45,10 @@ volumes:
     driver_opts:
       type: 'none'
       o: 'bind'
-      device: '/tmp/bsc/config/mainnet'
+      device: '/tmp/sipc2/config/mainnet'
   data:
     driver: local
     driver_opts:
       type: 'none'
       o: 'bind'
-      device: '/tmp/bsc/data/mainnet'
+      device: '/tmp/sipc2/data/mainnet'
