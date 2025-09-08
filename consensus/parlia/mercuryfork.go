@@ -13,17 +13,17 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
-func (p *Parlia) getBlockAward(blockNr rpc.BlockNumberOrHash) (*big.Int, error) {
+func (p *Parlia) getBlockReward(blockNr rpc.BlockNumberOrHash) (*big.Int, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	method := "BLOCK_AWARD"
+	method := "BLOCK_REWARD"
 	toAddress := common.HexToAddress(systemcontracts.ValidatorContract)
 	gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
 
 	data, err := p.validatorSetABI.Pack(method)
 	if err != nil {
-		log.Error("Unable to pack tx for getBlockAward", "error", err)
+		log.Error("Unable to pack tx for getBlockReward", "error", err)
 		return nil, err
 	}
 	msgData := (hexutil.Bytes)(data)

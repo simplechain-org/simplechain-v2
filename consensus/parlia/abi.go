@@ -2010,7 +2010,7 @@ const validatorSetABI = `
   },
   {
     "type": "function",
-    "name": "BLOCK_AWARD",
+    "name": "BLOCK_REWARD",
     "inputs": [],
     "outputs": [
       {
