@@ -1965,8 +1965,16 @@ func (p *Parlia) distributeIncoming(val common.Address, state vm.StateDB, header
 	}
 
 	state.SetBalance(consensus.SystemAddress, common.U2560, tracing.BalanceDecreaseBSCDistributeReward)
+
+	blockNr := rpc.BlockNumberOrHashWithHash(header.ParentHash, false)
+	award, err := p.getBlockAward(blockNr)
+	if err != nil {
+		log.Error("Unable to get block award", "error", err)
+	} else {
+		balance.Add(balance, uint256.NewInt(award.Uint64()))
+	}
 	state.AddBalance(coinbase, balance, tracing.BalanceIncreaseBSCDistributeReward)
-	log.Trace("distribute to validator contract", "block hash", header.Hash(), "amount", balance)
+	log.Trace("distribute to validator contract", "block hash", header.Hash(), "amount", balance, "blockAward", award)
 	return p.distributeToValidator(balance.ToBig(), val, state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
 }
 

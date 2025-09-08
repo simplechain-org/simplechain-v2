@@ -2010,6 +2010,19 @@ const validatorSetABI = `
   },
   {
     "type": "function",
+    "name": "BLOCK_AWARD",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "bscChainID",
     "inputs": [],
     "outputs": [
