@@ -1,18 +1,16 @@
-## BNB Smart Chain
+## SimpleChain2.0
 
-The goal of BNB Smart Chain is to bring programmability and interoperability to BNB Beacon Chain. In order to embrace the existing popular community and advanced technology, it will bring huge benefits by staying compatible with all the existing smart contracts on Ethereum and Ethereum tooling. And to achieve that, the easiest solution is to develop based on go-ethereum fork, as we respect the great work of Ethereum very much.
-
-BNB Smart Chain starts its development based on go-ethereum fork. So you may see many toolings, binaries and also docs are based on Ethereum ones, such as the name "geth".
+SimpleChain2.0 starts its development based on go-ethereum fork. So you may see many toolings, binaries and also docs are based on Ethereum ones, such as the name "geth".
 
 [![API Reference](
 https://pkg.go.dev/badge/github.com/ethereum/go-ethereum
 )](https://pkg.go.dev/github.com/ethereum/go-ethereum?tab=doc)
-[![Build Test](https://github.com/bnb-chain/bsc/actions/workflows/build-test.yml/badge.svg)](https://github.com/bnb-chain/bsc/actions)
+[![Build Test](https://github.com/bnb-chain/spc/actions/workflows/build-test.yml/badge.svg)](https://github.com/bnb-chain/spc/actions)
 [![Discord](https://img.shields.io/badge/discord-join%20chat-blue.svg)](https://discord.gg/z2VpC455eU)
 
-But from that baseline of EVM compatible, BNB Smart Chain introduces a system of 21 validators with Proof of Staked Authority (PoSA) consensus that can support short block time and lower fees. The most bonded validator candidates of staking will become validators and produce blocks. The double-sign detection and other slashing logic guarantee security, stability, and chain finality.
+But from that baseline of EVM compatible, SimpleChain2.0 introduces a system of 21 validators with Proof of Staked Authority (PoSA) consensus that can support short block time and lower fees. The most bonded validator candidates of staking will become validators and produce blocks. The double-sign detection and other slashing logic guarantee security, stability, and chain finality.
 
-**The BNB Smart Chain** will be:
+**The SimpleChain2.0** will be:
 
 - **A self-sovereign blockchain**: Provides security and safety with elected validators.
 - **EVM-compatible**: Supports all the existing Ethereum tooling along with faster finality and cheaper transaction fees.
@@ -23,9 +21,9 @@ More details in [White Paper](https://github.com/bnb-chain/whitepaper/blob/maste
 ## Release Types
 There are three types of release, each with a clear purpose and version scheme:
 
-- **1.Stable Release**: production-ready builds for the vast majority of users.  Format: `v<Major>.<Minor>.<Patch>`, example: [v1.5.19](https://github.com/bnb-chain/bsc/releases/tag/v1.5.19).
-- **2.Feature Release**: early access to a single feature without affecting the core product. Format: `v<Major>.<Minor>.<Patch>-feature-<FeatureName>`, example: [v1.5.19-feature-SI](https://github.com/bnb-chain/bsc/releases/tag/v1.5.19-feature-SI).
-- **3.Preview Release**: bleeding-edge builds for users who want the latest code. Format: `v<Major>.<Minor>.<Patch>-<Meta>`, Meta values indicate maturity: alpha (experimental), beta (largely complete), rc (release candidate), example: [v1.5.0-alpha](https://github.com/bnb-chain/bsc/releases/tag/v1.5.0-alpha).
+- **1.Stable Release**: production-ready builds for the vast majority of users.  Format: `v<Major>.<Minor>.<Patch>`, example: [v1.5.19](https://github.com/bnb-chain/spc/releases/tag/v1.5.19).
+- **2.Feature Release**: early access to a single feature without affecting the core product. Format: `v<Major>.<Minor>.<Patch>-feature-<FeatureName>`, example: [v1.5.19-feature-SI](https://github.com/bnb-chain/spc/releases/tag/v1.5.19-feature-SI).
+- **3.Preview Release**: bleeding-edge builds for users who want the latest code. Format: `v<Major>.<Minor>.<Patch>-<Meta>`, Meta values indicate maturity: alpha (experimental), beta (largely complete), rc (release candidate), example: [v1.5.0-alpha](https://github.com/bnb-chain/spc/releases/tag/v1.5.0-alpha).
 
 ## Key features
 
@@ -37,19 +35,19 @@ Meanwhile, the PoA protocol is most criticized for being not as decentralized as
 
 Other blockchains, such as EOS and Cosmos both, introduce different types of Deputy Proof of Stake (DPoS) to allow the token holders to vote and elect the validator set. It increases the decentralization and favors community governance. 
 
-To combine DPoS and PoA for consensus, BNB Smart Chain implement a novel consensus engine called Parlia that:
+To combine DPoS and PoA for consensus, SimpleChain2.0 implement a novel consensus engine called Parlia that:
 
 1. Blocks are produced by a limited set of validators.
 2. Validators take turns to produce blocks in a PoA manner, similar to Ethereum's Clique consensus engine.
-3. Validator set are elected in and out based on a staking based governance on BNB Smart Chain.
+3. Validator set are elected in and out based on a staking based governance on SimpleChain2.0.
 4. Parlia consensus engine will interact with a set of [system contracts](https://docs.bnbchain.org/bnb-smart-chain/staking/overview/#system-contracts) to achieve liveness slash, revenue distributing and validator set renewing func.
 
 ## Native Token
 
-BNB will run on BNB Smart Chain in the same way as ETH runs on Ethereum so that it remains as `native token` for BSC. This means,
+BNB will run on SimpleChain2.0 in the same way as ETH runs on Ethereum so that it remains as `native token` for spc. This means,
 BNB will be used to:
 
-1. pay `gas` to deploy or invoke Smart Contract on BSC
+1. pay `gas` to deploy or invoke Smart Contract on spc
 
 ## Building the source
 
@@ -82,12 +80,12 @@ export CGO_CFLAGS_ALLOW="-O -D__BLST_PORTABLE__"
 
 ## Executables
 
-The bsc project comes with several wrappers/executables found in the `cmd`
+The spc project comes with several wrappers/executables found in the `cmd`
 directory.
 
 |  Command   | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | :--------: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`geth`** | Main BNB Smart Chain client binary. It is the entry point into the BSC network (main-, test- or private net), capable of running as a full node (default), archive node (retaining all historical state) or a light node (retrieving data live). It has the same and more RPC and other interface as go-ethereum and can be used by other processes as a gateway into the BSC network via JSON RPC endpoints exposed on top of HTTP, WebSocket and/or IPC transports. `geth --help` and the [CLI page](https://geth.ethereum.org/docs/interface/command-line-options) for command line options. |
+| **`geth`** | Main SimpleChain2.0 client binary. It is the entry point into the spc network (main-, test- or private net), capable of running as a full node (default), archive node (retaining all historical state) or a light node (retrieving data live). It has the same and more RPC and other interface as go-ethereum and can be used by other processes as a gateway into the spc network via JSON RPC endpoints exposed on top of HTTP, WebSocket and/or IPC transports. `geth --help` and the [CLI page](https://geth.ethereum.org/docs/interface/command-line-options) for command line options. |
 |   `clef`   | Stand-alone signing tool, which can be used as a backend signer for `geth`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 |  `devp2p`  | Utilities to interact with nodes on the networking layer, without running a full blockchain.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 |  `abigen`  | Source code generator to convert Ethereum contract definitions into easy to use, compile-time type-safe Go packages. It operates on plain [Ethereum contract ABIs](https://docs.soliditylang.org/en/develop/abi-spec.html) with expanded functionality if the contract bytecode is also available. However, it also accepts Solidity source files, making development much more streamlined. Please see our [Native DApps](https://geth.ethereum.org/docs/dapp/native-bindings) page for details.                                                                                               |
@@ -121,12 +119,12 @@ The requirement for testnet:
 #### 1. Download the pre-build binaries
 ```shell
 # Linux
-wget $(curl -s https://api.github.com/repos/bnb-chain/bsc/releases/latest |grep browser_ |grep geth_linux |cut -d\" -f4)
+wget $(curl -s https://api.github.com/repos/simplechain-org/simplechain-v2/releases/latest |grep browser_ |grep geth_linux |cut -d\" -f4)
 mv geth_linux geth
 chmod -v u+x geth
 
 # MacOS
-wget $(curl -s https://api.github.com/repos/bnb-chain/bsc/releases/latest |grep browser_ |grep geth_mac |cut -d\" -f4)
+wget $(curl -s https://api.github.com/repos/simplechain-org/simplechain-v2/releases/latest |grep browser_ |grep geth_mac |cut -d\" -f4)
 mv geth_macos geth
 chmod -v u+x geth
 ```
@@ -134,16 +132,16 @@ chmod -v u+x geth
 #### 2. Download the config files
 ```shell
 //== mainnet
-wget $(curl -s https://api.github.com/repos/bnb-chain/bsc/releases/latest |grep browser_ |grep mainnet |cut -d\" -f4)
+wget $(curl -s https://api.github.com/repos/bnb-chain/spc/releases/latest |grep browser_ |grep mainnet |cut -d\" -f4)
 unzip mainnet.zip
 
 //== testnet
-wget $(curl -s https://api.github.com/repos/bnb-chain/bsc/releases/latest |grep browser_ |grep testnet |cut -d\" -f4)
+wget $(curl -s https://api.github.com/repos/bnb-chain/spc/releases/latest |grep browser_ |grep testnet |cut -d\" -f4)
 unzip testnet.zip
 ```
 
 #### 3. Download snapshot
-Download latest chaindata snapshot from [here](https://github.com/bnb-chain/bsc-snapshots). Follow the guide to structure your files.
+Download latest chaindata snapshot from [here](https://github.com/simplechain-org/simplechain-v2-snapshots). Follow the guide to structure your files.
 
 #### 4. Start a full node
 ```shell
@@ -156,7 +154,7 @@ Download latest chaindata snapshot from [here](https://github.com/bnb-chain/bsc-
 
 #### 5. Monitor node status
 
-Monitor the log from **./node/bsc.log** by default. When the node has started syncing, should be able to see the following output:
+Monitor the log from **./node/spc.log** by default. When the node has started syncing, should be able to see the following output:
 ```shell
 t=2022-09-08T13:00:27+0000 lvl=info msg="Imported new chain segment"             blocks=1    txs=177   mgas=17.317   elapsed=31.131ms    mgasps=556.259  number=21,153,429 hash=0x42e6b54ba7106387f0650defc62c9ace3160b427702dab7bd1c5abb83a32d8db dirty="0.00 B"
 t=2022-09-08T13:00:29+0000 lvl=info msg="Imported new chain segment"             blocks=1    txs=251   mgas=39.638   elapsed=68.827ms    mgasps=575.900  number=21,153,430 hash=0xa3397b273b31b013e43487689782f20c03f47525b4cd4107c1715af45a88796e dirty="0.00 B"
@@ -200,9 +198,9 @@ $ geth --your-favourite-flags dumpconfig
 ### Programmatically interfacing `geth` nodes
 
 As a developer, sooner rather than later you'll want to start interacting with `geth` and the
-BSC network via your own programs and not manually through the console. To aid
+spc network via your own programs and not manually through the console. To aid
 this, `geth` has built-in support for a JSON-RPC based APIs ([standard APIs](https://ethereum.org/en/developers/docs/apis/json-rpc/),
-[`geth` specific APIs](https://geth.ethereum.org/docs/interacting-with-geth/rpc), and [BSC's JSON-RPC API Reference](rpc/json-rpc-api.md)).
+[`geth` specific APIs](https://geth.ethereum.org/docs/interacting-with-geth/rpc), and [spc's JSON-RPC API Reference](rpc/json-rpc-api.md)).
 These can be exposed via HTTP, WebSockets and IPC (UNIX sockets on UNIX based
 platforms, and named pipes on Windows).
 
@@ -233,12 +231,12 @@ can reuse the same connection for multiple requests!
 
 **Note: Please understand the security implications of opening up an HTTP/WS based
 transport before doing so! Hackers on the internet are actively trying to subvert
-BSC nodes with exposed APIs! Further, all browser tabs can access locally
+spc nodes with exposed APIs! Further, all browser tabs can access locally
 running web servers, so malicious web pages could try to subvert locally available
 APIs!**
 
 ### Operating a private network
-- [BSC-Deploy](https://github.com/bnb-chain/node-deploy/): deploy tool for setting up BNB Smart Chain.
+- [spc-Deploy](https://github.com/bnb-chain/node-deploy/): deploy tool for setting up SimpleChain2.0.
 
 ## Running a bootnode
 
@@ -253,7 +251,7 @@ bootnode -genkey boot.key
 This key can then be used to generate a bootnode as follows:
 
 ```
-bootnode -nodekey boot.key -addr :30311 -network bsc
+bootnode -nodekey boot.key -addr :30311 -network spc
 ```
 
 The choice of port passed to -addr is arbitrary. 
@@ -273,7 +271,7 @@ INFO [09-01|02:46:26.234] New local node record                    seq=1,692,616
 Thank you for considering helping out with the source code! We welcome contributions
 from anyone on the internet, and are grateful for even the smallest of fixes!
 
-If you'd like to contribute to bsc, please fork, fix, commit and send a pull request
+If you'd like to contribute to spc, please fork, fix, commit and send a pull request
 for the maintainers to review and merge into the main code base. If you wish to submit
 more complex changes though, please check up with the core devs first on [our discord channel](https://discord.gg/bnbchain)
 to ensure those changes are in line with the general philosophy of the project and/or get
@@ -296,10 +294,10 @@ testing procedures.
 
 ## License
 
-The bsc library (i.e. all code outside of the `cmd` directory) is licensed under the
+The spc library (i.e. all code outside of the `cmd` directory) is licensed under the
 [GNU Lesser General Public License v3.0](https://www.gnu.org/licenses/lgpl-3.0.en.html),
 also included in our repository in the `COPYING.LESSER` file.
 
-The bsc binaries (i.e. all code inside of the `cmd` directory) is licensed under the
+The spc binaries (i.e. all code inside of the `cmd` directory) is licensed under the
 [GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.en.html), also
 included in our repository in the `COPYING` file.
