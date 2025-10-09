@@ -19,7 +19,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/systemcontracts/lorentz"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/luban"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/maxwell"
-	"github.com/ethereum/go-ethereum/core/systemcontracts/mercury"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/mirror"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/moran"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/niels"
@@ -1019,27 +1018,6 @@ func init() {
 				ContractAddr: common.HexToAddress(StakeHubContract),
 				CommitUrl:    "https://github.com/bnb-chain/bsc-genesis-contract/commit/bf3ac733f8aaf93ed88ca0ad2dcddd051166e4e1",
 				Code:         maxwell.RialtoStakeHubContract,
-			},
-		},
-	}
-
-	mercuryUpgrade[mainNet] = &Upgrade{
-		UpgradeName: "mercury",
-		Configs: []*UpgradeConfig{
-			{
-				ContractAddr: common.HexToAddress(ValidatorContract),
-				CommitUrl:    "https://github.com/bnb-chain/bsc-genesis-contract/commit/e0d0c5f0c0c7c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
-				Code:         mercury.MainnetValidatorContract,
-			},
-		},
-	}
-	mercuryUpgrade[chapelNet] = &Upgrade{
-		UpgradeName: "mercury",
-		Configs: []*UpgradeConfig{
-			{
-				ContractAddr: common.HexToAddress(ValidatorContract),
-				CommitUrl:    "https://github.com/bnb-chain/bsc-genesis-contract/commit/e0d0c5f0c0c7c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
-				Code:         mercury.ChapelValidatorContract,
 			},
 		},
 	}
