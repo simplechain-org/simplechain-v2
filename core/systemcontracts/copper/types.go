@@ -1,4 +1,4 @@
-package mercury
+package copper
 
 import _ "embed"
 
@@ -12,4 +12,10 @@ var (
 var (
 	//go:embed chapel/ValidatorContract
 	ChapelValidatorContract string
+)
+
+// contract codes for Default upgrade
+var (
+	//go:embed default/ValidatorContract
+	DefaultValidatorContract string
 )

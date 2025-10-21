@@ -694,6 +694,7 @@ type ChainConfig struct {
 	PlatoBlock      *big.Int `json:"platoBlock,omitempty"`      // platoBlock switch block (nil = no fork, 0 = already activated)
 	HertzBlock      *big.Int `json:"hertzBlock,omitempty"`      // hertzBlock switch block (nil = no fork, 0 = already activated)
 	HertzfixBlock   *big.Int `json:"hertzfixBlock,omitempty"`   // hertzfixBlock switch block (nil = no fork, 0 = already activated)
+	CopperBlock     *big.Int `json:"copperBlock,omitempty"`     // Copper switch block (nil = no fork, 0 = already on copper)
 
 	// Various consensus engines
 	Ethash             *EthashConfig       `json:"ethash,omitempty"`
@@ -869,6 +870,7 @@ func (c *ChainConfig) String() string {
 		c.PlatoBlock,
 		c.HertzBlock,
 		c.HertzfixBlock,
+		c.CopperBlock,
 		ShanghaiTime,
 		KeplerTime,
 		FeynmanTime,
@@ -1306,6 +1308,16 @@ func (c *ChainConfig) IsVerkleGenesis() bool {
 	return c.EnableVerkleAtGenesis
 }
 
+// IsLuban returns whether num is either equal to the first fast finality fork block or greater.
+func (c *ChainConfig) IsCopper(num *big.Int) bool {
+	return isBlockForked(c.CopperBlock, num)
+}
+
+// IsOnLuban returns whether num is equal to the first fast finality fork block.
+func (c *ChainConfig) IsOnCopper(num *big.Int) bool {
+	return configBlockEqual(c.CopperBlock, num)
+}
+
 // IsEIP4762 returns whether eip 4762 has been activated at given block.
 func (c *ChainConfig) IsEIP4762(num *big.Int, time uint64) bool {
 	return c.IsVerkle(num, time)
@@ -1360,6 +1372,7 @@ func (c *ChainConfig) CheckConfigForkOrder() error {
 		{name: "platoBlock", block: c.PlatoBlock},
 		{name: "hertzBlock", block: c.HertzBlock},
 		{name: "hertzfixBlock", block: c.HertzfixBlock},
+		{name: "copperBlock", block: c.CopperBlock},
 		{name: "keplerTime", timestamp: c.KeplerTime},
 		{name: "feynmanTime", timestamp: c.FeynmanTime},
 		{name: "feynmanFixTime", timestamp: c.FeynmanFixTime},
@@ -1543,6 +1556,9 @@ func (c *ChainConfig) checkCompatible(newcfg *ChainConfig, headNumber *big.Int, 
 	}
 	if isForkBlockIncompatible(c.HertzfixBlock, newcfg.HertzfixBlock, headNumber) {
 		return newBlockCompatError("hertzfix fork block", c.HertzfixBlock, newcfg.HertzfixBlock)
+	}
+	if isForkBlockIncompatible(c.CopperBlock, newcfg.CopperBlock, headNumber) {
+		return newBlockCompatError("copper fork block", c.CopperBlock, newcfg.CopperBlock)
 	}
 	if isForkTimestampIncompatible(c.ShanghaiTime, newcfg.ShanghaiTime, headTimestamp) {
 		return newTimestampCompatError("Shanghai fork timestamp", c.ShanghaiTime, newcfg.ShanghaiTime)
@@ -1802,6 +1818,7 @@ type Rules struct {
 	IsShanghai, IsKepler, IsFeynman, IsCancun, IsHaber      bool
 	IsBohr, IsPascal, IsPrague, IsLorentz, IsMaxwell        bool
 	IsFermi, IsOsaka, IsVerkle                              bool
+	IsCooper                                                bool
 }
 
 // Rules ensures c's ChainID is not nil.
@@ -1847,6 +1864,7 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 		IsFermi:          c.IsFermi(num, timestamp),
 		IsOsaka:          c.IsOsaka(num, timestamp),
 		IsVerkle:         c.IsVerkle(num, timestamp),
+		IsCooper:         c.IsCopper(num),
 		IsEIP4762:        isVerkle,
 	}
 }

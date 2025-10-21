@@ -10,6 +10,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/bohr"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/bruno"
+	"github.com/ethereum/go-ethereum/core/systemcontracts/copper"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/euler"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/feynman"
 	feynmanFix "github.com/ethereum/go-ethereum/core/systemcontracts/feynman_fix"
@@ -19,7 +20,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/systemcontracts/lorentz"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/luban"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/maxwell"
-	"github.com/ethereum/go-ethereum/core/systemcontracts/mercury"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/mirror"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/moran"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/niels"
@@ -94,7 +94,7 @@ var (
 
 	maxwellUpgrade = make(map[string]*Upgrade)
 
-	mercuryUpgrade = make(map[string]*Upgrade)
+	copperUpgrade = make(map[string]*Upgrade)
 )
 
 func init() {
@@ -1022,24 +1022,33 @@ func init() {
 			},
 		},
 	}
-
-	mercuryUpgrade[mainNet] = &Upgrade{
-		UpgradeName: "mercury",
+	copperUpgrade[chapelNet] = &Upgrade{
+		UpgradeName: "copper",
 		Configs: []*UpgradeConfig{
 			{
 				ContractAddr: common.HexToAddress(ValidatorContract),
-				CommitUrl:    "https://github.com/bnb-chain/bsc-genesis-contract/commit/e0d0c5f0c0c7c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
-				Code:         mercury.MainnetValidatorContract,
+				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
+				Code:         copper.ChapelValidatorContract,
 			},
 		},
 	}
-	mercuryUpgrade[chapelNet] = &Upgrade{
-		UpgradeName: "mercury",
+	copperUpgrade[defaultNet] = &Upgrade{
+		UpgradeName: "copper",
 		Configs: []*UpgradeConfig{
 			{
 				ContractAddr: common.HexToAddress(ValidatorContract),
-				CommitUrl:    "https://github.com/bnb-chain/bsc-genesis-contract/commit/e0d0c5f0c0c7c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
-				Code:         mercury.ChapelValidatorContract,
+				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
+				Code:         copper.DefaultValidatorContract,
+			},
+		},
+	}
+	copperUpgrade[mainNet] = &Upgrade{
+		UpgradeName: "copper",
+		Configs: []*UpgradeConfig{
+			{
+				ContractAddr: common.HexToAddress(ValidatorContract),
+				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
+				Code:         copper.ChapelValidatorContract,
 			},
 		},
 	}
@@ -1158,6 +1167,9 @@ func upgradeBuildInSystemContract(config *params.ChainConfig, blockNumber *big.I
 		applySystemContractUpgrade(maxwellUpgrade[network], blockNumber, statedb, logger)
 	}
 
+	if config.IsOnCopper(blockNumber) {
+		applySystemContractUpgrade(copperUpgrade[network], blockNumber, statedb, logger)
+	}
 	/*
 		apply other upgrades
 	*/
