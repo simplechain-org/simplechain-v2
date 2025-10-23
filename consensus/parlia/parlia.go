@@ -2032,7 +2032,9 @@ func (p *Parlia) distributeIncoming(val common.Address, state vm.StateDB, header
 	reward, err := p.getBlockReward(blockNr)
 	if err != nil {
 		log.Error("Unable to get block reward", "error", err)
-	} else if val == coinbase {
+		return nil, err
+	}
+	if val == coinbase {
 		balance.Add(balance, uint256.NewInt(reward.Uint64()))
 	}
 	state.AddBalance(coinbase, balance, tracing.BalanceIncreaseBSCDistributeReward)

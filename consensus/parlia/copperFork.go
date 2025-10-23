@@ -335,21 +335,70 @@ func (p *Parlia) getValidatorCommissionRate(blockNr rpc.BlockNumberOrHash, val c
 	return unpacked[0].(*big.Int), nil
 }
 
-func (p *Parlia) CalculateRewardByRate(blockNr rpc.BlockNumberOrHash, rate float64, annualBlockCountEveryYear *big.Int,
+// CalculateRewardByRateWithBigInt calculates reward using big.Int arithmetic with fast exponentiation
+// rate is in basis points (e.g., 500 for 5%)
+// Formula: reward = totalPooled * ((1 + rate/10000/annualBlockCountEveryYear)^annualBlockCountEveryEpoch - 1)
+func (p *Parlia) CalculateRewardByRate(rate *big.Int, annualBlockCountEveryYear *big.Int,
 	annualBlockCountEveryEpoch *big.Int, totalPooled *big.Int) *big.Int {
-	rateFloat, _ := big.NewFloat(rate).Float64()
-	annualBlocksYear, _ := new(big.Float).SetInt(annualBlockCountEveryYear).Float64()
-	annualBlocksEpoch, _ := new(big.Float).SetInt(annualBlockCountEveryEpoch).Float64()
 
-	ratePerBlock := 1 + rateFloat/annualBlocksYear
-	compoundRate := math.Pow(ratePerBlock, annualBlocksEpoch) - 1
+	// Scale factor: 10^13 to maintain precision (4 significant digits for the tiny ratePerBlock)
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(13), nil)
 
-	// Calculate basic reward: totalPooled * compoundRate
-	rewardFloat := new(big.Float).SetInt(totalPooled)
-	rewardFloat.Mul(rewardFloat, big.NewFloat(compoundRate))
-	reward, _ := rewardFloat.Int(nil)
+	// ratePerBlock = rate / 10000 / annualBlockCountEveryYear
+	// ratePerBlockScaled = rate * scale / 10000 / annualBlockCountEveryYear
+	ratePerBlockScaled := new(big.Int).Mul(rate, scale)
+	ratePerBlockScaled.Div(ratePerBlockScaled, big.NewInt(10000))
+	ratePerBlockScaled.Div(ratePerBlockScaled, annualBlockCountEveryYear)
+
+	// base = (1 + ratePerBlock) * scale = scale + ratePerBlockScaled
+	base := new(big.Int).Add(scale, ratePerBlockScaled)
+
+	// Use fast exponentiation to calculate base^annualBlocksEpoch
+	// Each multiplication divides by scale to keep the number from growing too large
+	result := powerWithScale(base, annualBlockCountEveryEpoch, scale)
+
+	// result is now (1 + ratePerBlock)^annualBlocksEpoch * scale
+	// compoundRate = result - scale (this is the actual rate multiplied by scale)
+	compoundRate := new(big.Int).Sub(result, scale)
+
+	// reward = totalPooled * compoundRate / scale
+	reward := new(big.Int).Mul(totalPooled, compoundRate)
+	reward.Div(reward, scale)
+
 	return reward
+}
 
+// powerWithScale calculates base^exp using fast exponentiation (binary exponentiation)
+// where base is already scaled up by scale
+// Each multiplication is followed by division by scale to maintain precision without overflow
+func powerWithScale(base *big.Int, exp *big.Int, scale *big.Int) *big.Int {
+	if exp.Cmp(big.NewInt(0)) == 0 {
+		return new(big.Int).Set(scale) // base^0 = 1, scaled is scale
+	}
+
+	// Initialize result to 1 * scale
+	result := new(big.Int).Set(scale)
+	currentBase := new(big.Int).Set(base)
+	currentExp := new(big.Int).Set(exp)
+
+	// Fast exponentiation algorithm
+	for currentExp.Cmp(big.NewInt(0)) > 0 {
+		// If current exponent is odd, multiply result by currentBase
+		if new(big.Int).And(currentExp, big.NewInt(1)).Cmp(big.NewInt(1)) == 0 {
+			// result = (result * currentBase) / scale
+			result.Mul(result, currentBase)
+			result.Div(result, scale)
+		}
+
+		// Square the base: currentBase = (currentBase * currentBase) / scale
+		currentBase = new(big.Int).Mul(currentBase, currentBase)
+		currentBase.Div(currentBase, scale)
+
+		// Divide exponent by 2 (right shift by 1 bit)
+		currentExp.Rsh(currentExp, 1)
+	}
+
+	return result
 }
 
 func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeaderReader, state vm.StateDB, header *types.Header,
@@ -358,6 +407,7 @@ func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeade
 	cx := chainContext{Chain: chain, parlia: p}
 	totalReward := new(big.Int).SetUint64(0)
 	breatheBlockFee := state.GetBalance(consensus.SystemAddress)
+	index := header.Time/params.BreatheBlockInterval - 1
 	snap, err := p.snapshot(chain, header.Number.Uint64()-1, header.ParentHash, nil)
 	if err != nil {
 		return nil, err
@@ -368,7 +418,7 @@ func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeade
 	if err != nil {
 		return nil, err
 	}
-	nominalInterestRateFloat := float64(nominalInterestRate.Uint64()) / float64(10000)
+
 	totalIssuedSupply, totalBurnedSupply, err := p.getTotalSupply(blockNr)
 	if err != nil {
 		return nil, err
@@ -385,10 +435,8 @@ func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeade
 	}
 
 	state.SetBalance(consensus.SystemAddress, common.U2560, tracing.BalanceDecreaseBSCDistributeReward)
-	// calculate basic reward of all validators
+	// calculate basic and contribution reward of all validators
 	for _, operatorAddr := range allValidators {
-		index := new(big.Int).Div(new(big.Int).SetUint64(header.Time), new(big.Int).SetUint64(params.BreatheBlockInterval))
-
 		totalDelegated, totalPooled, selfDelegated, err := p.getValidatorDelegatedAmount(blockNr, operatorAddr)
 		if err != nil {
 			return nil, err
@@ -399,7 +447,7 @@ func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeade
 		log.Debug("annualBlockCountEveryEpoch", "block hash", header.Hash(), "annualBlockCountEveryEpoch", annualBlockCountEveryEpoch)
 
 		// Calculate (1 + nominalInterestRate/annualBlockCountEveryYear)^annualBlockCountEveryEpoch - 1
-		basicReward := p.CalculateRewardByRate(blockNr, nominalInterestRateFloat, annualBlockCountEveryYear, annualBlockCountEveryEpoch, totalPooled)
+		basicReward := p.CalculateRewardByRate(nominalInterestRate, annualBlockCountEveryYear, annualBlockCountEveryEpoch, totalPooled)
 
 		log.Info("calculate basic reward", "block hash", header.Hash(), "address", p.val, "totalPooled", totalPooled, "basicReward", basicReward)
 		state.AddBalance(consensus.SystemAddress, uint256.MustFromBig(basicReward), tracing.BalanceIncreaseBasicReward)
@@ -413,60 +461,58 @@ func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeade
 			state.AddBalance(consensus.SystemAddress, breatheBlockFee, tracing.BalanceIncreaseBasicReward)
 		}
 
-		inTurnCounts, outTurnCounts, err := p.getValidatorUptimeRecord(blockNr, *consensusAddress, index)
+		upTimeIndex := big.NewInt(int64(index))
+		inTurnCounts, outTurnCounts, err := p.getValidatorUptimeRecord(blockNr, *consensusAddress, upTimeIndex)
 		if err != nil {
 			return nil, err
 		}
 
 		// Calculate uptime rate: inTurnCounts / (inTurnCounts + outTurnCounts)
 		totalTurnCounts := new(big.Int).Add(inTurnCounts, outTurnCounts)
-		uptimeRateFloat := float64(0)
+		uptimeRate := big.NewInt(0)
 		if totalTurnCounts.Cmp(big.NewInt(0)) > 0 {
-			inTurnFloat := new(big.Float).SetInt(inTurnCounts)
-			totalTurnFloat := new(big.Float).SetInt(totalTurnCounts)
-			uptimeRateBigFloat := new(big.Float).Quo(inTurnFloat, totalTurnFloat)
-			uptimeRateFloat, _ = uptimeRateBigFloat.Float64()
+			uptimeRate = new(big.Int).Mul(inTurnCounts, big.NewInt(10000))
+			uptimeRate.Div(uptimeRate, totalTurnCounts)
 		}
-		log.Debug("uptimeRate", "block hash", header.Hash(), "uptimeRate", uptimeRateFloat)
+		log.Debug("uptimeRate", "block hash", header.Hash(), "uptimeRate", uptimeRate)
 
 		// Calculate contribution staking ratio: totalDelegated / totalPooled
-		contributionStakingRatio := new(big.Float).SetInt(totalDelegated)
-		contributionStakingRatio.Quo(contributionStakingRatio, new(big.Float).SetInt(totalPooled))
-		contributionStakingRatioFloat, _ := contributionStakingRatio.Float64()
-		log.Debug("contributionStakingRatio", "block hash", header.Hash(), "contributionStakingRatio", contributionStakingRatioFloat)
+		contributionStakingRatio := new(big.Int).Mul(totalDelegated, big.NewInt(10000))
+		contributionStakingRatio.Div(contributionStakingRatio, totalPooled)
+		log.Debug("contributionStakingRatio", "block hash", header.Hash(), "contributionStakingRatio", contributionStakingRatio)
 		// Calculate total network-wide staking ratio: validatorsTotalPooled / (totalIssuedSupply - totalBurnedSupply)
 		totalSupply := new(big.Int).Sub(totalIssuedSupply, totalBurnedSupply)
-		totalNetworkStakingRatio := new(big.Float).SetInt(validatorsTotalPooled)
-		totalNetworkStakingRatio.Quo(totalNetworkStakingRatio, new(big.Float).SetInt(totalSupply))
-		totalNetworkStakingRatioFloat, _ := totalNetworkStakingRatio.Float64()
-		log.Debug("totalNetworkStakingRatio", "block hash", header.Hash(), "totalNetworkStakingRatio", totalNetworkStakingRatioFloat)
+		totalNetworkStakingRatio := new(big.Int).Mul(validatorsTotalPooled, big.NewInt(10000))
+		totalNetworkStakingRatio.Div(totalNetworkStakingRatio, totalSupply)
+		log.Debug("totalNetworkStakingRatio", "block hash", header.Hash(), "totalNetworkStakingRatio", totalNetworkStakingRatio)
 
 		inflationRate, err := p.getInflationRate(blockNr)
 		if err != nil {
 			return nil, err
 		}
-		inflationRateFloat, _ := new(big.Float).Quo(new(big.Float).SetInt(inflationRate), big.NewFloat(10000)).Float64()
 		commissionRateBig, err := p.getValidatorCommissionRate(blockNr, operatorAddr)
 		if err != nil {
 			return nil, err
 		}
-		commissionRateFloat, _ := new(big.Float).Quo(new(big.Float).SetInt(commissionRateBig), big.NewFloat(10000)).Float64()
-		log.Debug("commissionRate", "block hash", header.Hash(), "commissionRateBig", commissionRateBig, "commissionRateFloat", commissionRateFloat)
+		log.Debug("commissionRate", "block hash", header.Hash(), "commissionRateBig", commissionRateBig)
 
 		// Calculate contribution reward rate
 		// contributionRewardRate = inflationRate * uptimeRate * (1 - commissionRate) * totalNetworkStakingRatio * sqrt(contributionStakingRatio)
-		contributionRewardRate := inflationRateFloat * uptimeRateFloat * (1 - commissionRateFloat) * totalNetworkStakingRatioFloat * math.Sqrt(contributionStakingRatioFloat)
+		contributionRewardRate := new(big.Int).Mul(inflationRate, uptimeRate)
+		contributionRewardRate.Mul(contributionRewardRate, new(big.Int).Sub(big.NewInt(10000), commissionRateBig))
+		contributionRewardRate.Mul(contributionRewardRate, totalNetworkStakingRatio)
+		contributionRewardRate.Mul(contributionRewardRate, contributionStakingRatio)
 
 		log.Debug("contributionRewardRate", "block hash", header.Hash(), "contributionRewardRate", contributionRewardRate)
 
 		// Calculate contribution reward with compound interest: totalPooled * ((1 + contributionRewardRate/annualBlockCountEveryYear)^annualBlockCountEveryEpoch - 1)
-		contributionReward := p.CalculateRewardByRate(blockNr, contributionRewardRate, annualBlockCountEveryYear, annualBlockCountEveryEpoch, totalPooled)
+		contributionReward := p.CalculateRewardByRate(contributionRewardRate, annualBlockCountEveryYear, annualBlockCountEveryEpoch, totalPooled)
 		totalReward.Add(totalReward, contributionReward)
 		state.AddBalance(*consensusAddress, uint256.MustFromBig(contributionReward), tracing.BalanceIncreaseContributionReward)
 		log.Info("calculate contribution reward", "block hash", header.Hash(), "operatorAddr", operatorAddr, "consensusAddr", *consensusAddress,
-			"inTurnCounts", inTurnCounts, "outTurnCounts", outTurnCounts, "uptimeRate", uptimeRateFloat,
-			"contributionStakingRatio", contributionStakingRatioFloat, "totalNetworkStakingRatio", totalNetworkStakingRatioFloat,
-			"commissionRate", commissionRateFloat, "contributionRewardRate", contributionRewardRate, "contributionReward", contributionReward)
+			"inTurnCounts", inTurnCounts, "outTurnCounts", outTurnCounts, "uptimeRate", uptimeRate,
+			"contributionStakingRatio", contributionStakingRatio, "totalNetworkStakingRatio", totalNetworkStakingRatio,
+			"commissionRate", commissionRateBig, "contributionRewardRate", contributionRewardRate, "contributionReward", contributionReward)
 
 		// todo: If there are a large number of validators, consider adding a batch deposit interface to the contract.
 		fixedBlockReward, err := p.distributeIncoming(*consensusAddress, state, header, cx, txs, receipts, receivedTxs, usedGas, true, tracer)
@@ -483,10 +529,10 @@ func (p *Parlia) updateValidatorUptimeRecords(spoiledVal common.Address, state v
 	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) error {
 	// method
 	method := "updateValidatorUptimeRecords"
-
+	index := header.Time / params.BreatheBlockInterval
 	// get packed data
 	data, err := p.validatorSetABI.Pack(method,
-		header.Coinbase, spoiledVal,
+		index, header.Coinbase, spoiledVal,
 	)
 	if err != nil {
 		log.Error("Unable to pack tx for updateValidatorUptimeRecords", "error", err)
