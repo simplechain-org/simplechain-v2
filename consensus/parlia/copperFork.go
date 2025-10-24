@@ -341,18 +341,15 @@ func (p *Parlia) getValidatorCommissionRate(blockNr rpc.BlockNumberOrHash, val c
 func (p *Parlia) CalculateRewardByRate(rate *big.Int, annualBlockCountEveryYear *big.Int,
 	annualBlockCountEveryEpoch *big.Int, totalPooled *big.Int) *big.Int {
 
-	// Scale factor: 10^13 to maintain precision (4 significant digits for the tiny ratePerBlock)
-	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(13), nil)
-
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
 	// ratePerBlock = rate / 10000 / annualBlockCountEveryYear
-	// ratePerBlockScaled = rate * scale / 10000 / annualBlockCountEveryYear
-	ratePerBlockScaled := new(big.Int).Mul(rate, scale)
-	ratePerBlockScaled.Div(ratePerBlockScaled, big.NewInt(10000))
+	// ratePerBlockScaled = rate * 10000 / annualBlockCountEveryYear
+	ratePerBlockScaled := rate
 	ratePerBlockScaled.Div(ratePerBlockScaled, annualBlockCountEveryYear)
+	ratePerBlockScaled.Div(ratePerBlockScaled, big.NewInt(10000))
 
 	// base = (1 + ratePerBlock) * scale = scale + ratePerBlockScaled
 	base := new(big.Int).Add(scale, ratePerBlockScaled)
-
 	// Use fast exponentiation to calculate base^annualBlocksEpoch
 	// Each multiplication divides by scale to keep the number from growing too large
 	result := powerWithScale(base, annualBlockCountEveryEpoch, scale)
@@ -399,6 +396,107 @@ func powerWithScale(base *big.Int, exp *big.Int, scale *big.Int) *big.Int {
 	}
 
 	return result
+}
+
+// CalculateContributionRewardRate calculates the contribution reward rate using big.Int arithmetic
+// Formula: contributionRewardRate = inflationRate * uptimeRate * (1 - commissionRate) / totalNetworkStakingRatio * sqrt(contributionStakingRatio)
+// All rates are in basis points (10000 = 100%)
+// Returns: reward rate in basis points
+func CalculateContributionRewardRate(
+	inflationRate *big.Int, // basis points (e.g., 500 = 5%)
+	inTurnCounts *big.Int,
+	totalTurnCounts *big.Int,
+	commissionRate *big.Int, // basis points (e.g., 1000 = 10%)
+	totalDelegated *big.Int,
+	totalPooled *big.Int,
+	validatorsTotalPooled *big.Int,
+	totalSupply *big.Int,
+) *big.Int {
+	// Scale factor: 10^18 for high precision
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
+	scaleSqrt := new(big.Int).Exp(big.NewInt(10), big.NewInt(9), nil)
+	basisPointScale := big.NewInt(10000)
+
+	// 1. Calculate uptimeRate = inTurnCounts / totalTurnCounts (scaled by 10^18)
+	var uptimeRateScaled *big.Int
+	if totalTurnCounts.Cmp(big.NewInt(0)) > 0 {
+		uptimeRateScaled = new(big.Int).Mul(inTurnCounts, scale)
+		uptimeRateScaled.Div(uptimeRateScaled, totalTurnCounts)
+	} else {
+		uptimeRateScaled = big.NewInt(0)
+	}
+
+	// 2. Calculate (1 - commissionRate) where commissionRate is in basis points
+	oneMinusCommission := new(big.Int).Sub(basisPointScale, commissionRate)
+	oneMinusCommissionScaled := new(big.Int).Mul(oneMinusCommission, scale)
+	oneMinusCommissionScaled.Div(oneMinusCommissionScaled, basisPointScale)
+
+	// 3. Calculate contributionStakingRatio = totalDelegated / totalPooled (scaled)
+	contributionStakingRatioScaled := new(big.Int).Mul(totalDelegated, scale)
+	contributionStakingRatioScaled.Div(contributionStakingRatioScaled, totalPooled)
+
+	// 4. Calculate sqrt(contributionStakingRatio)
+	// Since ratio is scaled by 10^18, sqrt will be scaled by 10^9
+	sqrtContribRatio := sqrtBigInt(contributionStakingRatioScaled)
+
+	// 5. Calculate totalNetworkStakingRatio = validatorsTotalPooled / totalSupply (scaled)
+	networkStakingRatioScaled := new(big.Int).Mul(validatorsTotalPooled, scale)
+	networkStakingRatioScaled.Div(networkStakingRatioScaled, totalSupply)
+
+	// 6. Now calculate: inflationRate * uptimeRate * (1 - commissionRate) / totalNetworkStakingRatio * sqrt(contributionStakingRatio)
+	// Start with inflationRate (in basis points)
+	result := new(big.Int).Mul(inflationRate, scale)
+
+	// result = inflationRate * uptimeRateScaled / scale
+	result.Mul(result, uptimeRateScaled)
+	result.Div(result, scale)
+
+	// result = result * oneMinusCommissionScaled / scale
+	result.Mul(result, oneMinusCommissionScaled)
+	result.Div(result, scale)
+
+	// result = result * sqrtContribRatio / scaleSqrt
+	result.Mul(result, sqrtContribRatio)
+	result.Div(result, scaleSqrt)
+
+	// result = result * scale / networkStakingRatioScaled (division)
+	result.Mul(result, scale)
+	result.Div(result, networkStakingRatioScaled)
+
+	// Result is now in basis points
+	return result
+}
+
+// sqrtBigInt calculates the integer square root using Newton's method
+// For a number scaled by 10^18, the result will be scaled by 10^9
+func sqrtBigInt(n *big.Int) *big.Int {
+	if n.Cmp(big.NewInt(0)) <= 0 {
+		return big.NewInt(0)
+	}
+
+	// Initial guess: start with n/2
+	x := new(big.Int).Div(n, big.NewInt(2))
+	if x.Cmp(big.NewInt(0)) == 0 {
+		return big.NewInt(1)
+	}
+
+	// Newton's method: x_new = (x + n/x) / 2
+	for {
+		// Calculate n/x
+		nDivX := new(big.Int).Div(n, x)
+
+		// Calculate (x + n/x) / 2
+		xNew := new(big.Int).Add(x, nDivX)
+		xNew.Div(xNew, big.NewInt(2))
+
+		// Check convergence
+		diff := new(big.Int).Sub(x, xNew)
+		if diff.Abs(diff).Cmp(big.NewInt(1)) <= 0 {
+			return xNew
+		}
+
+		x = xNew
+	}
 }
 
 func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeaderReader, state vm.StateDB, header *types.Header,
@@ -467,41 +565,20 @@ func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeade
 			return nil, err
 		}
 
-		// Calculate uptime rate: inTurnCounts / (inTurnCounts + outTurnCounts)
 		totalTurnCounts := new(big.Int).Add(inTurnCounts, outTurnCounts)
-		uptimeRate := big.NewInt(0)
-		if totalTurnCounts.Cmp(big.NewInt(0)) > 0 {
-			uptimeRate = new(big.Int).Mul(inTurnCounts, big.NewInt(10000))
-			uptimeRate.Div(uptimeRate, totalTurnCounts)
-		}
-		log.Debug("uptimeRate", "block hash", header.Hash(), "uptimeRate", uptimeRate)
-
-		// Calculate contribution staking ratio: totalDelegated / totalPooled
-		contributionStakingRatio := new(big.Int).Mul(totalDelegated, big.NewInt(10000))
-		contributionStakingRatio.Div(contributionStakingRatio, totalPooled)
-		log.Debug("contributionStakingRatio", "block hash", header.Hash(), "contributionStakingRatio", contributionStakingRatio)
-		// Calculate total network-wide staking ratio: validatorsTotalPooled / (totalIssuedSupply - totalBurnedSupply)
 		totalSupply := new(big.Int).Sub(totalIssuedSupply, totalBurnedSupply)
-		totalNetworkStakingRatio := new(big.Int).Mul(validatorsTotalPooled, big.NewInt(10000))
-		totalNetworkStakingRatio.Div(totalNetworkStakingRatio, totalSupply)
-		log.Debug("totalNetworkStakingRatio", "block hash", header.Hash(), "totalNetworkStakingRatio", totalNetworkStakingRatio)
-
 		inflationRate, err := p.getInflationRate(blockNr)
 		if err != nil {
 			return nil, err
 		}
-		commissionRateBig, err := p.getValidatorCommissionRate(blockNr, operatorAddr)
+		commissionRate, err := p.getValidatorCommissionRate(blockNr, operatorAddr)
 		if err != nil {
 			return nil, err
 		}
-		log.Debug("commissionRate", "block hash", header.Hash(), "commissionRateBig", commissionRateBig)
+		log.Debug("commissionRate", "block hash", header.Hash(), "commissionRateBig", commissionRate)
 
-		// Calculate contribution reward rate
-		// contributionRewardRate = inflationRate * uptimeRate * (1 - commissionRate) * totalNetworkStakingRatio * sqrt(contributionStakingRatio)
-		contributionRewardRate := new(big.Int).Mul(inflationRate, uptimeRate)
-		contributionRewardRate.Mul(contributionRewardRate, new(big.Int).Sub(big.NewInt(10000), commissionRateBig))
-		contributionRewardRate.Mul(contributionRewardRate, totalNetworkStakingRatio)
-		contributionRewardRate.Mul(contributionRewardRate, contributionStakingRatio)
+		contributionRewardRate := CalculateContributionRewardRate(inflationRate, totalTurnCounts, outTurnCounts, commissionRate,
+			totalDelegated, totalPooled, validatorsTotalPooled, totalSupply)
 
 		log.Debug("contributionRewardRate", "block hash", header.Hash(), "contributionRewardRate", contributionRewardRate)
 
@@ -510,9 +587,8 @@ func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeade
 		totalReward.Add(totalReward, contributionReward)
 		state.AddBalance(*consensusAddress, uint256.MustFromBig(contributionReward), tracing.BalanceIncreaseContributionReward)
 		log.Info("calculate contribution reward", "block hash", header.Hash(), "operatorAddr", operatorAddr, "consensusAddr", *consensusAddress,
-			"inTurnCounts", inTurnCounts, "outTurnCounts", outTurnCounts, "uptimeRate", uptimeRate,
-			"contributionStakingRatio", contributionStakingRatio, "totalNetworkStakingRatio", totalNetworkStakingRatio,
-			"commissionRate", commissionRateBig, "contributionRewardRate", contributionRewardRate, "contributionReward", contributionReward)
+			"inTurnCounts", inTurnCounts, "outTurnCounts", outTurnCounts,
+			"commissionRate", commissionRate, "contributionRewardRate", contributionRewardRate, "contributionReward", contributionReward)
 
 		// todo: If there are a large number of validators, consider adding a batch deposit interface to the contract.
 		fixedBlockReward, err := p.distributeIncoming(*consensusAddress, state, header, cx, txs, receipts, receivedTxs, usedGas, true, tracer)
