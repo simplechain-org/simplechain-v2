@@ -1040,6 +1040,11 @@ func init() {
 				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
 				Code:         copper.DefaultValidatorContract,
 			},
+			{
+				ContractAddr: common.HexToAddress(StakeHubContract),
+				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
+				Code:         copper.DefaultStakeHubContract,
+			},
 		},
 	}
 	copperUpgrade[mainNet] = &Upgrade{

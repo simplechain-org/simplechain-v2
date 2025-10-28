@@ -268,6 +268,7 @@ type ChainOverrides struct {
 	OverrideMaxwell        *uint64
 	OverrideFermi          *uint64
 	OverrideVerkle         *uint64
+	OverrideCopper         *uint64
 }
 
 // apply applies the chain overrides on the supplied chain config.
@@ -298,6 +299,9 @@ func (o *ChainOverrides) apply(cfg *params.ChainConfig) error {
 	}
 	if o.OverrideVerkle != nil {
 		cfg.VerkleTime = o.OverrideVerkle
+	}
+	if o.OverrideCopper != nil {
+		cfg.CopperBlock = big.NewInt(int64(*o.OverrideCopper))
 	}
 	return cfg.CheckConfigForkOrder()
 }

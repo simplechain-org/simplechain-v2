@@ -2023,7 +2023,7 @@ func (p *Parlia) distributeIncoming(val common.Address, state vm.StateDB, header
 
 	balance := state.GetBalance(consensus.SystemAddress)
 	if !p.chainConfig.IsCopper(header.Number) && balance.Cmp(common.U2560) <= 0 {
-		return nil, nil
+		return big.NewInt(0), nil
 	}
 
 	state.SetBalance(consensus.SystemAddress, common.U2560, tracing.BalanceDecreaseBSCDistributeReward)
