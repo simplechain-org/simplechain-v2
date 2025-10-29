@@ -4222,7 +4222,6 @@ const stakeABI = `[
     "outputs": [
       {
         "name": "",
-
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -4840,6 +4839,35 @@ const stakeABI = `[
   },
   {
     "type": "function",
+    "name": "getValidatorDelegatedInfo",
+    "inputs": [
+      {
+        "name": "operatorAddress",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "totalPooled",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "selfDelegated",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "otherDelegated",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "getValidatorDescription",
     "inputs": [
       {
@@ -4931,44 +4959,6 @@ const stakeABI = `[
         "name": "index",
         "type": "uint256",
         "internalType": "uint256"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "getValidatorSelfDelegated",
-    "inputs": [
-      {
-        "name": "operatorAddress",
-        "type": "address",
-        "internalType": "address"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "getValidatorTotalPooled",
-    "inputs": [
-      {
-        "name": "operatorAddress",
-        "type": "address",
-        "internalType": "address"
       }
     ],
     "outputs": [
@@ -5082,7 +5072,7 @@ const stakeABI = `[
     "inputs": [],
     "outputs": [
       {
-        "name": "totalAmount",
+        "name": "",
         "type": "uint256",
         "internalType": "uint256"
       }

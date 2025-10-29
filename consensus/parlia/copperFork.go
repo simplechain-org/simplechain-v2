@@ -58,48 +58,17 @@ func (p *Parlia) getNominalInterestRate(blockNr rpc.BlockNumberOrHash) (*big.Int
 	return unpacked[0].(*big.Int), nil
 }
 
-func (p *Parlia) getTotalPooled(blockNr rpc.BlockNumberOrHash, operatorAddr common.Address) (*big.Int, error) {
+func (p *Parlia) getValidatorDelegatedInfo(blockNr rpc.BlockNumberOrHash, operatorAddress common.Address) (*big.Int, *big.Int, *big.Int, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	method := "getValidatorTotalPooled"
-	toAddress := common.HexToAddress(systemcontracts.StakeHubContract)
-	gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
-
-	data, err := p.stakeHubABI.Pack(method, operatorAddr)
-	if err != nil {
-		log.Error("Unable to pack tx for getValidatorTotalPooled", "error", err)
-		return nil, err
-	}
-	msgData := (hexutil.Bytes)(data)
-
-	result, err := p.ethAPI.Call(ctx, ethapi.TransactionArgs{
-		Gas:  &gas,
-		To:   &toAddress,
-		Data: &msgData,
-	}, &blockNr, nil, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	unpacked, err := p.stakeHubABI.Unpack(method, result)
-	if err != nil {
-		return nil, err
-	}
-
-	return unpacked[0].(*big.Int), nil
-}
-
-func (p *Parlia) getSelfDelegated(blockNr rpc.BlockNumberOrHash, operatorAddress common.Address) (*big.Int, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	method := "getValidatorSelfDelegated"
+	method := "getValidatorDelegatedInfo"
 	toAddress := common.HexToAddress(systemcontracts.StakeHubContract)
 	gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
 
 	data, err := p.stakeHubABI.Pack(method, operatorAddress)
 	if err != nil {
-		log.Error("Unable to pack tx for getValidatorSelfDelegated", "error", err)
-		return nil, err
+		log.Error("Unable to pack tx for getValidatorDelegatedInfo", "error", err)
+		return nil, nil, nil, err
 	}
 	msgData := (hexutil.Bytes)(data)
 
@@ -109,30 +78,29 @@ func (p *Parlia) getSelfDelegated(blockNr rpc.BlockNumberOrHash, operatorAddress
 		Data: &msgData,
 	}, &blockNr, nil, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
 	unpacked, err := p.stakeHubABI.Unpack(method, result)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
-	return unpacked[0].(*big.Int), nil
+	return unpacked[0].(*big.Int), unpacked[1].(*big.Int), unpacked[2].(*big.Int), nil
 }
 
 func (p *Parlia) getValidatorDelegatedAmount(blockNr rpc.BlockNumberOrHash, operatorAddr common.Address) (*big.Int, *big.Int, *big.Int, error) {
-	totalPooled, err := p.getTotalPooled(blockNr, operatorAddr)
+	totalPooled, selfDelegated, otherDelegated, err := p.getValidatorDelegatedInfo(blockNr, operatorAddr)
 	if err != nil {
 		log.Error("Unable to get total pooled", "error", err)
 		return nil, nil, nil, err
 	}
-	selfDelegated, err := p.getSelfDelegated(blockNr, operatorAddr)
-	if err != nil {
-		log.Error("Unable to get self delegated", "error", err)
-		return nil, nil, nil, err
+	// Minimum amount of delegated required
+	minDelegated := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
+	if otherDelegated.Cmp(minDelegated) < 0 {
+		otherDelegated = big.NewInt(0)
 	}
-	totalDelegated := new(big.Int).Sub(totalPooled, selfDelegated)
-	return totalDelegated, totalPooled, selfDelegated, nil
+	return otherDelegated, totalPooled, selfDelegated, nil
 }
 
 func (p *Parlia) getValidatorUptimeRecord(blockNr rpc.BlockNumberOrHash, val common.Address, index *big.Int) (*big.Int, *big.Int, error) {
@@ -611,7 +579,7 @@ func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeade
 		}
 		log.Debug("commissionRate", "block hash", header.Hash(), "commissionRate", commissionRate)
 
-		contributionRewardRate := CalculateContributionRewardRate(inflationRate, totalTurnCounts, outTurnCounts, new(big.Int).SetUint64(commissionRate.Rate),
+		contributionRewardRate := CalculateContributionRewardRate(inflationRate, inTurnCounts, totalTurnCounts, new(big.Int).SetUint64(commissionRate.Rate),
 			totalDelegated, totalPooled, validatorsTotalPooled, totalSupply)
 
 		log.Debug("contributionRewardRate", "block hash", header.Hash(), "contributionRewardRate", contributionRewardRate)
