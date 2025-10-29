@@ -1455,8 +1455,10 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 		}
 		additionalIssuanceAmount = *totalReward
 	}
-	if p.chainConfig.IsCopper(header.Number) {
-		if err := p.updateValidatorUptimeRecords(spoiledVal, state, header, cx, txs, receipts, systemTxs, usedGas, true, tracer); err != nil {
+	// The number of copper is upgrading
+	if p.chainConfig.IsCopper(header.Number) && !p.chainConfig.IsOnCopper(header.Number) {
+		if err := p.updateValidatorUptimeRecord(spoiledVal, state, header, cx, txs, receipts, systemTxs, usedGas, true, tracer); err != nil {
+			log.Warn("updateValidatorUptimeRecord failed", "error", err)
 			return err
 		}
 		err := p.updateCurrentTotalSupply(&additionalIssuanceAmount, chain, state, header, txs, receipts, systemTxs, usedGas, true, tracer)
@@ -1470,6 +1472,7 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 		if isFirstBlockOfNewYear {
 			err := p.updateInflationRecordForNewYear(parentYear, currentYear, cx, state, header, txs, receipts, systemTxs, usedGas, true, tracer)
 			if err != nil {
+				log.Warn("updateInflationRecordForNewYear failed", "error", err)
 				return err
 			}
 		}
@@ -1578,12 +1581,15 @@ func (p *Parlia) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *
 		additionalIssuanceAmount = *totalReward
 	}
 
-	if p.chainConfig.IsCopper(header.Number) {
-		if err := p.updateValidatorUptimeRecords(spoiledVal, state, header, cx, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer); err != nil {
+	// The number of copper is upgrading
+	if p.chainConfig.IsCopper(header.Number) && !p.chainConfig.IsOnCopper(header.Number) {
+		if err := p.updateValidatorUptimeRecord(spoiledVal, state, header, cx, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer); err != nil {
+			log.Error("updateValidatorUptimeRecord failed", "block hash", header.Hash(), "spoiled address", spoiledVal, "address", header.Coinbase)
 			return nil, nil, err
 		}
 		err := p.updateCurrentTotalSupply(&additionalIssuanceAmount, chain, state, header, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
 		if err != nil {
+			log.Error("updateCurrentTotalSupply failed", "block hash", header.Hash())
 			return nil, nil, err
 		}
 		// Check if this is the first block of a new year
@@ -2025,7 +2031,7 @@ func (p *Parlia) distributeIncoming(val common.Address, state vm.StateDB, header
 	if !p.chainConfig.IsCopper(header.Number) && balance.Cmp(common.U2560) <= 0 {
 		return big.NewInt(0), nil
 	}
-
+	log.Info("distributeIncoming ", "val", val.Hex(), "coinbase", coinbase.Hex())
 	state.SetBalance(consensus.SystemAddress, common.U2560, tracing.BalanceDecreaseBSCDistributeReward)
 
 	blockNr := rpc.BlockNumberOrHashWithHash(header.ParentHash, false)
@@ -2035,7 +2041,7 @@ func (p *Parlia) distributeIncoming(val common.Address, state vm.StateDB, header
 		return nil, err
 	}
 	if val == coinbase {
-		balance.Add(balance, uint256.NewInt(reward.Uint64()))
+		balance = new(uint256.Int).Add(balance, uint256.NewInt(reward.Uint64()))
 	}
 	state.AddBalance(coinbase, balance, tracing.BalanceIncreaseBSCDistributeReward)
 

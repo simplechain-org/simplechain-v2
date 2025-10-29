@@ -6,19 +6,22 @@ import _ "embed"
 var (
 	//go:embed mainnet/ValidatorContract
 	MainnetValidatorContract string
-	MainnetStakeHubContract  string
+	//go:embed default/StakeHub
+	MainnetStakeHubContract string
 )
 
 // contract codes for Chapel upgrade
 var (
 	//go:embed chapel/ValidatorContract
 	ChapelValidatorContract string
-	ChapelStakeHubContract  string
+	//go:embed default/StakeHub
+	ChapelStakeHubContract string
 )
 
 // contract codes for Default upgrade
 var (
 	//go:embed default/ValidatorContract
 	DefaultValidatorContract string
-	DefaultStakeHubContract  string
+	//go:embed default/StakeHub
+	DefaultStakeHubContract string
 )

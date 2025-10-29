@@ -20,6 +20,12 @@ import (
 	"github.com/holiman/uint256"
 )
 
+type CommissionItem struct {
+	Rate          uint64
+	MaxRate       uint64
+	MaxChangeRate uint64
+}
+
 func (p *Parlia) getNominalInterestRate(blockNr rpc.BlockNumberOrHash) (*big.Int, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -59,7 +65,7 @@ func (p *Parlia) getTotalPooled(blockNr rpc.BlockNumberOrHash, operatorAddr comm
 	toAddress := common.HexToAddress(systemcontracts.StakeHubContract)
 	gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
 
-	data, err := p.stakeHubABI.Pack(method)
+	data, err := p.stakeHubABI.Pack(method, operatorAddr)
 	if err != nil {
 		log.Error("Unable to pack tx for getValidatorTotalPooled", "error", err)
 		return nil, err
@@ -83,14 +89,14 @@ func (p *Parlia) getTotalPooled(blockNr rpc.BlockNumberOrHash, operatorAddr comm
 	return unpacked[0].(*big.Int), nil
 }
 
-func (p *Parlia) getSelfDelegated(blockNr rpc.BlockNumberOrHash, credit common.Address) (*big.Int, error) {
+func (p *Parlia) getSelfDelegated(blockNr rpc.BlockNumberOrHash, operatorAddress common.Address) (*big.Int, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	method := "getValidatorSelfDelegated"
 	toAddress := common.HexToAddress(systemcontracts.StakeHubContract)
 	gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
 
-	data, err := p.stakeHubABI.Pack(method)
+	data, err := p.stakeHubABI.Pack(method, operatorAddress)
 	if err != nil {
 		log.Error("Unable to pack tx for getValidatorSelfDelegated", "error", err)
 		return nil, err
@@ -252,39 +258,9 @@ func (p *Parlia) getValidatorsTotalPooled(blockNr rpc.BlockNumberOrHash) (*big.I
 	toAddress := common.HexToAddress(systemcontracts.StakeHubContract)
 	gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
 
-	data, err := p.validatorSetABI.Pack(method)
+	data, err := p.stakeHubABI.Pack(method)
 	if err != nil {
 		log.Error("Unable to pack tx for getValidatorsTotalPooled", "error", err)
-		return nil, err
-	}
-	msgData := (hexutil.Bytes)(data)
-
-	result, err := p.ethAPI.Call(ctx, ethapi.TransactionArgs{
-		Gas:  &gas,
-		To:   &toAddress,
-		Data: &msgData,
-	}, &blockNr, nil, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	unpacked, err := p.validatorSetABI.Unpack(method, result)
-	if err != nil {
-		return nil, err
-	}
-
-	return unpacked[0].(*big.Int), nil
-}
-
-func (p *Parlia) getValidatorConsensusAddress(blockNr rpc.BlockNumberOrHash, operatorAddr common.Address) (*common.Address, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	method := "getValidatorConsensusAddress"
-	toAddress := common.HexToAddress(systemcontracts.StakeHubContract)
-	gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
-
-	data, err := p.stakeHubABI.Pack(method, operatorAddr)
-	if err != nil {
 		return nil, err
 	}
 	msgData := (hexutil.Bytes)(data)
@@ -303,18 +279,19 @@ func (p *Parlia) getValidatorConsensusAddress(blockNr rpc.BlockNumberOrHash, ope
 		return nil, err
 	}
 
-	return unpacked[0].(*common.Address), nil
+	return unpacked[0].(*big.Int), nil
 }
-func (p *Parlia) getValidatorCommissionRate(blockNr rpc.BlockNumberOrHash, val common.Address) (*big.Int, error) {
+
+func (p *Parlia) getValidatorConsensusAddress(blockNr rpc.BlockNumberOrHash, operatorAddr common.Address) (common.Address, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	method := "getValidatorCommission"
-	toAddress := common.HexToAddress(systemcontracts.ValidatorContract)
+	method := "getValidatorConsensusAddress"
+	toAddress := common.HexToAddress(systemcontracts.StakeHubContract)
 	gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
 
-	data, err := p.validatorSetABI.Pack(method, val)
+	data, err := p.stakeHubABI.Pack(method, operatorAddr)
 	if err != nil {
-		return nil, err
+		return common.Address{}, err
 	}
 	msgData := (hexutil.Bytes)(data)
 
@@ -324,15 +301,54 @@ func (p *Parlia) getValidatorCommissionRate(blockNr rpc.BlockNumberOrHash, val c
 		Data: &msgData,
 	}, &blockNr, nil, nil)
 	if err != nil {
-		return nil, err
+		return common.Address{}, err
 	}
 
-	unpacked, err := p.validatorSetABI.Unpack(method, result)
+	unpacked, err := p.stakeHubABI.Unpack(method, result)
 	if err != nil {
-		return nil, err
+		return common.Address{}, err
 	}
 
-	return unpacked[0].(*big.Int), nil
+	return unpacked[0].(common.Address), nil
+}
+func (p *Parlia) getValidatorCommissionRate(blockNr rpc.BlockNumberOrHash, val common.Address) (CommissionItem, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	method := "getValidatorCommission"
+	toAddress := common.HexToAddress(systemcontracts.StakeHubContract)
+	gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
+
+	data, err := p.stakeHubABI.Pack(method, val)
+	if err != nil {
+		return CommissionItem{}, err
+	}
+	msgData := (hexutil.Bytes)(data)
+
+	result, err := p.ethAPI.Call(ctx, ethapi.TransactionArgs{
+		Gas:  &gas,
+		To:   &toAddress,
+		Data: &msgData,
+	}, &blockNr, nil, nil)
+	if err != nil {
+		return CommissionItem{}, err
+	}
+
+	unpacked, err := p.stakeHubABI.Unpack(method, result)
+	if err != nil {
+		return CommissionItem{}, err
+	}
+
+	commission := unpacked[0].(struct {
+		Rate          uint64 `json:"rate"`
+		MaxRate       uint64 `json:"maxRate"`
+		MaxChangeRate uint64 `json:"maxChangeRate"`
+	})
+
+	return CommissionItem{
+		Rate:          commission.Rate,
+		MaxRate:       commission.MaxRate,
+		MaxChangeRate: commission.MaxChangeRate,
+	}, nil
 }
 
 // CalculateRewardByRateWithBigInt calculates reward using big.Int arithmetic with fast exponentiation
@@ -506,46 +522,56 @@ func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeade
 	totalReward := new(big.Int).SetUint64(0)
 	breatheBlockFee := state.GetBalance(consensus.SystemAddress)
 	index := header.Time/params.BreatheBlockInterval - 1
+	log.Info("distributeBasicAndContributionReward", "blockNumber", header.Number, "blockTime", header.Time, "index", index)
 	snap, err := p.snapshot(chain, header.Number.Uint64()-1, header.ParentHash, nil)
 	if err != nil {
+		log.Warn("distributeBasicAndContributionReward snapshot failed", "blockNumber", header.Number.Uint64()-1, "error", err)
 		return nil, err
 	}
 	annualBlockCountEveryYear := new(big.Int).SetUint64(365 * 24 * 60 * 60 * 1000 / snap.BlockInterval)
 	annualBlockCountEveryEpoch := new(big.Int).SetUint64(params.BreatheBlockInterval * 1000 / snap.BlockInterval)
 	nominalInterestRate, err := p.getNominalInterestRate(blockNr)
 	if err != nil {
+		log.Warn("distributeBasicAndContributionReward getNominalInterestRate failed", "blockNr", blockNr, "error", err)
 		return nil, err
 	}
+	// The first input parameter rate of CalculateRewardByRate is required to be expanded precision, mainly to unify the calculation of contribution rewards
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
+	nominalInterestRateScaled := new(big.Int).Mul(nominalInterestRate, scale)
+	log.Debug("distributeBasicAndContributionReward", "annualBlockCountEveryYear", annualBlockCountEveryYear, "annualBlockCountEveryEpoch", annualBlockCountEveryEpoch, "nominalInterestRate", nominalInterestRate)
 
 	totalIssuedSupply, totalBurnedSupply, err := p.getTotalSupply(blockNr)
 	if err != nil {
+		log.Warn("distributeBasicAndContributionReward getTotalSupply failed", "blockNr", blockNr, "error", err)
 		return nil, err
 	}
 
 	validatorsTotalPooled, err := p.getValidatorsTotalPooled(blockNr)
 	if err != nil {
+		log.Warn("distributeBasicAndContributionReward getValidatorsTotalPooled failed", "blockNr", blockNr, "error", err)
 		return nil, err
 	}
 
 	allValidators, err := p.getAllValidators(blockNr)
 	if err != nil {
+		log.Warn("distributeBasicAndContributionReward getAllValidators failed", "blockNr", blockNr, "error", err)
 		return nil, err
 	}
 
 	state.SetBalance(consensus.SystemAddress, common.U2560, tracing.BalanceDecreaseBSCDistributeReward)
 	// calculate basic and contribution reward of all validators
 	for _, operatorAddr := range allValidators {
+		log.Debug("begin calculate basic and contribution reward", "block hash", header.Hash(), "operatorAddr", operatorAddr)
 		totalDelegated, totalPooled, selfDelegated, err := p.getValidatorDelegatedAmount(blockNr, operatorAddr)
 		if err != nil {
+			log.Warn("distributeBasicAndContributionReward getValidatorDelegatedAmount failed", "blockNr", blockNr, "error", err)
 			return nil, err
 		}
 
 		log.Debug("getValidatorDelegatedAmount", "block hash", header.Hash(), "totalDelegated", totalDelegated, "totalPooled", totalPooled, "selfDelegated", selfDelegated)
-		log.Debug("annualBlockCountEveryYear", "block hash", header.Hash(), "annualBlockCountEveryYear", annualBlockCountEveryYear)
-		log.Debug("annualBlockCountEveryEpoch", "block hash", header.Hash(), "annualBlockCountEveryEpoch", annualBlockCountEveryEpoch)
 
 		// Calculate (1 + nominalInterestRate/annualBlockCountEveryYear)^annualBlockCountEveryEpoch - 1
-		basicReward := p.CalculateRewardByRate(nominalInterestRate, annualBlockCountEveryYear, annualBlockCountEveryEpoch, totalPooled)
+		basicReward := p.CalculateRewardByRate(nominalInterestRateScaled, annualBlockCountEveryYear, annualBlockCountEveryEpoch, totalPooled)
 
 		log.Info("calculate basic reward", "block hash", header.Hash(), "address", p.val, "totalPooled", totalPooled, "basicReward", basicReward)
 		state.AddBalance(consensus.SystemAddress, uint256.MustFromBig(basicReward), tracing.BalanceIncreaseBasicReward)
@@ -553,31 +579,39 @@ func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeade
 		// calculate validator uptime rate
 		consensusAddress, err := p.getValidatorConsensusAddress(blockNr, operatorAddr)
 		if err != nil {
+			log.Warn("distributeBasicAndContributionReward getNominalInterestRate failed", "blockNr", blockNr, "error", err)
 			return nil, err
 		}
-		if *consensusAddress == header.Coinbase {
+		log.Debug("consensusAddress", "block hash", header.Hash(), "consensusAddress", consensusAddress)
+		if consensusAddress == header.Coinbase {
 			state.AddBalance(consensus.SystemAddress, breatheBlockFee, tracing.BalanceIncreaseBasicReward)
 		}
 
 		upTimeIndex := big.NewInt(int64(index))
-		inTurnCounts, outTurnCounts, err := p.getValidatorUptimeRecord(blockNr, *consensusAddress, upTimeIndex)
+		inTurnCounts, outTurnCounts, err := p.getValidatorUptimeRecord(blockNr, consensusAddress, upTimeIndex)
 		if err != nil {
+			log.Warn("distributeBasicAndContributionReward getNominalInterestRate failed", "blockNr", blockNr, "error", err)
 			return nil, err
 		}
+		log.Debug("inTurnCounts", "block hash", header.Hash(), "inTurnCounts", inTurnCounts, "outTurnCounts", outTurnCounts)
 
 		totalTurnCounts := new(big.Int).Add(inTurnCounts, outTurnCounts)
 		totalSupply := new(big.Int).Sub(totalIssuedSupply, totalBurnedSupply)
+		log.Debug("totalSupply", "block hash", header.Hash(), "totalSupply", totalSupply, "totalIssuedSupply", totalIssuedSupply, "totalBurnedSupply", totalBurnedSupply)
 		inflationRate, err := p.getInflationRate(blockNr)
 		if err != nil {
+			log.Warn("distributeBasicAndContributionReward getInflationRate failed", "blockNr", blockNr, "error", err)
 			return nil, err
 		}
+		log.Debug("inflationRate", "block hash", header.Hash(), "inflationRate", inflationRate)
 		commissionRate, err := p.getValidatorCommissionRate(blockNr, operatorAddr)
 		if err != nil {
+			log.Warn("distributeBasicAndContributionReward getValidatorCommissionRate failed", "blockNr", blockNr, "operatorAddr", operatorAddr, "error", err)
 			return nil, err
 		}
-		log.Debug("commissionRate", "block hash", header.Hash(), "commissionRateBig", commissionRate)
+		log.Debug("commissionRate", "block hash", header.Hash(), "commissionRate", commissionRate)
 
-		contributionRewardRate := CalculateContributionRewardRate(inflationRate, totalTurnCounts, outTurnCounts, commissionRate,
+		contributionRewardRate := CalculateContributionRewardRate(inflationRate, totalTurnCounts, outTurnCounts, new(big.Int).SetUint64(commissionRate.Rate),
 			totalDelegated, totalPooled, validatorsTotalPooled, totalSupply)
 
 		log.Debug("contributionRewardRate", "block hash", header.Hash(), "contributionRewardRate", contributionRewardRate)
@@ -585,14 +619,15 @@ func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeade
 		// Calculate contribution reward with compound interest: totalPooled * ((1 + contributionRewardRate/annualBlockCountEveryYear)^annualBlockCountEveryEpoch - 1)
 		contributionReward := p.CalculateRewardByRate(contributionRewardRate, annualBlockCountEveryYear, annualBlockCountEveryEpoch, totalPooled)
 		totalReward.Add(totalReward, contributionReward)
-		state.AddBalance(*consensusAddress, uint256.MustFromBig(contributionReward), tracing.BalanceIncreaseContributionReward)
-		log.Info("calculate contribution reward", "block hash", header.Hash(), "operatorAddr", operatorAddr, "consensusAddr", *consensusAddress,
-			"inTurnCounts", inTurnCounts, "outTurnCounts", outTurnCounts,
+		state.AddBalance(consensusAddress, uint256.MustFromBig(contributionReward), tracing.BalanceIncreaseContributionReward)
+		log.Info("calculate contribution reward", "block hash", header.Hash(), "operatorAddr", operatorAddr,
+			"consensusAddr", consensusAddress, "inTurnCounts", inTurnCounts, "outTurnCounts", outTurnCounts,
 			"commissionRate", commissionRate, "contributionRewardRate", contributionRewardRate, "contributionReward", contributionReward)
 
 		// todo: If there are a large number of validators, consider adding a batch deposit interface to the contract.
-		fixedBlockReward, err := p.distributeIncoming(*consensusAddress, state, header, cx, txs, receipts, receivedTxs, usedGas, true, tracer)
+		fixedBlockReward, err := p.distributeIncoming(consensusAddress, state, header, cx, txs, receipts, receivedTxs, usedGas, true, tracer)
 		if err != nil {
+			log.Warn("distributeBasicAndContributionReward distributeIncoming failed", "error", err)
 			return nil, err
 		}
 		totalReward.Add(totalReward, fixedBlockReward)
@@ -601,21 +636,21 @@ func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeade
 }
 
 // slash spoiled validators
-func (p *Parlia) updateValidatorUptimeRecords(spoiledVal common.Address, state vm.StateDB, header *types.Header, chain core.ChainContext,
+func (p *Parlia) updateValidatorUptimeRecord(spoiledVal common.Address, state vm.StateDB, header *types.Header, chain core.ChainContext,
 	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) error {
 	// method
-	method := "updateValidatorUptimeRecords"
+	method := "updateValidatorUptimeRecord"
 	index := header.Time / params.BreatheBlockInterval
 	// get packed data
 	data, err := p.validatorSetABI.Pack(method,
-		index, header.Coinbase, spoiledVal,
+		new(big.Int).SetUint64(index), header.Coinbase, spoiledVal,
 	)
 	if err != nil {
-		log.Error("Unable to pack tx for updateValidatorUptimeRecords", "error", err)
+		log.Error("Unable to pack tx for updateValidatorUptimeRecord", "error", err)
 		return err
 	}
 	// get system message
-	msg := p.getSystemMessage(header.Coinbase, common.HexToAddress(systemcontracts.SlashContract), data, common.Big0)
+	msg := p.getSystemMessage(header.Coinbase, common.HexToAddress(systemcontracts.ValidatorContract), data, common.Big0)
 	// apply message
 	return p.applyTransaction(msg, state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
 }
@@ -637,15 +672,17 @@ func (p *Parlia) _updateCurrentTotalSupply(state *vm.StateDB, header *types.Head
 func (p *Parlia) updateCurrentTotalSupply(additionalIssuanceAmount *big.Int, chain consensus.ChainHeaderReader, state vm.StateDB, header *types.Header,
 	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) error {
 	cx := chainContext{Chain: chain, parlia: p}
-	blockNr := rpc.BlockNumberOrHashWithNumber(rpc.BlockNumber(header.Number.Uint64()))
+	blockNr := rpc.BlockNumberOrHashWithHash(header.ParentHash, false)
 	// BurnedAddressList := []common.Address{
 	// 	common.HexToAddress("0x0000000000000000000000000000000000000000"),
 	// 	common.HexToAddress("0x000000000000000000000000000000000000DEAD"),
 	// }
 	burnedAddressList, err := p.getBurnedAddressList(blockNr)
 	if err != nil {
+		log.Error("Failed to get burned address list", "error", err)
 		return err
 	}
+	log.Info("updateCurrentTotalSupply", "block hash", header.Hash(), "burnedAddressList", burnedAddressList)
 	// Get balance at specific block number using ethAPI
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -663,14 +700,15 @@ func (p *Parlia) updateCurrentTotalSupply(additionalIssuanceAmount *big.Int, cha
 		}
 	}
 
+	log.Info("updateCurrentTotalSupply", "block hash", header.Hash(), "additionalIssuanceAmount", additionalIssuanceAmount, "burnedAmount", burnedAmount)
 	return p._updateCurrentTotalSupply(&state, header, additionalIssuanceAmount, burnedAmount, cx, txs, receipts, receivedTxs, &header.GasUsed, true, tracer)
 }
 
-func (p *Parlia) getInflationRecord(year int, blockNr rpc.BlockNumberOrHash, validatorAddr common.Address) (*big.Int, *big.Int, *big.Int, error) {
+func (p *Parlia) getInflationRecord(year int, blockNr rpc.BlockNumberOrHash) (*big.Int, *big.Int, *big.Int, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	method := "inflationRecord"
-	data, err := p.validatorSetABI.Pack(method, year)
+	data, err := p.validatorSetABI.Pack(method, new(big.Int).SetInt64(int64(year)))
 	if err != nil {
 		log.Error("Unable to pack tx for getInflationRecord", "error", err)
 		return nil, nil, nil, err
@@ -729,7 +767,7 @@ func (p *Parlia) getInflationRate(blockNr rpc.BlockNumberOrHash) (*big.Int, erro
 func (p *Parlia) updateInflationRecord(year int, totalSupply *big.Int, additionalIssuanceAmount *big.Int, inflationRateUint uint64, chain core.ChainContext, state vm.StateDB, header *types.Header,
 	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) error {
 	method := "updateInflationRecord"
-	data, err := p.validatorSetABI.Pack(method, year, totalSupply, additionalIssuanceAmount, inflationRateUint)
+	data, err := p.validatorSetABI.Pack(method, new(big.Int).SetInt64(int64(year)), totalSupply, additionalIssuanceAmount, new(big.Int).SetUint64(inflationRateUint))
 	if err != nil {
 		log.Error("Unable to pack tx for updateInflationInfo", "error", err)
 		return err
@@ -743,13 +781,13 @@ func (p *Parlia) updateInflationRecord(year int, totalSupply *big.Int, additiona
 
 func (p *Parlia) updateInflationRecordForNewYear(parentYear int, currentYear int, cx core.ChainContext, state vm.StateDB,
 	header *types.Header, txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) error {
-	blockNr := rpc.BlockNumberOrHashWithNumber(rpc.BlockNumber(header.Number.Uint64()))
+	blockNr := rpc.BlockNumberOrHashWithHash(header.ParentHash, false)
 	log.Info("First block of new year detected", "blockNumber", header.Number, "blockTime", header.Time, "parentYear", parentYear, "currentYear", currentYear)
 	currentTotalSupply, _, err := p.getTotalSupply(blockNr)
 	if err != nil {
 		return err
 	}
-	lastYearTotalSupply, _, _, err := p.getInflationRecord(parentYear, blockNr, p.val)
+	lastYearTotalSupply, _, _, err := p.getInflationRecord(parentYear, blockNr)
 	if err != nil {
 		return err
 	}
@@ -768,7 +806,7 @@ func (p *Parlia) updateInflationRecordForNewYear(parentYear int, currentYear int
 func (p *Parlia) getBurnedAddressList(blockNr rpc.BlockNumberOrHash) ([]common.Address, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	method := "burnedAddressList"
+	method := "getBurnedAddressList"
 	data, err := p.validatorSetABI.Pack(method)
 	if err != nil {
 		log.Error("Unable to pack tx for getBurnedAddressList", "error", err)
