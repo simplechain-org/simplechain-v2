@@ -2478,6 +2478,19 @@ const validatorSetABI = `[
     "stateMutability": "view"
   },
   {
+	"type": "function",
+	"name": "maxContributionRewardRatio",
+	"inputs": [],
+	"outputs": [
+	{
+	  "name": "",
+	  "type": "uint256",
+	  "internalType": "uint256"
+	}
+	],
+	"stateMutability": "view"
+  },
+  {
     "type": "function",
     "name": "maxNumOfCandidates",
     "inputs": [],

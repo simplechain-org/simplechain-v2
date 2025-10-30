@@ -1408,7 +1408,7 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 		if err != nil {
 			return err
 		}
-		spoiledVal := snap.inturnValidator()
+		spoiledVal = snap.inturnValidator()
 		signedRecently := false
 		if p.chainConfig.IsPlato(header.Number) {
 			signedRecently = snap.SignRecently(spoiledVal)
@@ -1443,7 +1443,7 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 
 	var additionalIssuanceAmount big.Int
 	if p.chainConfig.IsCopper(header.Number) && isBreatheBlock(parent.Time, header.Time) {
-		totalReward, err := p.distributeBasicAndContributionReward(chain, state, header, txs, receipts, systemTxs, usedGas, tracer)
+		totalReward, err := p.distributeBasicAndContributionReward(chain, state, header, txs, receipts, systemTxs, usedGas, false, tracer)
 		if err != nil {
 			return err
 		}
@@ -1457,11 +1457,11 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 	}
 	// The number of copper is upgrading
 	if p.chainConfig.IsCopper(header.Number) && !p.chainConfig.IsOnCopper(header.Number) {
-		if err := p.updateValidatorUptimeRecord(spoiledVal, state, header, cx, txs, receipts, systemTxs, usedGas, true, tracer); err != nil {
+		if err := p.updateValidatorUptimeRecord(spoiledVal, state, header, cx, txs, receipts, systemTxs, usedGas, false, tracer); err != nil {
 			log.Warn("updateValidatorUptimeRecord failed", "error", err)
 			return err
 		}
-		err := p.updateCurrentTotalSupply(&additionalIssuanceAmount, chain, state, header, txs, receipts, systemTxs, usedGas, true, tracer)
+		err := p.updateCurrentTotalSupply(&additionalIssuanceAmount, chain, state, header, txs, receipts, systemTxs, usedGas, false, tracer)
 		if err != nil {
 			return err
 		}
@@ -1470,7 +1470,7 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 		currentYear := time.Unix(int64(header.Time), 0).UTC().Year()
 		isFirstBlockOfNewYear := currentYear > parentYear
 		if isFirstBlockOfNewYear {
-			err := p.updateInflationRecordForNewYear(parentYear, currentYear, cx, state, header, txs, receipts, systemTxs, usedGas, true, tracer)
+			err := p.updateInflationRecordForNewYear(parentYear, currentYear, cx, state, header, txs, receipts, systemTxs, usedGas, false, tracer)
 			if err != nil {
 				log.Warn("updateInflationRecordForNewYear failed", "error", err)
 				return err
@@ -1568,7 +1568,7 @@ func (p *Parlia) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *
 
 	var additionalIssuanceAmount big.Int
 	if p.chainConfig.IsCopper(header.Number) && isBreatheBlock(parent.Time, header.Time) {
-		totalReward, err := p.distributeBasicAndContributionReward(chain, state, header, &body.Transactions, &receipts, nil, &header.GasUsed, tracer)
+		totalReward, err := p.distributeBasicAndContributionReward(chain, state, header, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2043,9 +2043,12 @@ func (p *Parlia) distributeIncoming(val common.Address, state vm.StateDB, header
 	if val == coinbase {
 		balance = new(uint256.Int).Add(balance, uint256.NewInt(reward.Uint64()))
 	}
+	if balance.Cmp(common.U2560) <= 0 {
+		return big.NewInt(0), nil
+	}
 	state.AddBalance(coinbase, balance, tracing.BalanceIncreaseBSCDistributeReward)
 
-	log.Trace("distribute to validator contract", "block hash", header.Hash(), "amount", balance, "blockReward", reward)
+	log.Trace("distribute to validator contract", "block hash", header.Hash(), "val", val.Hex(), "amount", balance, "blockReward", reward)
 	return reward, p.distributeToValidator(balance.ToBig(), val, state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
 }
 
