@@ -1442,12 +1442,16 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 	}
 
 	var additionalIssuanceAmount big.Int
+	var additionalBasicIssuanceAmount big.Int
+	var additionalContributionIssuanceAmount big.Int
 	if p.chainConfig.IsCopper(header.Number) && isBreatheBlock(parent.Time, header.Time) {
-		totalReward, err := p.distributeBasicAndContributionReward(chain, state, header, txs, receipts, systemTxs, usedGas, false, tracer)
+		totalReward, additionalBasicReward, additionalContributionReward, err := p.distributeBasicAndContributionReward(chain, state, header, txs, receipts, systemTxs, usedGas, false, tracer)
 		if err != nil {
 			return err
 		}
 		additionalIssuanceAmount = *totalReward
+		additionalBasicIssuanceAmount = *additionalBasicReward
+		additionalContributionIssuanceAmount = *additionalContributionReward
 	} else {
 		totalReward, err := p.distributeIncoming(val, state, header, cx, txs, receipts, systemTxs, usedGas, false, tracer)
 		if err != nil {
@@ -1461,7 +1465,7 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 			log.Warn("updateValidatorUptimeRecord failed", "error", err)
 			return err
 		}
-		err := p.updateCurrentTotalSupply(&additionalIssuanceAmount, chain, state, header, txs, receipts, systemTxs, usedGas, false, tracer)
+		err := p.updateCurrentTotalSupply(&additionalIssuanceAmount, &additionalBasicIssuanceAmount, &additionalContributionIssuanceAmount, chain, state, header, txs, receipts, systemTxs, usedGas, false, tracer)
 		if err != nil {
 			return err
 		}
@@ -1567,12 +1571,16 @@ func (p *Parlia) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *
 	}
 
 	var additionalIssuanceAmount big.Int
+	var additionalBasicIssuanceAmount big.Int
+	var additionalContributionIssuanceAmount big.Int
 	if p.chainConfig.IsCopper(header.Number) && isBreatheBlock(parent.Time, header.Time) {
-		totalReward, err := p.distributeBasicAndContributionReward(chain, state, header, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
+		totalReward, additionalBasicReward, additionalContributionReward, err := p.distributeBasicAndContributionReward(chain, state, header, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
 		if err != nil {
 			return nil, nil, err
 		}
 		additionalIssuanceAmount = *totalReward
+		additionalBasicIssuanceAmount = *additionalBasicReward
+		additionalContributionIssuanceAmount = *additionalContributionReward
 	} else {
 		totalReward, err := p.distributeIncoming(p.val, state, header, cx, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
 		if err != nil {
@@ -1587,7 +1595,7 @@ func (p *Parlia) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *
 			log.Error("updateValidatorUptimeRecord failed", "block hash", header.Hash(), "spoiled address", spoiledVal, "address", header.Coinbase)
 			return nil, nil, err
 		}
-		err := p.updateCurrentTotalSupply(&additionalIssuanceAmount, chain, state, header, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
+		err := p.updateCurrentTotalSupply(&additionalIssuanceAmount, &additionalBasicIssuanceAmount, &additionalContributionIssuanceAmount, chain, state, header, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
 		if err != nil {
 			log.Error("updateCurrentTotalSupply failed", "block hash", header.Hash())
 			return nil, nil, err

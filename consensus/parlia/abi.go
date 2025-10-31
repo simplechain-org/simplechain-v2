@@ -1566,6 +1566,19 @@ const validatorSetABI = `[
   },
   {
     "type": "function",
+    "name": "INIT_MAX_CONTRIBUTION_REWARD_RATIO",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "INIT_MAX_NUM_OF_MAINTAINING",
     "inputs": [],
     "outputs": [
@@ -2169,6 +2182,24 @@ const validatorSetABI = `[
   },
   {
     "type": "function",
+    "name": "getTotalIssuanceAmountOfReward",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "totalBasicReward",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "totalContributionReward",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "getTotalSupply",
     "inputs": [],
     "outputs": [
@@ -2348,6 +2379,16 @@ const validatorSetABI = `[
         "internalType": "uint256"
       },
       {
+        "name": "annualIssuanceAmountOfBasicReward",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "annualIssuanceAmountOfContributionReward",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
         "name": "inflationRate",
         "type": "uint256",
         "internalType": "uint256"
@@ -2478,17 +2519,17 @@ const validatorSetABI = `[
     "stateMutability": "view"
   },
   {
-	"type": "function",
-	"name": "maxContributionRewardRatio",
-	"inputs": [],
-	"outputs": [
-	{
-	  "name": "",
-	  "type": "uint256",
-	  "internalType": "uint256"
-	}
-	],
-	"stateMutability": "view"
+    "type": "function",
+    "name": "maxContributionRewardRatio",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
   },
   {
     "type": "function",
@@ -2693,6 +2734,32 @@ const validatorSetABI = `[
   },
   {
     "type": "function",
+    "name": "totalIssuanceAmountOfBasicReward",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "totalIssuanceAmountOfContributionReward",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "turnLength",
     "inputs": [],
     "outputs": [
@@ -2709,12 +2776,22 @@ const validatorSetABI = `[
     "name": "updateCurrentTotalSupply",
     "inputs": [
       {
-        "name": "additionalAmount",
+        "name": "additionalTotalAmount",
         "type": "uint256",
         "internalType": "uint256"
       },
       {
         "name": "burnedAmount",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "additionalBasicRewardAmount",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "additionalContributionRewardAmount",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -2733,6 +2810,16 @@ const validatorSetABI = `[
       },
       {
         "name": "additionalAmount",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "additionalBasicRewardAmount",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "additionalContributionRewardAmount",
         "type": "uint256",
         "internalType": "uint256"
       },
@@ -3075,6 +3162,31 @@ const validatorSetABI = `[
       },
       {
         "name": "amount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "inflationRecordUpdated",
+    "inputs": [
+      {
+        "name": "year",
+        "type": "uint256",
+        "indexed": true,
+        "internalType": "uint256"
+      },
+      {
+        "name": "inflationRate",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "additionalTokenIssuanceAmount",
         "type": "uint256",
         "indexed": false,
         "internalType": "uint256"
