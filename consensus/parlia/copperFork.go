@@ -28,6 +28,69 @@ type CommissionItem struct {
 	MaxChangeRate uint64
 }
 
+// ethAPIReader defines the interface for reading data from ethAPI.
+// This abstraction makes it easier to test functions that depend on blockchain state.
+type ethAPIReader interface {
+	GetNominalInterestRate(blockNr rpc.BlockNumberOrHash) (*big.Int, error)
+	GetInflationRate(blockNr rpc.BlockNumberOrHash) (*big.Int, error)
+	GetMaxContributionRewardRatio(blockNr rpc.BlockNumberOrHash) (*big.Int, error)
+	GetTotalSupply(blockNr rpc.BlockNumberOrHash) (*big.Int, *big.Int, error)
+	GetValidatorsTotalPooled(blockNr rpc.BlockNumberOrHash) (*big.Int, error)
+	GetAllValidators(blockNr rpc.BlockNumberOrHash) ([]common.Address, error)
+	GetValidatorDelegatedAmount(blockNr rpc.BlockNumberOrHash, operatorAddr common.Address) (*big.Int, *big.Int, *big.Int, error)
+	GetValidatorConsensusAddress(blockNr rpc.BlockNumberOrHash, operatorAddr common.Address) (common.Address, error)
+	GetValidatorUptimeRecord(blockNr rpc.BlockNumberOrHash, val common.Address, index *big.Int) (*big.Int, *big.Int, error)
+	GetValidatorCommissionRate(blockNr rpc.BlockNumberOrHash, val common.Address) (CommissionItem, error)
+}
+
+// ethAPIWriter defines the interface for writing data to state database.
+// This abstraction makes it easier to test functions that modify blockchain state.
+type ethAPIWriter interface {
+	SetBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason)
+	AddBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason)
+	GetBalance(addr common.Address) *uint256.Int
+	DistributeIncoming(val common.Address, state vm.StateDB, header *types.Header, chain core.ChainContext,
+		txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) (*big.Int, error)
+}
+
+// ValidatorRewardInput contains all input data needed to calculate validator rewards
+// This struct is used to separate data fetching from calculation logic for easier testing
+type ValidatorRewardInput struct {
+	// Basic reward calculation inputs
+	NominalInterestRateScaled  *big.Int // Scaled by 10^18
+	AnnualBlockCountEveryYear  *big.Int
+	AnnualBlockCountEveryEpoch *big.Int
+	TotalPooled                *big.Int
+
+	// Contribution reward calculation inputs
+	InflationRate              *big.Int
+	InTurnCounts               *big.Int
+	TotalTurnCounts            *big.Int
+	CommissionRate             *big.Int // In basis points
+	TotalDelegated             *big.Int
+	ValidatorsTotalPooled      *big.Int
+	TotalSupply                *big.Int
+	MaxContributionRewardRatio *big.Int // Scaled by 10^18
+}
+
+// ValidatorRewardResult contains the calculated reward results
+type ValidatorRewardResult struct {
+	BasicReward        *big.Int
+	ContributionReward *big.Int
+}
+
+// validatorRewardData contains validator-specific data fetched from blockchain state
+type validatorRewardData struct {
+	TotalDelegated   *big.Int
+	TotalPooled      *big.Int
+	SelfDelegated    *big.Int
+	ConsensusAddress common.Address
+	InTurnCounts     *big.Int
+	OutTurnCounts    *big.Int
+	TotalTurnCounts  *big.Int
+	CommissionRate   *big.Int
+}
+
 func (p *Parlia) getNominalInterestRate(blockNr rpc.BlockNumberOrHash) (*big.Int, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -310,6 +373,7 @@ func (p *Parlia) getValidatorConsensusAddress(blockNr rpc.BlockNumberOrHash, ope
 
 	return unpacked[0].(common.Address), nil
 }
+
 func (p *Parlia) getValidatorCommissionRate(blockNr rpc.BlockNumberOrHash, val common.Address) (CommissionItem, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -349,6 +413,7 @@ func (p *Parlia) getValidatorCommissionRate(blockNr rpc.BlockNumberOrHash, val c
 		MaxChangeRate: commission.MaxChangeRate,
 	}, nil
 }
+
 func (p *Parlia) getMaxContributionRewardRatio(blockNr rpc.BlockNumberOrHash) (*big.Int, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -468,7 +533,7 @@ func CalculateContributionRewardRate(
 		uptimeRateScaled = new(big.Int).Mul(inTurnCounts, scale)
 		uptimeRateScaled.Div(uptimeRateScaled, totalTurnCounts)
 	} else {
-		uptimeRateScaled = big.NewInt(0)
+		return big.NewInt(0)
 	}
 
 	// 2. Calculate (1 - commissionRate) where commissionRate is in basis points
@@ -478,7 +543,11 @@ func CalculateContributionRewardRate(
 
 	// 3. Calculate contributionStakingRatio = totalDelegated / totalPooled (scaled)
 	contributionStakingRatioScaled := new(big.Int).Mul(totalDelegated, scale)
-	contributionStakingRatioScaled.Div(contributionStakingRatioScaled, totalPooled)
+	if totalPooled.Cmp(big.NewInt(0)) > 0 {
+		contributionStakingRatioScaled.Div(contributionStakingRatioScaled, totalPooled)
+	} else {
+		return big.NewInt(0)
+	}
 
 	// 4. Calculate sqrt(contributionStakingRatio)
 	// Since ratio is scaled by 10^18, sqrt will be scaled by 10^9
@@ -486,7 +555,11 @@ func CalculateContributionRewardRate(
 
 	// 5. Calculate totalNetworkStakingRatio = validatorsTotalPooled / totalSupply (scaled)
 	networkStakingRatioScaled := new(big.Int).Mul(validatorsTotalPooled, scale)
-	networkStakingRatioScaled.Div(networkStakingRatioScaled, totalSupply)
+	if totalSupply.Cmp(big.NewInt(0)) > 0 {
+		networkStakingRatioScaled.Div(networkStakingRatioScaled, totalSupply)
+	} else {
+		return big.NewInt(0)
+	}
 
 	// 6. Now calculate: inflationRate * uptimeRate * (1 - commissionRate) / totalNetworkStakingRatio * sqrt(contributionStakingRatio)
 	// Start with inflationRate (in basis points)
@@ -546,27 +619,39 @@ func sqrtBigInt(n *big.Int) *big.Int {
 
 func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeaderReader, state vm.StateDB, header *types.Header,
 	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) (*big.Int, *big.Int, *big.Int, error) {
-	blockNr := rpc.BlockNumberOrHashWithHash(header.ParentHash, false)
-	cx := chainContext{Chain: chain, parlia: p}
-	totalReward := new(big.Int).SetUint64(0)
-	additionalBasicReward := new(big.Int).SetUint64(0)
-	additionalContributionReward := new(big.Int).SetUint64(0)
-	breatheBlockFee := state.GetBalance(consensus.SystemAddress)
-	index := header.Time/params.BreatheBlockInterval - 1
-	log.Info("distributeBasicAndContributionReward", "blockNumber", header.Number, "blockTime", header.Time, "intervalIndex", index, "breatheBlockFee", breatheBlockFee)
+	// Use default implementations
+	reader := &defaultEthAPIReader{parlia: p}
+	writer := &defaultEthAPIWriter{parlia: p, state: state}
 	snap, err := p.snapshot(chain, header.Number.Uint64()-1, header.ParentHash, nil)
 	if err != nil {
 		log.Warn("distributeBasicAndContributionReward snapshot failed", "blockNumber", header.Number.Uint64()-1, "error", err)
 		return nil, nil, nil, err
 	}
+	return p.distributeBasicAndContributionRewardWithInterfaces(chain, state, header, txs, receipts, receivedTxs, usedGas, mining, tracer, reader, writer, snap)
+}
+
+// distributeBasicAndContributionRewardWithInterfaces is the internal implementation that accepts reader and writer interfaces.
+// This makes it easier to test by injecting mock implementations.
+func (p *Parlia) distributeBasicAndContributionRewardWithInterfaces(chain consensus.ChainHeaderReader, state vm.StateDB, header *types.Header,
+	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks,
+	reader ethAPIReader, writer ethAPIWriter, snap *Snapshot) (*big.Int, *big.Int, *big.Int, error) {
+	blockNr := rpc.BlockNumberOrHashWithHash(header.ParentHash, false)
+	cx := chainContext{Chain: chain, parlia: p}
+	totalReward := new(big.Int).SetUint64(0)
+	additionalBasicReward := new(big.Int).SetUint64(0)
+	additionalContributionReward := new(big.Int).SetUint64(0)
+	breatheBlockFee := writer.GetBalance(consensus.SystemAddress)
+	index := header.Time/params.BreatheBlockInterval - 1
+	log.Info("distributeBasicAndContributionReward", "blockNumber", header.Number, "blockTime", header.Time, "intervalIndex", index, "breatheBlockFee", breatheBlockFee)
+
 	annualBlockCountEveryYear := new(big.Int).SetUint64(365 * 24 * 60 * 60 * 1000 / snap.BlockInterval)
 	annualBlockCountEveryEpoch := new(big.Int).SetUint64(params.BreatheBlockInterval * 1000 / snap.BlockInterval)
-	nominalInterestRate, err := p.getNominalInterestRate(blockNr)
+	nominalInterestRate, err := reader.GetNominalInterestRate(blockNr)
 	if err != nil {
 		log.Warn("distributeBasicAndContributionReward getNominalInterestRate failed", "blockNr", blockNr.BlockHash.Hex(), "error", err)
 		return nil, nil, nil, err
 	}
-	inflationRate, err := p.getInflationRate(blockNr)
+	inflationRate, err := reader.GetInflationRate(blockNr)
 	if err != nil {
 		log.Warn("distributeBasicAndContributionReward getInflationRate failed", "blockNr", blockNr.BlockHash.Hex(), "error", err)
 		return nil, nil, nil, err
@@ -575,18 +660,18 @@ func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeade
 	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
 	nominalInterestRateScaled := new(big.Int).Mul(nominalInterestRate, scale)
 
-	maxContributionRewardRatio, err := p.getMaxContributionRewardRatio(blockNr)
+	maxContributionRewardRatio, err := reader.GetMaxContributionRewardRatio(blockNr)
 	if err != nil {
 		log.Warn("distributeBasicAndContributionReward getMaxContributionRewardRatio failed", "blockNr", blockNr.BlockHash.Hex(), "error", err)
 		return nil, nil, nil, err
 	}
-	totalIssuedSupply, totalBurnedSupply, err := p.getTotalSupply(blockNr)
+	totalIssuedSupply, totalBurnedSupply, err := reader.GetTotalSupply(blockNr)
 	if err != nil {
 		log.Warn("distributeBasicAndContributionReward getTotalSupply failed", "blockNr", blockNr.BlockHash.Hex(), "error", err)
 		return nil, nil, nil, err
 	}
 
-	validatorsTotalPooled, err := p.getValidatorsTotalPooled(blockNr)
+	validatorsTotalPooled, err := reader.GetValidatorsTotalPooled(blockNr)
 	if err != nil {
 		log.Warn("distributeBasicAndContributionReward getValidatorsTotalPooled failed", "blockNr", blockNr.BlockHash.Hex(), "error", err)
 		return nil, nil, nil, err
@@ -597,71 +682,71 @@ func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeade
 		"maxContributionRewardRatio", maxContributionRewardRatio, "totalIssuedSupply", totalIssuedSupply, "totalBurnedSupply", totalBurnedSupply,
 		"validatorsTotalPooled", validatorsTotalPooled,
 	)
-	allValidators, err := p.getAllValidators(blockNr)
+	allValidators, err := reader.GetAllValidators(blockNr)
 	if err != nil {
 		log.Warn("distributeBasicAndContributionReward getAllValidators failed", "blockNr", blockNr.BlockHash.Hex(), "error", err)
 		return nil, nil, nil, err
 	}
 
 	log.Debug("distributeBasicAndContributionReward get validators length = ", len(allValidators))
-	state.SetBalance(consensus.SystemAddress, common.U2560, tracing.BalanceDecreaseBSCDistributeReward)
+	writer.SetBalance(consensus.SystemAddress, common.U2560, tracing.BalanceDecreaseBSCDistributeReward)
+
+	// Prepare shared calculation parameters
+	totalSupply := new(big.Int).Sub(totalIssuedSupply, totalBurnedSupply)
+	maxContributionRewardRate := new(big.Int).Mul(maxContributionRewardRatio, scale)
+	upTimeIndex := big.NewInt(int64(index))
+
 	// calculate basic and contribution reward of all validators
 	for _, operatorAddr := range allValidators {
 		log.Debug("begin calculate basic and contribution reward", "block hash", header.Hash(), "operatorAddr", operatorAddr)
-		totalDelegated, totalPooled, selfDelegated, err := p.getValidatorDelegatedAmount(blockNr, operatorAddr)
+
+		// Fetch validator-specific data from blockchain state
+		validatorData, err := fetchValidatorRewardData(reader, blockNr, operatorAddr, upTimeIndex, header)
 		if err != nil {
-			log.Warn("distributeBasicAndContributionReward getValidatorDelegatedAmount failed", "blockNr", blockNr.BlockHash.Hex(), "error", err)
+			log.Warn("distributeBasicAndContributionReward fetchValidatorRewardData failed", "blockNr", blockNr.BlockHash.Hex(), "operatorAddr", operatorAddr, "error", err)
 			return nil, nil, nil, err
 		}
 
-		// Calculate (1 + nominalInterestRate/annualBlockCountEveryYear)^annualBlockCountEveryEpoch - 1
-		basicReward := p.CalculateRewardByRate(nominalInterestRateScaled, annualBlockCountEveryYear, annualBlockCountEveryEpoch, totalPooled)
-		additionalBasicReward.Add(additionalBasicReward, basicReward)
-		log.Info("calculate basic reward", "blockNumber", header.Number, "operator", operatorAddr, "totalDelegated", totalDelegated, "totalPooled", totalPooled, "selfDelegated", selfDelegated, "basicReward", basicReward)
-		state.AddBalance(consensus.SystemAddress, uint256.MustFromBig(basicReward), tracing.BalanceIncreaseBasicReward)
-		totalReward.Add(totalReward, basicReward)
-		// calculate validator uptime rate
-		consensusAddress, err := p.getValidatorConsensusAddress(blockNr, operatorAddr)
-		if err != nil {
-			log.Warn("distributeBasicAndContributionReward getNominalInterestRate failed", "blockNr", blockNr.BlockHash.Hex(), "error", err)
-			return nil, nil, nil, err
-		}
-		if consensusAddress == header.Coinbase {
-			state.AddBalance(consensus.SystemAddress, breatheBlockFee, tracing.BalanceIncreaseBasicReward)
-		}
-
-		upTimeIndex := big.NewInt(int64(index))
-		inTurnCounts, outTurnCounts, err := p.getValidatorUptimeRecord(blockNr, consensusAddress, upTimeIndex)
-		if err != nil {
-			log.Warn("distributeBasicAndContributionReward getValidatorUptimeRecord failed", "blockNr", blockNr.BlockHash.Hex(), "error", err)
-			return nil, nil, nil, err
+		// Prepare input for reward calculation
+		rewardInput := &ValidatorRewardInput{
+			NominalInterestRateScaled:  nominalInterestRateScaled,
+			AnnualBlockCountEveryYear:  annualBlockCountEveryYear,
+			AnnualBlockCountEveryEpoch: annualBlockCountEveryEpoch,
+			TotalPooled:                validatorData.TotalPooled,
+			InflationRate:              inflationRate,
+			InTurnCounts:               validatorData.InTurnCounts,
+			TotalTurnCounts:            validatorData.TotalTurnCounts,
+			CommissionRate:             validatorData.CommissionRate,
+			TotalDelegated:             validatorData.TotalDelegated,
+			ValidatorsTotalPooled:      validatorsTotalPooled,
+			TotalSupply:                totalSupply,
+			MaxContributionRewardRatio: maxContributionRewardRatio,
 		}
 
-		totalTurnCounts := new(big.Int).Add(inTurnCounts, outTurnCounts)
-		totalSupply := new(big.Int).Sub(totalIssuedSupply, totalBurnedSupply)
-		commissionRate, err := p.getValidatorCommissionRate(blockNr, operatorAddr)
-		if err != nil {
-			log.Warn("distributeBasicAndContributionReward getValidatorCommissionRate failed", "blockNr", blockNr.BlockHash.Hex(), "operatorAddr", operatorAddr, "error", err)
-			return nil, nil, nil, err
+		// Calculate rewards using pure function
+		rewardResult := calculateValidatorRewards(p, rewardInput, maxContributionRewardRate, scale)
+
+		// Update state and accumulate rewards
+		additionalBasicReward.Add(additionalBasicReward, rewardResult.BasicReward)
+		additionalContributionReward.Add(additionalContributionReward, rewardResult.ContributionReward)
+		totalReward.Add(totalReward, rewardResult.BasicReward)
+		totalReward.Add(totalReward, rewardResult.ContributionReward)
+
+		log.Info("calculate basic reward", "blockNumber", header.Number, "operator", operatorAddr,
+			"totalDelegated", validatorData.TotalDelegated, "totalPooled", validatorData.TotalPooled,
+			"selfDelegated", validatorData.SelfDelegated, "basicReward", rewardResult.BasicReward)
+		writer.AddBalance(consensus.SystemAddress, uint256.MustFromBig(rewardResult.BasicReward), tracing.BalanceIncreaseBasicReward)
+
+		if validatorData.ConsensusAddress == header.Coinbase {
+			writer.AddBalance(consensus.SystemAddress, breatheBlockFee, tracing.BalanceIncreaseBasicReward)
 		}
-		log.Debug("distributeBasicAndContributionReward", "blockNumber", header.Number, "operator", operatorAddr, "consensusAddress", consensusAddress, "inTurnCounts", inTurnCounts, "outTurnCounts", outTurnCounts, "commissionRate", commissionRate)
 
-		contributionRewardRate := CalculateContributionRewardRate(inflationRate, inTurnCounts, totalTurnCounts, new(big.Int).SetUint64(commissionRate.Rate),
-			totalDelegated, totalPooled, validatorsTotalPooled, totalSupply)
-		maxContributionRewardRate := new(big.Int).Mul(maxContributionRewardRatio, scale)
-		if contributionRewardRate.Cmp(maxContributionRewardRate) > 0 {
-			contributionRewardRate = maxContributionRewardRate
-		}
+		log.Info("calculate contribution reward", "blockNumber", header.Number, "operatorAddr", operatorAddr,
+			"contributionReward", rewardResult.ContributionReward)
+		writer.AddBalance(consensus.SystemAddress, uint256.MustFromBig(rewardResult.ContributionReward), tracing.BalanceIncreaseContributionReward)
 
-		// Calculate contribution reward with compound interest: totalPooled * ((1 + contributionRewardRate/annualBlockCountEveryYear)^annualBlockCountEveryEpoch - 1)
-		contributionReward := p.CalculateRewardByRate(contributionRewardRate, annualBlockCountEveryYear, annualBlockCountEveryEpoch, totalPooled)
-		additionalContributionReward.Add(additionalContributionReward, contributionReward)
-		totalReward.Add(totalReward, contributionReward)
-		state.AddBalance(consensus.SystemAddress, uint256.MustFromBig(contributionReward), tracing.BalanceIncreaseContributionReward)
-		log.Info("calculate contribution reward", "blockNumber", header.Number, "operatorAddr", operatorAddr, "contributionRewardRate", contributionRewardRate, "contributionReward", contributionReward)
-
-		// todo: If there are a large number of validators, consider adding a batch deposit interface to the contract.
-		fixedBlockReward, err := p.distributeIncoming(consensusAddress, state, header, cx, txs, receipts, receivedTxs, usedGas, mining, tracer)
+		// Distribute fixed block reward (this still requires state access)
+		fixedBlockReward, err := writer.DistributeIncoming(validatorData.ConsensusAddress, state, header, cx, txs, receipts, receivedTxs, usedGas, mining, tracer)
 		if err != nil {
 			log.Warn("distributeBasicAndContributionReward distributeIncoming failed", "blockNr", blockNr.BlockHash.Hex(), "error", err)
 			return nil, nil, nil, err
@@ -670,6 +755,93 @@ func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeade
 	}
 	log.Debug("distributeBasicAndContributionReward", "blockNumber", header.Number, "totalReward", totalReward)
 	return totalReward, additionalBasicReward, additionalContributionReward, nil
+}
+
+// fetchValidatorRewardDataWithReader fetches all validator-specific data needed for reward calculation from blockchain state.
+// This function accepts a reader interface, making it easier to test by injecting mock implementations.
+func fetchValidatorRewardData(reader ethAPIReader, blockNr rpc.BlockNumberOrHash, operatorAddr common.Address,
+	upTimeIndex *big.Int, header *types.Header) (*validatorRewardData, error) {
+	data := &validatorRewardData{}
+
+	// Fetch delegated amounts
+	totalDelegated, totalPooled, selfDelegated, err := reader.GetValidatorDelegatedAmount(blockNr, operatorAddr)
+	if err != nil {
+		return nil, err
+	}
+	data.TotalDelegated = totalDelegated
+	data.TotalPooled = totalPooled
+	data.SelfDelegated = selfDelegated
+
+	// Fetch consensus address
+	consensusAddress, err := reader.GetValidatorConsensusAddress(blockNr, operatorAddr)
+	if err != nil {
+		return nil, err
+	}
+	data.ConsensusAddress = consensusAddress
+
+	// Fetch uptime record
+	inTurnCounts, outTurnCounts, err := reader.GetValidatorUptimeRecord(blockNr, consensusAddress, upTimeIndex)
+	if err != nil {
+		return nil, err
+	}
+	data.InTurnCounts = inTurnCounts
+	data.OutTurnCounts = outTurnCounts
+	data.TotalTurnCounts = new(big.Int).Add(inTurnCounts, outTurnCounts)
+
+	// Fetch commission rate
+	commissionRate, err := reader.GetValidatorCommissionRate(blockNr, operatorAddr)
+	if err != nil {
+		return nil, err
+	}
+	data.CommissionRate = new(big.Int).SetUint64(commissionRate.Rate)
+
+	log.Debug("fetchValidatorRewardData", "blockNumber", header.Number, "operator", operatorAddr,
+		"consensusAddress", consensusAddress, "inTurnCounts", inTurnCounts, "outTurnCounts", outTurnCounts,
+		"commissionRate", commissionRate)
+
+	return data, nil
+}
+
+// calculateValidatorRewards is a pure function that calculates validator rewards based on input data.
+// This function has no dependencies on blockchain state, making it easy to test.
+func calculateValidatorRewards(p *Parlia, input *ValidatorRewardInput, maxContributionRewardRate *big.Int, scale *big.Int) *ValidatorRewardResult {
+	result := &ValidatorRewardResult{}
+
+	// Calculate basic reward: (1 + nominalInterestRate/annualBlockCountEveryYear)^annualBlockCountEveryEpoch - 1
+	result.BasicReward = p.CalculateRewardByRate(
+		input.NominalInterestRateScaled,
+		input.AnnualBlockCountEveryYear,
+		input.AnnualBlockCountEveryEpoch,
+		input.TotalPooled,
+	)
+
+	// Calculate contribution reward rate
+	contributionRewardRate := CalculateContributionRewardRate(
+		input.InflationRate,
+		input.InTurnCounts,
+		input.TotalTurnCounts,
+		input.CommissionRate,
+		input.TotalDelegated,
+		input.TotalPooled,
+		input.ValidatorsTotalPooled,
+		input.TotalSupply,
+	)
+
+	// Cap contribution reward rate at maximum
+	if contributionRewardRate.Cmp(maxContributionRewardRate) > 0 {
+		contributionRewardRate = new(big.Int).Set(maxContributionRewardRate)
+	}
+
+	// Calculate contribution reward with compound interest:
+	// totalPooled * ((1 + contributionRewardRate/annualBlockCountEveryYear)^annualBlockCountEveryEpoch - 1)
+	result.ContributionReward = p.CalculateRewardByRate(
+		contributionRewardRate,
+		input.AnnualBlockCountEveryYear,
+		input.AnnualBlockCountEveryEpoch,
+		input.TotalPooled,
+	)
+
+	return result
 }
 
 // slash spoiled validators
@@ -892,4 +1064,74 @@ func (p *Parlia) getBurnedAddressList(blockNr rpc.BlockNumberOrHash) ([]common.A
 		return nil, err
 	}
 	return unpacked[0].([]common.Address), nil
+}
+
+// defaultEthAPIReader is the default implementation of ethAPIReader interface.
+// It delegates all calls to the underlying Parlia instance methods.
+type defaultEthAPIReader struct {
+	parlia *Parlia
+}
+
+func (r *defaultEthAPIReader) GetNominalInterestRate(blockNr rpc.BlockNumberOrHash) (*big.Int, error) {
+	return r.parlia.getNominalInterestRate(blockNr)
+}
+
+func (r *defaultEthAPIReader) GetInflationRate(blockNr rpc.BlockNumberOrHash) (*big.Int, error) {
+	return r.parlia.getInflationRate(blockNr)
+}
+
+func (r *defaultEthAPIReader) GetMaxContributionRewardRatio(blockNr rpc.BlockNumberOrHash) (*big.Int, error) {
+	return r.parlia.getMaxContributionRewardRatio(blockNr)
+}
+
+func (r *defaultEthAPIReader) GetTotalSupply(blockNr rpc.BlockNumberOrHash) (*big.Int, *big.Int, error) {
+	return r.parlia.getTotalSupply(blockNr)
+}
+
+func (r *defaultEthAPIReader) GetValidatorsTotalPooled(blockNr rpc.BlockNumberOrHash) (*big.Int, error) {
+	return r.parlia.getValidatorsTotalPooled(blockNr)
+}
+
+func (r *defaultEthAPIReader) GetAllValidators(blockNr rpc.BlockNumberOrHash) ([]common.Address, error) {
+	return r.parlia.getAllValidators(blockNr)
+}
+
+func (r *defaultEthAPIReader) GetValidatorDelegatedAmount(blockNr rpc.BlockNumberOrHash, operatorAddr common.Address) (*big.Int, *big.Int, *big.Int, error) {
+	return r.parlia.getValidatorDelegatedAmount(blockNr, operatorAddr)
+}
+
+func (r *defaultEthAPIReader) GetValidatorConsensusAddress(blockNr rpc.BlockNumberOrHash, operatorAddr common.Address) (common.Address, error) {
+	return r.parlia.getValidatorConsensusAddress(blockNr, operatorAddr)
+}
+
+func (r *defaultEthAPIReader) GetValidatorUptimeRecord(blockNr rpc.BlockNumberOrHash, val common.Address, index *big.Int) (*big.Int, *big.Int, error) {
+	return r.parlia.getValidatorUptimeRecord(blockNr, val, index)
+}
+
+func (r *defaultEthAPIReader) GetValidatorCommissionRate(blockNr rpc.BlockNumberOrHash, val common.Address) (CommissionItem, error) {
+	return r.parlia.getValidatorCommissionRate(blockNr, val)
+}
+
+// defaultEthAPIWriter is the default implementation of ethAPIWriter interface.
+// It delegates all calls to the underlying state database and Parlia instance methods.
+type defaultEthAPIWriter struct {
+	parlia *Parlia
+	state  vm.StateDB
+}
+
+func (w *defaultEthAPIWriter) SetBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) {
+	w.state.SetBalance(addr, amount, reason)
+}
+
+func (w *defaultEthAPIWriter) AddBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) {
+	w.state.AddBalance(addr, amount, reason)
+}
+
+func (w *defaultEthAPIWriter) GetBalance(addr common.Address) *uint256.Int {
+	return w.state.GetBalance(addr)
+}
+
+func (w *defaultEthAPIWriter) DistributeIncoming(val common.Address, state vm.StateDB, header *types.Header, chain core.ChainContext,
+	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) (*big.Int, error) {
+	return w.parlia.distributeIncoming(val, state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
 }
