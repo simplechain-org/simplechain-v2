@@ -688,7 +688,7 @@ func (p *Parlia) distributeBasicAndContributionRewardWithInterfaces(chain consen
 		return nil, nil, nil, err
 	}
 
-	log.Debug("distributeBasicAndContributionReward get validators length = ", len(allValidators))
+	log.Debug("distributeBasicAndContributionReward get validators", "length", len(allValidators))
 	writer.SetBalance(consensus.SystemAddress, common.U2560, tracing.BalanceDecreaseBSCDistributeReward)
 
 	// Prepare shared calculation parameters

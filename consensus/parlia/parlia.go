@@ -2050,6 +2050,8 @@ func (p *Parlia) distributeIncoming(val common.Address, state vm.StateDB, header
 	}
 	if val == coinbase {
 		balance = new(uint256.Int).Add(balance, uint256.NewInt(reward.Uint64()))
+	} else {
+		reward = big.NewInt(0)
 	}
 	if balance.Cmp(common.U2560) <= 0 {
 		return big.NewInt(0), nil
