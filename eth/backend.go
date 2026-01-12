@@ -251,6 +251,10 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		chainConfig.VerkleTime = config.OverrideVerkle
 		overrides.OverrideVerkle = config.OverrideVerkle
 	}
+	if config.OverrideCopper != nil {
+		chainConfig.CopperBlock = big.NewInt(int64(*config.OverrideCopper))
+		overrides.OverrideCopper = config.OverrideCopper
+	}
 
 	// startup ancient freeze
 	freezeDb := chainDb

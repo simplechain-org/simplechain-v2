@@ -72,6 +72,7 @@ var (
 			utils.OverrideMaxwell,
 			utils.OverrideFermi,
 			utils.OverrideVerkle,
+			utils.OverrideCopper,
 			utils.MultiDataBaseFlag,
 		}, utils.DatabaseFlags),
 		Description: `
@@ -347,6 +348,10 @@ func initGenesis(ctx *cli.Context) error {
 	if ctx.IsSet(utils.OverrideVerkle.Name) {
 		v := ctx.Uint64(utils.OverrideVerkle.Name)
 		overrides.OverrideVerkle = &v
+	}
+	if ctx.IsSet(utils.OverrideCopper.Name) {
+		v := ctx.Uint64(utils.OverrideCopper.Name)
+		overrides.OverrideCopper = &v
 	}
 
 	chaindb := utils.MakeChainDatabase(ctx, stack, false)

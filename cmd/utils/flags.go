@@ -314,6 +314,11 @@ var (
 		Usage:    "Manually specify the Verkle fork timestamp, overriding the bundled setting",
 		Category: flags.EthCategory,
 	}
+	OverrideCopper = &cli.Uint64Flag{
+		Name:     "override.copper",
+		Usage:    "Manually specify the copper fork block, overriding the bundled setting",
+		Category: flags.EthCategory,
+	}
 	OverrideFullImmutabilityThreshold = &cli.Uint64Flag{
 		Name:     "override.immutabilitythreshold",
 		Usage:    "It is the number of blocks after which a chain segment is considered immutable, only for testing purpose",

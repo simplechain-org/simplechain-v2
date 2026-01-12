@@ -313,6 +313,9 @@ const (
 	// It is only emitted when the tracer has opted in to use the journaling wrapper (WrapWithJournal).
 	BalanceChangeRevert BalanceChangeReason = 15
 
+	BalanceIncreaseBasicReward        BalanceChangeReason = 16
+	BalanceIncreaseContributionReward BalanceChangeReason = 17
+
 	// BSC specific balance changes
 
 	// BalanceDecreaseBSCDistributeReward is a balance change that decreases system address' balance and happens

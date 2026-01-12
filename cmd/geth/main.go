@@ -77,6 +77,7 @@ var (
 		utils.OverrideMaxwell,
 		utils.OverrideFermi,
 		utils.OverrideVerkle,
+		utils.OverrideCopper,
 		utils.OverrideFullImmutabilityThreshold,
 		utils.OverrideMinBlocksForBlobRequests,
 		utils.OverrideDefaultExtraReserveForBlobRequests,

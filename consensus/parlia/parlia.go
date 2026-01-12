@@ -1402,12 +1402,13 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 			log.Error("init contract failed")
 		}
 	}
+	spoiledVal := header.Coinbase
 	if header.Difficulty.Cmp(diffInTurn) != 0 {
 		snap, err := p.snapshot(chain, header.Number.Uint64()-1, header.ParentHash, nil)
 		if err != nil {
 			return err
 		}
-		spoiledVal := snap.inturnValidator()
+		spoiledVal = snap.inturnValidator()
 		signedRecently := false
 		if p.chainConfig.IsPlato(header.Number) {
 			signedRecently = snap.SignRecently(spoiledVal)
@@ -1439,9 +1440,46 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 		intentionalDelayMiningCounter.Inc(1)
 		log.Warn("intentional delay mining detected", "validator", val, "number", header.Number, "hash", header.Hash())
 	}
-	err = p.distributeIncoming(val, state, header, cx, txs, receipts, systemTxs, usedGas, false, tracer)
-	if err != nil {
-		return err
+
+	var additionalIssuanceAmount big.Int
+	var additionalBasicIssuanceAmount big.Int
+	var additionalContributionIssuanceAmount big.Int
+	if p.chainConfig.IsCopper(header.Number) && isBreatheBlock(parent.Time, header.Time) {
+		totalReward, additionalBasicReward, additionalContributionReward, err := p.distributeBasicAndContributionReward(chain, state, header, txs, receipts, systemTxs, usedGas, false, tracer)
+		if err != nil {
+			return err
+		}
+		additionalIssuanceAmount = *totalReward
+		additionalBasicIssuanceAmount = *additionalBasicReward
+		additionalContributionIssuanceAmount = *additionalContributionReward
+	} else {
+		totalReward, err := p.distributeIncoming(val, state, header, cx, txs, receipts, systemTxs, usedGas, false, tracer)
+		if err != nil {
+			return err
+		}
+		additionalIssuanceAmount = *totalReward
+	}
+	// The number of copper is upgrading
+	if p.chainConfig.IsCopper(header.Number) && !p.chainConfig.IsOnCopper(header.Number) {
+		if err := p.updateValidatorUptimeRecord(spoiledVal, state, header, cx, txs, receipts, systemTxs, usedGas, false, tracer); err != nil {
+			log.Warn("updateValidatorUptimeRecord failed", "error", err)
+			return err
+		}
+		err := p.updateCurrentTotalSupply(&additionalIssuanceAmount, &additionalBasicIssuanceAmount, &additionalContributionIssuanceAmount, chain, state, header, txs, receipts, systemTxs, usedGas, false, tracer)
+		if err != nil {
+			return err
+		}
+		// Check if this is the first block of a new year
+		parentYear := time.Unix(int64(parent.Time), 0).UTC().Year()
+		currentYear := time.Unix(int64(header.Time), 0).UTC().Year()
+		isFirstBlockOfNewYear := currentYear > parentYear
+		if isFirstBlockOfNewYear {
+			err := p.updateInflationRecordForNewYear(parentYear, currentYear, cx, state, header, txs, receipts, systemTxs, usedGas, false, tracer)
+			if err != nil {
+				log.Warn("updateInflationRecordForNewYear failed", "error", err)
+				return err
+			}
+		}
 	}
 
 	if p.chainConfig.IsPlato(header.Number) {
@@ -1504,13 +1542,14 @@ func (p *Parlia) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *
 			log.Error("init contract failed")
 		}
 	}
+	spoiledVal := header.Coinbase
 	if header.Difficulty.Cmp(diffInTurn) != 0 {
 		number := header.Number.Uint64()
 		snap, err := p.snapshot(chain, number-1, header.ParentHash, nil)
 		if err != nil {
 			return nil, nil, err
 		}
-		spoiledVal := snap.inturnValidator()
+		spoiledVal = snap.inturnValidator()
 		signedRecently := false
 		if p.chainConfig.IsPlato(header.Number) {
 			signedRecently = snap.SignRecently(spoiledVal)
@@ -1531,9 +1570,46 @@ func (p *Parlia) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *
 		}
 	}
 
-	err := p.distributeIncoming(p.val, state, header, cx, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
-	if err != nil {
-		return nil, nil, err
+	var additionalIssuanceAmount big.Int
+	var additionalBasicIssuanceAmount big.Int
+	var additionalContributionIssuanceAmount big.Int
+	if p.chainConfig.IsCopper(header.Number) && isBreatheBlock(parent.Time, header.Time) {
+		totalReward, additionalBasicReward, additionalContributionReward, err := p.distributeBasicAndContributionReward(chain, state, header, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
+		if err != nil {
+			return nil, nil, err
+		}
+		additionalIssuanceAmount = *totalReward
+		additionalBasicIssuanceAmount = *additionalBasicReward
+		additionalContributionIssuanceAmount = *additionalContributionReward
+	} else {
+		totalReward, err := p.distributeIncoming(p.val, state, header, cx, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
+		if err != nil {
+			return nil, nil, err
+		}
+		additionalIssuanceAmount = *totalReward
+	}
+
+	// The number of copper is upgrading
+	if p.chainConfig.IsCopper(header.Number) && !p.chainConfig.IsOnCopper(header.Number) {
+		if err := p.updateValidatorUptimeRecord(spoiledVal, state, header, cx, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer); err != nil {
+			log.Error("updateValidatorUptimeRecord failed", "block hash", header.Hash(), "spoiled address", spoiledVal, "address", header.Coinbase)
+			return nil, nil, err
+		}
+		err := p.updateCurrentTotalSupply(&additionalIssuanceAmount, &additionalBasicIssuanceAmount, &additionalContributionIssuanceAmount, chain, state, header, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
+		if err != nil {
+			log.Error("updateCurrentTotalSupply failed", "block hash", header.Hash())
+			return nil, nil, err
+		}
+		// Check if this is the first block of a new year
+		parentYear := time.Unix(int64(parent.Time), 0).UTC().Year()
+		currentYear := time.Unix(int64(header.Time), 0).UTC().Year()
+		isFirstBlockOfNewYear := currentYear > parentYear
+		if isFirstBlockOfNewYear {
+			err := p.updateInflationRecordForNewYear(parentYear, currentYear, cx, state, header, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
 	}
 
 	if p.chainConfig.IsPlato(header.Number) {
@@ -1939,7 +2015,7 @@ func (p *Parlia) isIntentionalDelayMining(chain consensus.ChainHeaderReader, hea
 
 // distributeIncoming distributes system incoming of the block
 func (p *Parlia) distributeIncoming(val common.Address, state vm.StateDB, header *types.Header, chain core.ChainContext,
-	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) error {
+	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) (*big.Int, error) {
 	coinbase := header.Coinbase
 
 	doDistributeSysReward := !p.chainConfig.IsKepler(header.Number, header.Time) &&
@@ -1953,29 +2029,37 @@ func (p *Parlia) distributeIncoming(val common.Address, state vm.StateDB, header
 			state.AddBalance(coinbase, rewards, tracing.BalanceChangeUnspecified)
 			err := p.distributeToSystem(rewards.ToBig(), state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			log.Trace("distribute to system reward pool", "block hash", header.Hash(), "amount", rewards)
 		}
 	}
 
 	balance := state.GetBalance(consensus.SystemAddress)
-	if balance.Cmp(common.U2560) <= 0 {
-		return nil
+	if !p.chainConfig.IsCopper(header.Number) && balance.Cmp(common.U2560) <= 0 {
+		return big.NewInt(0), nil
 	}
-
+	log.Info("distributeIncoming ", "val", val.Hex(), "coinbase", coinbase.Hex())
 	state.SetBalance(consensus.SystemAddress, common.U2560, tracing.BalanceDecreaseBSCDistributeReward)
 
 	blockNr := rpc.BlockNumberOrHashWithHash(header.ParentHash, false)
 	reward, err := p.getBlockReward(blockNr)
 	if err != nil {
 		log.Error("Unable to get block reward", "error", err)
+		return nil, err
+	}
+	if val == coinbase {
+		balance = new(uint256.Int).Add(balance, uint256.NewInt(reward.Uint64()))
 	} else {
-		balance.Add(balance, uint256.NewInt(reward.Uint64()))
+		reward = big.NewInt(0)
+	}
+	if balance.Cmp(common.U2560) <= 0 {
+		return big.NewInt(0), nil
 	}
 	state.AddBalance(coinbase, balance, tracing.BalanceIncreaseBSCDistributeReward)
-	log.Trace("distribute to validator contract", "block hash", header.Hash(), "amount", balance, "blockReward", reward)
-	return p.distributeToValidator(balance.ToBig(), val, state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
+
+	log.Trace("distribute to validator contract", "block hash", header.Hash(), "val", val.Hex(), "amount", balance, "blockReward", reward)
+	return reward, p.distributeToValidator(balance.ToBig(), val, state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
 }
 
 // slash spoiled validators
@@ -2436,4 +2520,12 @@ func applyMessage(
 // proposalKey build a key which is a combination of the block number and the proposer address.
 func proposalKey(header types.Header) string {
 	return header.ParentHash.String() + header.Coinbase.String()
+}
+
+// isFirstBlockOfNewYear checks if the current block is the first block of a new year
+// by comparing the year of parent block and current block timestamps
+func isFirstBlockOfNewYear(parentTime, currentTime uint64) bool {
+	parentYear := time.Unix(int64(parentTime), 0).UTC().Year()
+	currentYear := time.Unix(int64(currentTime), 0).UTC().Year()
+	return currentYear > parentYear
 }

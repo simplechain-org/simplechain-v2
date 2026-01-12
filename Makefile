@@ -76,7 +76,7 @@ devtools:
 
 #? help: Build docker image
 docker:
-	docker build --pull -t bnb-chain/bsc:latest -f Dockerfile .
+	docker build --pull -t spc-chain/spc:latest -f Dockerfile .
 
 #? help: Get more info on make commands.
 help: Makefile
