@@ -319,7 +319,7 @@ var (
 		Usage:    "Manually specify the copper fork block, overriding the bundled setting",
 		Category: flags.EthCategory,
 	}
-	OverriderNoBlockReward = &cli.Uint64Flag{
+	OverrideNoBlockReward = &cli.Uint64Flag{
 		Name:     "override.noblockreward",
 		Usage:    "Manually specify the noblockreward fork timestamp, overriding the bundled setting",
 		Category: flags.EthCategory,

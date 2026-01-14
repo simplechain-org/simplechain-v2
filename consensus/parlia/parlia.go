@@ -2044,6 +2044,7 @@ func (p *Parlia) distributeIncoming(val common.Address, state vm.StateDB, header
 
 	blockReward := big.NewInt(0)
 	if !p.chainConfig.IsNoBlockReward(header.Number, header.Time) {
+		log.Debug("have block reward", "number", header.Number, "time", header.Time, "noBlockRewardTime", p.chainConfig.NoBlockRewardTime)
 		blockNr := rpc.BlockNumberOrHashWithHash(header.ParentHash, false)
 		reward, err := p.getBlockReward(blockNr)
 		if err != nil {

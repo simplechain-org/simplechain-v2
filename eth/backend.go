@@ -255,7 +255,10 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		chainConfig.CopperBlock = big.NewInt(int64(*config.OverrideCopper))
 		overrides.OverrideCopper = config.OverrideCopper
 	}
-
+	if config.OverrideNoBlockReward != nil {
+		chainConfig.NoBlockRewardTime = config.OverrideNoBlockReward
+		overrides.OverrideNoBlockReward = config.OverrideNoBlockReward
+	}
 	// startup ancient freeze
 	freezeDb := chainDb
 	if err = freezeDb.SetupFreezerEnv(&ethdb.FreezerEnv{

@@ -74,7 +74,7 @@ var (
 			utils.OverrideVerkle,
 			utils.OverrideCopper,
 			utils.MultiDataBaseFlag,
-			utils.OverriderNoBlockReward,
+			utils.OverrideNoBlockReward,
 		}, utils.DatabaseFlags),
 		Description: `
 The init command initializes a new genesis block and definition for the network.
@@ -354,7 +354,10 @@ func initGenesis(ctx *cli.Context) error {
 		v := ctx.Uint64(utils.OverrideCopper.Name)
 		overrides.OverrideCopper = &v
 	}
-
+	if ctx.IsSet(utils.OverrideNoBlockReward.Name) {
+		v := ctx.Uint64(utils.OverrideNoBlockReward.Name)
+		overrides.OverrideNoBlockReward = &v
+	}
 	chaindb := utils.MakeChainDatabase(ctx, stack, false)
 	defer chaindb.Close()
 
