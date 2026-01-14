@@ -403,6 +403,7 @@ var (
 		PragueTime:              nil,
 		OsakaTime:               nil,
 		VerkleTime:              nil,
+		NoBlockRewardTime:       nil,
 		Ethash:                  new(EthashConfig),
 		Clique:                  nil,
 	}
@@ -457,6 +458,7 @@ var (
 		PragueTime:              nil,
 		OsakaTime:               nil,
 		VerkleTime:              nil,
+		NoBlockRewardTime:       nil,
 		TerminalTotalDifficulty: big.NewInt(math.MaxInt64),
 		Ethash:                  nil,
 		Clique:                  &CliqueConfig{Period: 0, Epoch: 30000},
@@ -487,6 +489,7 @@ var (
 		PragueTime:              nil,
 		OsakaTime:               nil,
 		VerkleTime:              nil,
+		NoBlockRewardTime:       nil,
 		TerminalTotalDifficulty: big.NewInt(math.MaxInt64),
 		Ethash:                  new(EthashConfig),
 		Clique:                  nil,
@@ -517,6 +520,7 @@ var (
 		PragueTime:              newUint64(0),
 		OsakaTime:               newUint64(0),
 		VerkleTime:              nil,
+		NoBlockRewardTime:       nil,
 		TerminalTotalDifficulty: big.NewInt(0),
 		Ethash:                  new(EthashConfig),
 		Clique:                  nil,
@@ -552,6 +556,7 @@ var (
 		PragueTime:              nil,
 		OsakaTime:               nil,
 		VerkleTime:              nil,
+		NoBlockRewardTime:       nil,
 		TerminalTotalDifficulty: big.NewInt(math.MaxInt64),
 		Ethash:                  new(EthashConfig),
 		Clique:                  nil,
@@ -644,22 +649,22 @@ type ChainConfig struct {
 
 	// Fork scheduling was switched from blocks to timestamps here
 
-	ShanghaiTime   *uint64 `json:"shanghaiTime,omitempty"`   // Shanghai switch time (nil = no fork, 0 = already on shanghai)
-	KeplerTime     *uint64 `json:"keplerTime,omitempty"`     // Kepler switch time (nil = no fork, 0 = already activated)
-	FeynmanTime    *uint64 `json:"feynmanTime,omitempty"`    // Feynman switch time (nil = no fork, 0 = already activated)
-	FeynmanFixTime *uint64 `json:"feynmanFixTime,omitempty"` // FeynmanFix switch time (nil = no fork, 0 = already activated)
-	CancunTime     *uint64 `json:"cancunTime,omitempty"`     // Cancun switch time (nil = no fork, 0 = already on cancun)
-	HaberTime      *uint64 `json:"haberTime,omitempty"`      // Haber switch time (nil = no fork, 0 = already on haber)
-	HaberFixTime   *uint64 `json:"haberFixTime,omitempty"`   // HaberFix switch time (nil = no fork, 0 = already on haberFix)
-	BohrTime       *uint64 `json:"bohrTime,omitempty"`       // Bohr switch time (nil = no fork, 0 = already on bohr)
-	PascalTime     *uint64 `json:"pascalTime,omitempty"`     // Pascal switch time (nil = no fork, 0 = already on pascal)
-	PragueTime     *uint64 `json:"pragueTime,omitempty"`     // Prague switch time (nil = no fork, 0 = already on prague)
-	OsakaTime      *uint64 `json:"osakaTime,omitempty"`      // Osaka switch time (nil = no fork, 0 = already on osaka)
-	LorentzTime    *uint64 `json:"lorentzTime,omitempty"`    // Lorentz switch time (nil = no fork, 0 = already on lorentz)
-	MaxwellTime    *uint64 `json:"maxwellTime,omitempty"`    // Maxwell switch time (nil = no fork, 0 = already on maxwell)
-	FermiTime      *uint64 `json:"fermiTime,omitempty"`      // Fermi switch time (nil = no fork, 0 = already on fermi)
-	VerkleTime     *uint64 `json:"verkleTime,omitempty"`     // Verkle switch time (nil = no fork, 0 = already on verkle)
-
+	ShanghaiTime      *uint64 `json:"shanghaiTime,omitempty"`      // Shanghai switch time (nil = no fork, 0 = already on shanghai)
+	KeplerTime        *uint64 `json:"keplerTime,omitempty"`        // Kepler switch time (nil = no fork, 0 = already activated)
+	FeynmanTime       *uint64 `json:"feynmanTime,omitempty"`       // Feynman switch time (nil = no fork, 0 = already activated)
+	FeynmanFixTime    *uint64 `json:"feynmanFixTime,omitempty"`    // FeynmanFix switch time (nil = no fork, 0 = already activated)
+	CancunTime        *uint64 `json:"cancunTime,omitempty"`        // Cancun switch time (nil = no fork, 0 = already on cancun)
+	HaberTime         *uint64 `json:"haberTime,omitempty"`         // Haber switch time (nil = no fork, 0 = already on haber)
+	HaberFixTime      *uint64 `json:"haberFixTime,omitempty"`      // HaberFix switch time (nil = no fork, 0 = already on haberFix)
+	BohrTime          *uint64 `json:"bohrTime,omitempty"`          // Bohr switch time (nil = no fork, 0 = already on bohr)
+	PascalTime        *uint64 `json:"pascalTime,omitempty"`        // Pascal switch time (nil = no fork, 0 = already on pascal)
+	PragueTime        *uint64 `json:"pragueTime,omitempty"`        // Prague switch time (nil = no fork, 0 = already on prague)
+	OsakaTime         *uint64 `json:"osakaTime,omitempty"`         // Osaka switch time (nil = no fork, 0 = already on osaka)
+	LorentzTime       *uint64 `json:"lorentzTime,omitempty"`       // Lorentz switch time (nil = no fork, 0 = already on lorentz)
+	MaxwellTime       *uint64 `json:"maxwellTime,omitempty"`       // Maxwell switch time (nil = no fork, 0 = already on maxwell)
+	FermiTime         *uint64 `json:"fermiTime,omitempty"`         // Fermi switch time (nil = no fork, 0 = already on fermi)
+	VerkleTime        *uint64 `json:"verkleTime,omitempty"`        // Verkle switch time (nil = no fork, 0 = already on verkle)
+	NoBlockRewardTime *uint64 `json:"noBlockRewardTime,omitempty"` // NoBlockReward switch time (nil = no fork, 0 = already on noBlockReward)
 	// TerminalTotalDifficulty is the amount of total difficulty reached by
 	// the network that triggers the consensus upgrade.
 	TerminalTotalDifficulty *big.Int `json:"terminalTotalDifficulty,omitempty"`
@@ -1309,14 +1314,19 @@ func (c *ChainConfig) IsVerkleGenesis() bool {
 	return c.EnableVerkleAtGenesis
 }
 
-// IsLuban returns whether num is either equal to the first fast finality fork block or greater.
+// IsCopper returns whether num is either equal to the first copper fork block or greater.
 func (c *ChainConfig) IsCopper(num *big.Int) bool {
 	return isBlockForked(c.CopperBlock, num)
 }
 
-// IsOnLuban returns whether num is equal to the first fast finality fork block.
+// IsOnCopper returns whether num is equal to the first copper fork block.
 func (c *ChainConfig) IsOnCopper(num *big.Int) bool {
 	return configBlockEqual(c.CopperBlock, num)
+}
+
+// IsNoBlockReward returns whether time is either equal to the NoBlockReward fork time or greater.
+func (c *ChainConfig) IsNoBlockReward(num *big.Int, time uint64) bool {
+	return c.IsCopper(num) && isTimestampForked(c.NoBlockRewardTime, time)
 }
 
 // IsEIP4762 returns whether eip 4762 has been activated at given block.
@@ -1388,6 +1398,7 @@ func (c *ChainConfig) CheckConfigForkOrder() error {
 		{name: "maxwellTime", timestamp: c.MaxwellTime},
 		{name: "fermiTime", timestamp: c.FermiTime},
 		{name: "verkleTime", timestamp: c.VerkleTime, optional: true},
+		{name: "noBlockRewardTime", timestamp: c.NoBlockRewardTime, optional: true},
 	} {
 		if lastFork.name != "" {
 			switch {
@@ -1606,6 +1617,9 @@ func (c *ChainConfig) checkCompatible(newcfg *ChainConfig, headNumber *big.Int, 
 	if isForkTimestampIncompatible(c.VerkleTime, newcfg.VerkleTime, headTimestamp) {
 		return newTimestampCompatError("Verkle fork timestamp", c.VerkleTime, newcfg.VerkleTime)
 	}
+	if isForkTimestampIncompatible(c.NoBlockRewardTime, newcfg.NoBlockRewardTime, headTimestamp) {
+		return newTimestampCompatError("NoBlockReward fork timestamp", c.NoBlockRewardTime, newcfg.NoBlockRewardTime)
+	}
 	return nil
 }
 
@@ -1819,7 +1833,7 @@ type Rules struct {
 	IsShanghai, IsKepler, IsFeynman, IsCancun, IsHaber      bool
 	IsBohr, IsPascal, IsPrague, IsLorentz, IsMaxwell        bool
 	IsFermi, IsOsaka, IsVerkle                              bool
-	IsCooper                                                bool
+	IsCooper, IsNoBlockReward                               bool
 }
 
 // Rules ensures c's ChainID is not nil.
@@ -1866,6 +1880,7 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 		IsOsaka:          c.IsOsaka(num, timestamp),
 		IsVerkle:         c.IsVerkle(num, timestamp),
 		IsCooper:         c.IsCopper(num),
+		IsNoBlockReward:  c.IsNoBlockReward(num, timestamp),
 		IsEIP4762:        isVerkle,
 	}
 }

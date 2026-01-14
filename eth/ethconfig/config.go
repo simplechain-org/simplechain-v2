@@ -214,6 +214,9 @@ type Config struct {
 	// OverrideCopper (TODO: remove after the fork)
 	OverrideCopper *uint64 `toml:",omitempty"`
 
+	// OverrideCopper (TODO: remove after the fork)
+	OverrideNoBlockReward *uint64 `toml:",omitempty"`
+
 	// blob setting
 	BlobExtraReserve uint64
 }

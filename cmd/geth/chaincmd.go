@@ -74,6 +74,7 @@ var (
 			utils.OverrideVerkle,
 			utils.OverrideCopper,
 			utils.MultiDataBaseFlag,
+			utils.OverriderNoBlockReward,
 		}, utils.DatabaseFlags),
 		Description: `
 The init command initializes a new genesis block and definition for the network.

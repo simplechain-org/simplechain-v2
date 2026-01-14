@@ -319,6 +319,11 @@ var (
 		Usage:    "Manually specify the copper fork block, overriding the bundled setting",
 		Category: flags.EthCategory,
 	}
+	OverriderNoBlockReward = &cli.Uint64Flag{
+		Name:     "override.noblockreward",
+		Usage:    "Manually specify the noblockreward fork timestamp, overriding the bundled setting",
+		Category: flags.EthCategory,
+	}
 	OverrideFullImmutabilityThreshold = &cli.Uint64Flag{
 		Name:     "override.immutabilitythreshold",
 		Usage:    "It is the number of blocks after which a chain segment is considered immutable, only for testing purpose",

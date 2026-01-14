@@ -2042,24 +2042,28 @@ func (p *Parlia) distributeIncoming(val common.Address, state vm.StateDB, header
 	log.Info("distributeIncoming ", "val", val.Hex(), "coinbase", coinbase.Hex())
 	state.SetBalance(consensus.SystemAddress, common.U2560, tracing.BalanceDecreaseBSCDistributeReward)
 
-	blockNr := rpc.BlockNumberOrHashWithHash(header.ParentHash, false)
-	reward, err := p.getBlockReward(blockNr)
-	if err != nil {
-		log.Error("Unable to get block reward", "error", err)
-		return nil, err
-	}
-	if val == coinbase {
-		balance = new(uint256.Int).Add(balance, uint256.NewInt(reward.Uint64()))
-	} else {
-		reward = big.NewInt(0)
+	blockReward := big.NewInt(0)
+	if !p.chainConfig.IsNoBlockReward(header.Number, header.Time) {
+		blockNr := rpc.BlockNumberOrHashWithHash(header.ParentHash, false)
+		reward, err := p.getBlockReward(blockNr)
+		if err != nil {
+			log.Error("Unable to get block reward", "error", err)
+			return nil, err
+		}
+		if val == coinbase {
+			balance = new(uint256.Int).Add(balance, uint256.NewInt(reward.Uint64()))
+		} else {
+			reward = big.NewInt(0)
+		}
+		blockReward = reward
 	}
 	if balance.Cmp(common.U2560) <= 0 {
 		return big.NewInt(0), nil
 	}
 	state.AddBalance(coinbase, balance, tracing.BalanceIncreaseBSCDistributeReward)
 
-	log.Trace("distribute to validator contract", "block hash", header.Hash(), "val", val.Hex(), "amount", balance, "blockReward", reward)
-	return reward, p.distributeToValidator(balance.ToBig(), val, state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
+	log.Trace("distribute to validator contract", "block hash", header.Hash(), "val", val.Hex(), "amount", balance, "blockReward", blockReward)
+	return blockReward, p.distributeToValidator(balance.ToBig(), val, state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
 }
 
 // slash spoiled validators
