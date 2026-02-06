@@ -11,6 +11,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/systemcontracts/bohr"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/bruno"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/copper"
+	copperFix "github.com/ethereum/go-ethereum/core/systemcontracts/copper_fix"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/euler"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/feynman"
 	feynmanFix "github.com/ethereum/go-ethereum/core/systemcontracts/feynman_fix"
@@ -95,6 +96,8 @@ var (
 	maxwellUpgrade = make(map[string]*Upgrade)
 
 	copperUpgrade = make(map[string]*Upgrade)
+
+	copperFixUpgrade = make(map[string]*Upgrade)
 )
 
 func init() {
@@ -1057,6 +1060,51 @@ func init() {
 			},
 		},
 	}
+	copperFixUpgrade[chapelNet] = &Upgrade{
+		UpgradeName: "copperFix",
+		Configs: []*UpgradeConfig{
+			{
+				ContractAddr: common.HexToAddress(StakeCreditContract),
+				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
+				Code:         copperFix.ChapelStakeCreditContract,
+			},
+			{
+				ContractAddr: common.HexToAddress(StakeHubContract),
+				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
+				Code:         copperFix.ChapelStakeHubContract,
+			},
+		},
+	}
+	copperFixUpgrade[defaultNet] = &Upgrade{
+		UpgradeName: "copperFix",
+		Configs: []*UpgradeConfig{
+			{
+				ContractAddr: common.HexToAddress(StakeCreditContract),
+				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
+				Code:         copperFix.DefaultStakeCreditContract,
+			},
+			{
+				ContractAddr: common.HexToAddress(StakeHubContract),
+				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
+				Code:         copper.DefaultStakeHubContract,
+			},
+		},
+	}
+	copperFixUpgrade[mainNet] = &Upgrade{
+		UpgradeName: "copperFix",
+		Configs: []*UpgradeConfig{
+			{
+				ContractAddr: common.HexToAddress(StakeCreditContract),
+				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
+				Code:         copperFix.MainnetStakeCreditContract,
+			},
+			{
+				ContractAddr: common.HexToAddress(StakeHubContract),
+				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
+				Code:         copperFix.MainnetStakeHubContract,
+			},
+		},
+	}
 }
 
 func TryUpdateBuildInSystemContract(config *params.ChainConfig, blockNumber *big.Int, lastBlockTime uint64, blockTime uint64, statedb vm.StateDB, atBlockBegin bool) {
@@ -1174,6 +1222,10 @@ func upgradeBuildInSystemContract(config *params.ChainConfig, blockNumber *big.I
 
 	if config.IsOnCopper(blockNumber) {
 		applySystemContractUpgrade(copperUpgrade[network], blockNumber, statedb, logger)
+	}
+
+	if config.IsOnCopperFix(blockNumber, lastBlockTime, blockTime) {
+		applySystemContractUpgrade(copperFixUpgrade[network], blockNumber, statedb, logger)
 	}
 	/*
 		apply other upgrades

@@ -259,6 +259,10 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		chainConfig.NoBlockRewardTime = config.OverrideNoBlockReward
 		overrides.OverrideNoBlockReward = config.OverrideNoBlockReward
 	}
+	if config.OverrideCopperFix != nil {
+		chainConfig.CopperFixTime = config.OverrideCopperFix
+		overrides.OverrideCopperFix = config.OverrideCopperFix
+	}
 	// startup ancient freeze
 	freezeDb := chainDb
 	if err = freezeDb.SetupFreezerEnv(&ethdb.FreezerEnv{

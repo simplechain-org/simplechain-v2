@@ -404,6 +404,7 @@ var (
 		OsakaTime:               nil,
 		VerkleTime:              nil,
 		NoBlockRewardTime:       nil,
+		CopperFixTime:           nil,
 		Ethash:                  new(EthashConfig),
 		Clique:                  nil,
 	}
@@ -459,6 +460,7 @@ var (
 		OsakaTime:               nil,
 		VerkleTime:              nil,
 		NoBlockRewardTime:       nil,
+		CopperFixTime:           nil,
 		TerminalTotalDifficulty: big.NewInt(math.MaxInt64),
 		Ethash:                  nil,
 		Clique:                  &CliqueConfig{Period: 0, Epoch: 30000},
@@ -490,6 +492,7 @@ var (
 		OsakaTime:               nil,
 		VerkleTime:              nil,
 		NoBlockRewardTime:       nil,
+		CopperFixTime:           nil,
 		TerminalTotalDifficulty: big.NewInt(math.MaxInt64),
 		Ethash:                  new(EthashConfig),
 		Clique:                  nil,
@@ -521,6 +524,7 @@ var (
 		OsakaTime:               newUint64(0),
 		VerkleTime:              nil,
 		NoBlockRewardTime:       nil,
+		CopperFixTime:           nil,
 		TerminalTotalDifficulty: big.NewInt(0),
 		Ethash:                  new(EthashConfig),
 		Clique:                  nil,
@@ -557,6 +561,7 @@ var (
 		OsakaTime:               nil,
 		VerkleTime:              nil,
 		NoBlockRewardTime:       nil,
+		CopperFixTime:           nil,
 		TerminalTotalDifficulty: big.NewInt(math.MaxInt64),
 		Ethash:                  new(EthashConfig),
 		Clique:                  nil,
@@ -665,6 +670,7 @@ type ChainConfig struct {
 	FermiTime         *uint64 `json:"fermiTime,omitempty"`         // Fermi switch time (nil = no fork, 0 = already on fermi)
 	VerkleTime        *uint64 `json:"verkleTime,omitempty"`        // Verkle switch time (nil = no fork, 0 = already on verkle)
 	NoBlockRewardTime *uint64 `json:"noBlockRewardTime,omitempty"` // NoBlockReward switch time (nil = no fork, 0 = already on noBlockReward)
+	CopperFixTime     *uint64 `json:"copperFixTime,omitempty"`     // CopperFix switch time (nil = no fork, 0 = already on copperFix)
 	// TerminalTotalDifficulty is the amount of total difficulty reached by
 	// the network that triggers the consensus upgrade.
 	TerminalTotalDifficulty *big.Int `json:"terminalTotalDifficulty,omitempty"`
@@ -841,9 +847,19 @@ func (c *ChainConfig) String() string {
 		FermiTime = big.NewInt(0).SetUint64(*c.FermiTime)
 	}
 
+	var NoBlockRewardTime *big.Int
+	if c.NoBlockRewardTime != nil {
+		NoBlockRewardTime = big.NewInt(0).SetUint64(*c.NoBlockRewardTime)
+	}
+
+	var CopperFixTime *big.Int
+	if c.CopperFixTime != nil {
+		CopperFixTime = big.NewInt(0).SetUint64(*c.CopperFixTime)
+	}
+
 	return fmt.Sprintf("{ChainID: %v, Engine: %v, Homestead: %v DAO: %v DAOSupport: %v EIP150: %v EIP155: %v EIP158: %v Byzantium: %v Constantinople: %v Petersburg: %v Istanbul: %v, Muir Glacier: %v, Ramanujan: %v, Niels: %v, "+
-		"MirrorSync: %v, Bruno: %v, Berlin: %v, YOLO v3: %v, CatalystBlock: %v, London: %v, ArrowGlacier: %v, MergeFork:%v, Euler: %v, Gibbs: %v, Nano: %v, Moran: %v, Planck: %v,Luban: %v, Plato: %v, Hertz: %v, Hertzfix: %v, "+
-		"ShanghaiTime: %v, KeplerTime: %v, FeynmanTime: %v, FeynmanFixTime: %v, CancunTime: %v, HaberTime: %v, HaberFixTime: %v, BohrTime: %v, PascalTime: %v, PragueTime: %v, LorentzTime: %v, MaxwellTime: %v, FermiTime: %v}",
+		"MirrorSync: %v, Bruno: %v, Berlin: %v, YOLO v3: %v, CatalystBlock: %v, London: %v, ArrowGlacier: %v, MergeFork:%v, Euler: %v, Gibbs: %v, Nano: %v, Moran: %v, Planck: %v,Luban: %v, Plato: %v, Hertz: %v, Hertzfix: %v, Copper: %v, "+
+		"ShanghaiTime: %v, KeplerTime: %v, FeynmanTime: %v, FeynmanFixTime: %v, CancunTime: %v, HaberTime: %v, HaberFixTime: %v, BohrTime: %v, PascalTime: %v, PragueTime: %v, LorentzTime: %v, MaxwellTime: %v, FermiTime: %v, NoBlockRewardTime: %v, CopperFixTime: %v}",
 		c.ChainID,
 		engine,
 		c.HomesteadBlock,
@@ -890,6 +906,8 @@ func (c *ChainConfig) String() string {
 		LorentzTime,
 		MaxwellTime,
 		FermiTime,
+		NoBlockRewardTime,
+		CopperFixTime,
 	)
 }
 
@@ -1329,6 +1347,20 @@ func (c *ChainConfig) IsNoBlockReward(num *big.Int, time uint64) bool {
 	return c.IsCopper(num) && isTimestampForked(c.NoBlockRewardTime, time)
 }
 
+// IsCopperFix returns whether time is either equal to the CopperFix fork time or greater.
+func (c *ChainConfig) IsCopperFix(num *big.Int, time uint64) bool {
+	return c.IsCopper(num) && isTimestampForked(c.CopperFixTime, time)
+}
+
+// IsOnCopperFix returns whether currentBlockTime is either equal to the CopperFix fork time or greater firstly.
+func (c *ChainConfig) IsOnCopperFix(currentBlockNumber *big.Int, lastBlockTime uint64, currentBlockTime uint64) bool {
+	lastBlockNumber := new(big.Int)
+	if currentBlockNumber.Cmp(big.NewInt(1)) >= 0 {
+		lastBlockNumber.Sub(currentBlockNumber, big.NewInt(1))
+	}
+	return !c.IsCopperFix(lastBlockNumber, lastBlockTime) && c.IsCopperFix(currentBlockNumber, currentBlockTime)
+}
+
 // IsEIP4762 returns whether eip 4762 has been activated at given block.
 func (c *ChainConfig) IsEIP4762(num *big.Int, time uint64) bool {
 	return c.IsVerkle(num, time)
@@ -1399,6 +1431,7 @@ func (c *ChainConfig) CheckConfigForkOrder() error {
 		{name: "fermiTime", timestamp: c.FermiTime},
 		{name: "verkleTime", timestamp: c.VerkleTime, optional: true},
 		{name: "noBlockRewardTime", timestamp: c.NoBlockRewardTime, optional: true},
+		{name: "copperFixTime", timestamp: c.CopperFixTime, optional: true},
 	} {
 		if lastFork.name != "" {
 			switch {
@@ -1620,6 +1653,9 @@ func (c *ChainConfig) checkCompatible(newcfg *ChainConfig, headNumber *big.Int, 
 	if isForkTimestampIncompatible(c.NoBlockRewardTime, newcfg.NoBlockRewardTime, headTimestamp) {
 		return newTimestampCompatError("NoBlockReward fork timestamp", c.NoBlockRewardTime, newcfg.NoBlockRewardTime)
 	}
+	if isForkTimestampIncompatible(c.CopperFixTime, newcfg.CopperFixTime, headTimestamp) {
+		return newTimestampCompatError("CopperFix fork timestamp", c.CopperFixTime, newcfg.CopperFixTime)
+	}
 	return nil
 }
 
@@ -1833,7 +1869,7 @@ type Rules struct {
 	IsShanghai, IsKepler, IsFeynman, IsCancun, IsHaber      bool
 	IsBohr, IsPascal, IsPrague, IsLorentz, IsMaxwell        bool
 	IsFermi, IsOsaka, IsVerkle                              bool
-	IsCooper, IsNoBlockReward                               bool
+	IsCooper, IsNoBlockReward, IsCopperFix                  bool
 }
 
 // Rules ensures c's ChainID is not nil.
@@ -1881,6 +1917,7 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 		IsVerkle:         c.IsVerkle(num, timestamp),
 		IsCooper:         c.IsCopper(num),
 		IsNoBlockReward:  c.IsNoBlockReward(num, timestamp),
+		IsCopperFix:      c.IsCopperFix(num, timestamp),
 		IsEIP4762:        isVerkle,
 	}
 }
