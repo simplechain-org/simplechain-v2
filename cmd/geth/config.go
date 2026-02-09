@@ -282,9 +282,9 @@ func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend) {
 		v := ctx.Uint64(utils.OverrideNoBlockReward.Name)
 		cfg.Eth.OverrideNoBlockReward = &v
 	}
-	if ctx.IsSet(utils.OverrideCopperFix.Name) {
-		v := ctx.Uint64(utils.OverrideCopperFix.Name)
-		cfg.Eth.OverrideCopperFix = &v
+	if ctx.IsSet(utils.OverrideCopperRemix.Name) {
+		v := ctx.Uint64(utils.OverrideCopperRemix.Name)
+		cfg.Eth.OverrideCopperRemix = &v
 	}
 	if ctx.IsSet(utils.OverrideFullImmutabilityThreshold.Name) {
 		params.FullImmutabilityThreshold = ctx.Uint64(utils.OverrideFullImmutabilityThreshold.Name)

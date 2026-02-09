@@ -79,7 +79,7 @@ var (
 		utils.OverrideVerkle,
 		utils.OverrideCopper,
 		utils.OverrideNoBlockReward,
-		utils.OverrideCopperFix,
+		utils.OverrideCopperRemix,
 		utils.OverrideFullImmutabilityThreshold,
 		utils.OverrideMinBlocksForBlobRequests,
 		utils.OverrideDefaultExtraReserveForBlobRequests,

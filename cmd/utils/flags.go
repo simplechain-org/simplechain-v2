@@ -324,9 +324,9 @@ var (
 		Usage:    "Manually specify the noblockreward fork timestamp, overriding the bundled setting",
 		Category: flags.EthCategory,
 	}
-	OverrideCopperFix = &cli.Uint64Flag{
-		Name:     "override.copperfix",
-		Usage:    "Manually specify the copperfix fork timestamp, overriding the bundled setting",
+	OverrideCopperRemix = &cli.Uint64Flag{
+		Name:     "override.copperremix",
+		Usage:    "Manually specify the copperremix fork timestamp, overriding the bundled setting",
 		Category: flags.EthCategory,
 	}
 	OverrideFullImmutabilityThreshold = &cli.Uint64Flag{
