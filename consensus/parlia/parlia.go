@@ -254,12 +254,13 @@ type Parlia struct {
 
 	lock sync.RWMutex // Protects the signer fields
 
-	ethAPI                     *ethapi.BlockChainAPI
-	VotePool                   consensus.VotePool
-	validatorSetABIBeforeLuban abi.ABI
-	validatorSetABI            abi.ABI
-	slashABI                   abi.ABI
-	stakeHubABI                abi.ABI
+	ethAPI                            *ethapi.BlockChainAPI
+	VotePool                          consensus.VotePool
+	validatorSetABIBeforeLuban        abi.ABI
+	validatorSetABIBeforeCopperRemix2 abi.ABI
+	validatorSetABI                   abi.ABI
+	slashABI                          abi.ABI
+	stakeHubABI                       abi.ABI
 
 	// The fields below are for testing only
 	fakeDiff bool // Skip difficulty verifications
@@ -280,6 +281,10 @@ func New(
 	if err != nil {
 		panic(err)
 	}
+	vABIBeforeCopperRemix2, err := abi.JSON(strings.NewReader(validatorSetABIBeforeCopperRemix2))
+	if err != nil {
+		panic(err)
+	}
 	vABI, err := abi.JSON(strings.NewReader(validatorSetABI))
 	if err != nil {
 		panic(err)
@@ -293,19 +298,20 @@ func New(
 		panic(err)
 	}
 	c := &Parlia{
-		chainConfig:                chainConfig,
-		config:                     parliaConfig,
-		genesisHash:                genesisHash,
-		db:                         db,
-		ethAPI:                     ethAPI,
-		recentSnaps:                lru.NewCache[common.Hash, *Snapshot](inMemorySnapshots),
-		recentHeaders:              lru.NewCache[string, common.Hash](inMemoryHeaders),
-		signatures:                 lru.NewCache[common.Hash, common.Address](inMemorySignatures),
-		validatorSetABIBeforeLuban: vABIBeforeLuban,
-		validatorSetABI:            vABI,
-		slashABI:                   sABI,
-		stakeHubABI:                stABI,
-		signer:                     types.LatestSigner(chainConfig),
+		chainConfig:                       chainConfig,
+		config:                            parliaConfig,
+		genesisHash:                       genesisHash,
+		db:                                db,
+		ethAPI:                            ethAPI,
+		recentSnaps:                       lru.NewCache[common.Hash, *Snapshot](inMemorySnapshots),
+		recentHeaders:                     lru.NewCache[string, common.Hash](inMemoryHeaders),
+		signatures:                        lru.NewCache[common.Hash, common.Address](inMemorySignatures),
+		validatorSetABIBeforeLuban:        vABIBeforeLuban,
+		validatorSetABIBeforeCopperRemix2: vABIBeforeCopperRemix2,
+		validatorSetABI:                   vABI,
+		slashABI:                          sABI,
+		stakeHubABI:                       stABI,
+		signer:                            types.LatestSigner(chainConfig),
 	}
 
 	return c
@@ -2146,12 +2152,21 @@ func (p *Parlia) distributeToValidator(amount *big.Int, validator common.Address
 	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) error {
 	// method
 	method := "deposit"
+	var data []byte
+	var err error
+	if p.chainConfig.IsCopperRemix2(header.Number, header.Time) {
+		// get packed data
+		data, err = p.validatorSetABI.Pack(method,
+			validator,
+			transactionFee,
+		)
+	} else {
+		// get packed data
+		data, err = p.validatorSetABIBeforeCopperRemix2.Pack(method,
+			validator,
+		)
+	}
 
-	// get packed data
-	data, err := p.validatorSetABI.Pack(method,
-		validator,
-		transactionFee,
-	)
 	if err != nil {
 		log.Error("Unable to pack tx for deposit", "error", err)
 		return err
