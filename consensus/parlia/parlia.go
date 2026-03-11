@@ -1453,7 +1453,7 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 		additionalBasicIssuanceAmount = *additionalBasicReward
 		additionalContributionIssuanceAmount = *additionalContributionReward
 	} else {
-		totalReward, err := p.distributeIncoming(val, state, header, cx, txs, receipts, systemTxs, usedGas, false, tracer)
+		totalReward, err := p.distributeIncoming(val, nil, state, header, cx, txs, receipts, systemTxs, usedGas, false, tracer)
 		if err != nil {
 			return err
 		}
@@ -1582,7 +1582,7 @@ func (p *Parlia) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *
 		additionalBasicIssuanceAmount = *additionalBasicReward
 		additionalContributionIssuanceAmount = *additionalContributionReward
 	} else {
-		totalReward, err := p.distributeIncoming(p.val, state, header, cx, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
+		totalReward, err := p.distributeIncoming(p.val, nil, state, header, cx, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2014,9 +2014,21 @@ func (p *Parlia) isIntentionalDelayMining(chain consensus.ChainHeaderReader, hea
 }
 
 // distributeIncoming distributes system incoming of the block
-func (p *Parlia) distributeIncoming(val common.Address, state vm.StateDB, header *types.Header, chain core.ChainContext,
+func (p *Parlia) distributeIncoming(val common.Address, transactionFee *big.Int, state vm.StateDB, header *types.Header, chain core.ChainContext,
 	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) (*big.Int, error) {
 	coinbase := header.Coinbase
+
+	if p.chainConfig.IsCopperRemix2(header.Number, header.Time) {
+		if transactionFee == nil {
+			if val == coinbase {
+				transactionFee = state.GetBalance(consensus.SystemAddress).ToBig()
+			} else {
+				transactionFee = common.Big0
+			}
+		}
+	} else {
+		transactionFee = common.Big0
+	}
 
 	doDistributeSysReward := !p.chainConfig.IsKepler(header.Number, header.Time) &&
 		state.GetBalance(common.HexToAddress(systemcontracts.SystemRewardContract)).Cmp(maxSystemBalance) < 0
@@ -2063,8 +2075,8 @@ func (p *Parlia) distributeIncoming(val common.Address, state vm.StateDB, header
 	}
 	state.AddBalance(coinbase, balance, tracing.BalanceIncreaseBSCDistributeReward)
 
-	log.Trace("distribute to validator contract", "block hash", header.Hash(), "val", val.Hex(), "amount", balance, "blockReward", blockReward)
-	return blockReward, p.distributeToValidator(balance.ToBig(), val, state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
+	log.Trace("distribute to validator contract", "block hash", header.Hash(), "val", val.Hex(), "amount", balance, "blockReward", blockReward, "transactionFee", transactionFee)
+	return blockReward, p.distributeToValidator(balance.ToBig(), val, transactionFee, state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
 }
 
 // slash spoiled validators
@@ -2129,7 +2141,7 @@ func (p *Parlia) distributeToSystem(amount *big.Int, state vm.StateDB, header *t
 }
 
 // distributeToValidator deposits validator reward to validator contract
-func (p *Parlia) distributeToValidator(amount *big.Int, validator common.Address,
+func (p *Parlia) distributeToValidator(amount *big.Int, validator common.Address, transactionFee *big.Int,
 	state vm.StateDB, header *types.Header, chain core.ChainContext,
 	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) error {
 	// method
@@ -2138,6 +2150,7 @@ func (p *Parlia) distributeToValidator(amount *big.Int, validator common.Address
 	// get packed data
 	data, err := p.validatorSetABI.Pack(method,
 		validator,
+		transactionFee,
 	)
 	if err != nil {
 		log.Error("Unable to pack tx for deposit", "error", err)

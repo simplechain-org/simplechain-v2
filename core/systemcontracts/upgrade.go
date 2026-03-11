@@ -12,6 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/systemcontracts/bruno"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/copper"
 	copperRemix "github.com/ethereum/go-ethereum/core/systemcontracts/copper_remix"
+	copperRemix2 "github.com/ethereum/go-ethereum/core/systemcontracts/copper_remix2"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/euler"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/feynman"
 	feynmanFix "github.com/ethereum/go-ethereum/core/systemcontracts/feynman_fix"
@@ -100,6 +101,8 @@ var (
 	copperRemixUpgrade = make(map[string]*Upgrade)
 
 	copperRemixFixUpgrade = make(map[string]*Upgrade)
+
+	copperRemix2Upgrade = make(map[string]*Upgrade)
 )
 
 func init() {
@@ -1141,6 +1144,52 @@ func init() {
 	copperRemixFixUpgrade[chapelNet] = copperRemixUpgrade[chapelNet]
 	copperRemixFixUpgrade[defaultNet] = copperRemixUpgrade[defaultNet]
 	copperRemixFixUpgrade[mainNet] = copperRemixUpgrade[mainNet]
+
+	copperRemix2Upgrade[chapelNet] = &Upgrade{
+		UpgradeName: "copperRemix2",
+		Configs: []*UpgradeConfig{
+			{
+				ContractAddr: common.HexToAddress(ValidatorContract),
+				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
+				Code:         copperRemix2.ChapelValidatorContract,
+			},
+			{
+				ContractAddr: common.HexToAddress(StakeHubContract),
+				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
+				Code:         copperRemix2.ChapelStakeHubContract,
+			},
+		},
+	}
+	copperRemix2Upgrade[defaultNet] = &Upgrade{
+		UpgradeName: "copperRemix2",
+		Configs: []*UpgradeConfig{
+			{
+				ContractAddr: common.HexToAddress(ValidatorContract),
+				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
+				Code:         copperRemix2.DefaultValidatorContract,
+			},
+			{
+				ContractAddr: common.HexToAddress(StakeHubContract),
+				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
+				Code:         copperRemix2.DefaultStakeHubContract,
+			},
+		},
+	}
+	copperRemix2Upgrade[mainNet] = &Upgrade{
+		UpgradeName: "copperRemix2",
+		Configs: []*UpgradeConfig{
+			{
+				ContractAddr: common.HexToAddress(ValidatorContract),
+				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
+				Code:         copperRemix2.MainnetValidatorContract,
+			},
+			{
+				ContractAddr: common.HexToAddress(StakeHubContract),
+				CommitUrl:    "https://github.com/simplechain-org/spc-genesis-contract/commit/3332f66611412e925d63044c47698b5145e0f588",
+				Code:         copperRemix2.MainnetStakeHubContract,
+			},
+		},
+	}
 }
 
 func TryUpdateBuildInSystemContract(config *params.ChainConfig, blockNumber *big.Int, lastBlockTime uint64, blockTime uint64, statedb vm.StateDB, atBlockBegin bool) {
@@ -1266,6 +1315,10 @@ func upgradeBuildInSystemContract(config *params.ChainConfig, blockNumber *big.I
 
 	if config.IsOnCopperRemixFix(blockNumber, lastBlockTime, blockTime) {
 		applySystemContractUpgrade(copperRemixFixUpgrade[network], blockNumber, statedb, logger)
+	}
+
+	if config.IsOnCopperRemix2(blockNumber, lastBlockTime, blockTime) {
+		applySystemContractUpgrade(copperRemix2Upgrade[network], blockNumber, statedb, logger)
 	}
 	/*
 		apply other upgrades

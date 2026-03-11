@@ -1021,7 +1021,7 @@ func (m *mockEthAPIWriter) GetBalance(addr common.Address) *uint256.Int {
 	return uint256.NewInt(0)
 }
 
-func (m *mockEthAPIWriter) DistributeIncoming(val common.Address, state vm.StateDB, header *types.Header, chain core.ChainContext,
+func (m *mockEthAPIWriter) DistributeIncoming(val common.Address, transactionFee *big.Int, state vm.StateDB, header *types.Header, chain core.ChainContext,
 	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) (*big.Int, error) {
 	if m.distributeIncomingError != nil {
 		return nil, m.distributeIncomingError
@@ -1166,7 +1166,7 @@ func TestMockEthAPIWriter(t *testing.T) {
 
 	// Test DistributeIncoming
 	writer.distributeIncomingResult = big.NewInt(100)
-	result, err := writer.DistributeIncoming(testAddr, nil, nil, nil, nil, nil, nil, nil, false, nil)
+	result, err := writer.DistributeIncoming(testAddr, big.NewInt(0), nil, nil, nil, nil, nil, nil, nil, false, nil)
 	if err != nil {
 		t.Errorf("DistributeIncoming failed: %v", err)
 	}
@@ -1176,7 +1176,7 @@ func TestMockEthAPIWriter(t *testing.T) {
 
 	// Test DistributeIncoming with error
 	writer.distributeIncomingError = errors.New("test error")
-	_, err = writer.DistributeIncoming(testAddr, nil, nil, nil, nil, nil, nil, nil, false, nil)
+	_, err = writer.DistributeIncoming(testAddr, big.NewInt(0), nil, nil, nil, nil, nil, nil, nil, false, nil)
 	if err == nil {
 		t.Error("expected error from DistributeIncoming but got nil")
 	}

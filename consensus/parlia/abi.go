@@ -1170,6 +1170,11 @@ const validatorSetABIBeforeLuban = `
           "internalType": "address",
           "name": "valAddr",
           "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "transactionFee",
+          "type": "uint256"
         }
       ],
       "name": "deposit",
@@ -2030,6 +2035,11 @@ const validatorSetABI = `[
         "name": "valAddr",
         "type": "address",
         "internalType": "address"
+      },
+      {
+        "name": "transactionFee",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ],
     "outputs": [],

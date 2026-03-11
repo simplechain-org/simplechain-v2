@@ -49,7 +49,7 @@ type ethAPIWriter interface {
 	SetBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason)
 	AddBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason)
 	GetBalance(addr common.Address) *uint256.Int
-	DistributeIncoming(val common.Address, state vm.StateDB, header *types.Header, chain core.ChainContext,
+	DistributeIncoming(val common.Address, transactionFee *big.Int, state vm.StateDB, header *types.Header, chain core.ChainContext,
 		txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) (*big.Int, error)
 }
 
@@ -746,7 +746,12 @@ func (p *Parlia) distributeBasicAndContributionRewardWithInterfaces(chain consen
 		writer.AddBalance(consensus.SystemAddress, uint256.MustFromBig(rewardResult.ContributionReward), tracing.BalanceIncreaseContributionReward)
 
 		// Distribute fixed block reward (this still requires state access)
-		fixedBlockReward, err := writer.DistributeIncoming(validatorData.ConsensusAddress, state, header, cx, txs, receipts, receivedTxs, usedGas, mining, tracer)
+		txFee := common.Big0
+		if validatorData.ConsensusAddress == header.Coinbase {
+			// Only pass the breatheBlockFee once (on coinbase) to avoid double counting.
+			txFee = breatheBlockFee.ToBig()
+		}
+		fixedBlockReward, err := writer.DistributeIncoming(validatorData.ConsensusAddress, txFee, state, header, cx, txs, receipts, receivedTxs, usedGas, mining, tracer)
 		if err != nil {
 			log.Warn("distributeBasicAndContributionReward distributeIncoming failed", "blockNr", blockNr.BlockHash.Hex(), "error", err)
 			return nil, nil, nil, err
@@ -1131,7 +1136,7 @@ func (w *defaultEthAPIWriter) GetBalance(addr common.Address) *uint256.Int {
 	return w.state.GetBalance(addr)
 }
 
-func (w *defaultEthAPIWriter) DistributeIncoming(val common.Address, state vm.StateDB, header *types.Header, chain core.ChainContext,
+func (w *defaultEthAPIWriter) DistributeIncoming(val common.Address, transactionFee *big.Int, state vm.StateDB, header *types.Header, chain core.ChainContext,
 	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) (*big.Int, error) {
-	return w.parlia.distributeIncoming(val, state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
+	return w.parlia.distributeIncoming(val, transactionFee, state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
 }

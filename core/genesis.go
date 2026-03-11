@@ -272,6 +272,7 @@ type ChainOverrides struct {
 	OverrideNoBlockReward  *uint64
 	OverrideCopperRemix    *uint64
 	OverrideCopperRemixFix *uint64
+	OverrideCopperRemix2   *uint64
 }
 
 // apply applies the chain overrides on the supplied chain config.
@@ -314,6 +315,9 @@ func (o *ChainOverrides) apply(cfg *params.ChainConfig) error {
 	}
 	if o.OverrideCopperRemixFix != nil {
 		cfg.CopperRemixFixTime = o.OverrideCopperRemixFix
+	}
+	if o.OverrideCopperRemix2 != nil {
+		cfg.CopperRemix2Time = o.OverrideCopperRemix2
 	}
 	return cfg.CheckConfigForkOrder()
 }
