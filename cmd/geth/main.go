@@ -82,6 +82,7 @@ var (
 		utils.OverrideCopperRemix,
 		utils.OverrideCopperRemixFix,
 		utils.OverrideCopperRemix2,
+		utils.OverrideCopperRemix2Fix,
 		utils.OverrideFullImmutabilityThreshold,
 		utils.OverrideMinBlocksForBlobRequests,
 		utils.OverrideDefaultExtraReserveForBlobRequests,

@@ -226,6 +226,9 @@ type Config struct {
 	// OverrideCopperRemix2 (TODO: remove after the fork)
 	OverrideCopperRemix2 *uint64 `toml:",omitempty"`
 
+	// OverrideCopperRemix2Fix (TODO: remove after the fork)
+	OverrideCopperRemix2Fix *uint64 `toml:",omitempty"`
+
 	// blob setting
 	BlobExtraReserve uint64
 }

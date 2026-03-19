@@ -204,6 +204,7 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		OverrideCopperRemix     *uint64 `toml:",omitempty"`
 		OverrideCopperRemixFix  *uint64 `toml:",omitempty"`
 		OverrideCopperRemix2    *uint64 `toml:",omitempty"`
+		OverrideCopperRemix2Fix *uint64 `toml:",omitempty"`
 		BlobExtraReserve        *uint64
 	}
 	var dec Config
@@ -398,6 +399,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.OverrideCopperRemix2 != nil {
 		c.OverrideCopperRemix2 = dec.OverrideCopperRemix2
+	}
+	if dec.OverrideCopperRemix2Fix != nil {
+		c.OverrideCopperRemix2Fix = dec.OverrideCopperRemix2Fix
 	}
 	return nil
 }

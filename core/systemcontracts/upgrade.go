@@ -103,6 +103,8 @@ var (
 	copperRemixFixUpgrade = make(map[string]*Upgrade)
 
 	copperRemix2Upgrade = make(map[string]*Upgrade)
+
+	copperRemix2FixUpgrade = make(map[string]*Upgrade)
 )
 
 func init() {
@@ -1190,6 +1192,10 @@ func init() {
 			},
 		},
 	}
+
+	copperRemix2FixUpgrade[chapelNet] = copperRemix2Upgrade[chapelNet]
+	copperRemix2FixUpgrade[defaultNet] = copperRemix2Upgrade[defaultNet]
+	copperRemix2FixUpgrade[mainNet] = copperRemix2Upgrade[mainNet]
 }
 
 func TryUpdateBuildInSystemContract(config *params.ChainConfig, blockNumber *big.Int, lastBlockTime uint64, blockTime uint64, statedb vm.StateDB, atBlockBegin bool) {
@@ -1319,6 +1325,10 @@ func upgradeBuildInSystemContract(config *params.ChainConfig, blockNumber *big.I
 
 	if config.IsOnCopperRemix2(blockNumber, lastBlockTime, blockTime) {
 		applySystemContractUpgrade(copperRemix2Upgrade[network], blockNumber, statedb, logger)
+	}
+
+	if config.IsOnCopperRemix2Fix(blockNumber, lastBlockTime, blockTime) {
+		applySystemContractUpgrade(copperRemix2FixUpgrade[network], blockNumber, statedb, logger)
 	}
 	/*
 		apply other upgrades

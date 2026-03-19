@@ -263,16 +263,17 @@ func (e *GenesisMismatchError) Error() string {
 // ChainOverrides contains the changes to chain config
 // Typically, these modifications involve hardforks that are not enabled on the BSC mainnet, intended for testing purposes.
 type ChainOverrides struct {
-	OverridePassedForkTime *uint64
-	OverrideLorentz        *uint64
-	OverrideMaxwell        *uint64
-	OverrideFermi          *uint64
-	OverrideVerkle         *uint64
-	OverrideCopper         *uint64
-	OverrideNoBlockReward  *uint64
-	OverrideCopperRemix    *uint64
-	OverrideCopperRemixFix *uint64
-	OverrideCopperRemix2   *uint64
+	OverridePassedForkTime  *uint64
+	OverrideLorentz         *uint64
+	OverrideMaxwell         *uint64
+	OverrideFermi           *uint64
+	OverrideVerkle          *uint64
+	OverrideCopper          *uint64
+	OverrideNoBlockReward   *uint64
+	OverrideCopperRemix     *uint64
+	OverrideCopperRemixFix  *uint64
+	OverrideCopperRemix2    *uint64
+	OverrideCopperRemix2Fix *uint64
 }
 
 // apply applies the chain overrides on the supplied chain config.
@@ -318,6 +319,9 @@ func (o *ChainOverrides) apply(cfg *params.ChainConfig) error {
 	}
 	if o.OverrideCopperRemix2 != nil {
 		cfg.CopperRemix2Time = o.OverrideCopperRemix2
+	}
+	if o.OverrideCopperRemix2Fix != nil {
+		cfg.CopperRemix2FixTime = o.OverrideCopperRemix2Fix
 	}
 	return cfg.CheckConfigForkOrder()
 }
