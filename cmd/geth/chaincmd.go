@@ -79,6 +79,7 @@ var (
 			utils.OverrideCopperRemixFix,
 			utils.OverrideCopperRemix2,
 			utils.OverrideCopperRemix2Fix,
+			utils.OverrideCopperRemix2FixRewardJailed,
 		}, utils.DatabaseFlags),
 		Description: `
 The init command initializes a new genesis block and definition for the network.
@@ -377,6 +378,10 @@ func initGenesis(ctx *cli.Context) error {
 	if ctx.IsSet(utils.OverrideCopperRemix2Fix.Name) {
 		v := ctx.Uint64(utils.OverrideCopperRemix2Fix.Name)
 		overrides.OverrideCopperRemix2Fix = &v
+	}
+	if ctx.IsSet(utils.OverrideCopperRemix2FixRewardJailed.Name) {
+		v := ctx.Uint64(utils.OverrideCopperRemix2FixRewardJailed.Name)
+		overrides.OverrideCopperRemix2FixRewardJailed = &v
 	}
 	chaindb := utils.MakeChainDatabase(ctx, stack, false)
 	defer chaindb.Close()

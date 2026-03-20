@@ -36,7 +36,7 @@ type ethAPIReader interface {
 	GetMaxContributionRewardRatio(blockNr rpc.BlockNumberOrHash) (*big.Int, error)
 	GetTotalSupply(blockNr rpc.BlockNumberOrHash) (*big.Int, *big.Int, error)
 	GetValidatorsTotalPooled(blockNr rpc.BlockNumberOrHash) (*big.Int, error)
-	GetAllValidators(blockNr rpc.BlockNumberOrHash) ([]common.Address, error)
+	GetAllValidators(blockNr rpc.BlockNumberOrHash, num *big.Int, timestamp uint64) ([]common.Address, error)
 	GetValidatorDelegatedAmount(blockNr rpc.BlockNumberOrHash, operatorAddr common.Address) (*big.Int, *big.Int, *big.Int, error)
 	GetValidatorConsensusAddress(blockNr rpc.BlockNumberOrHash, operatorAddr common.Address) (common.Address, error)
 	GetValidatorUptimeRecord(blockNr rpc.BlockNumberOrHash, val common.Address, index *big.Int) (*big.Int, *big.Int, error)
@@ -259,7 +259,7 @@ func (p *Parlia) getTotalIssuanceAmountOfReward(blockNr rpc.BlockNumberOrHash) (
 
 	return unpacked[0].(*big.Int), unpacked[1].(*big.Int), nil
 }
-func (p *Parlia) getAllValidators(blockNr rpc.BlockNumberOrHash) ([]common.Address, error) {
+func (p *Parlia) getAllValidators(blockNr rpc.BlockNumberOrHash, num *big.Int, timestamp uint64) ([]common.Address, error) {
 	method := "getValidators"
 	toAddress := common.HexToAddress(systemcontracts.StakeHubContract)
 	gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
@@ -310,7 +310,28 @@ func (p *Parlia) getAllValidators(blockNr rpc.BlockNumberOrHash) ([]common.Addre
 		offset += uint64(len(operatorAddrs))
 	}
 
-	return allOperatorAddrs, nil
+	// Behavior:
+	// - Before CopperRemix2FixRewardJailed fork: do not check jailed status; reward all validators (including jailed).
+	// - After CopperRemix2FixRewardJailed fork: skip jailed validators.
+	if !p.chainConfig.IsCopperRemix2FixRewardJailed(num, timestamp) {
+		return allOperatorAddrs, nil
+	}
+
+	var activeValidators []common.Address
+	for _, operatorAddr := range allOperatorAddrs {
+		_, jailed, _, err := p.getValidatorBasicInfo(blockNr, operatorAddr)
+		if err != nil {
+			log.Warn("getAllValidators getValidatorBasicInfo failed, including validator anyway", "operatorAddr", operatorAddr, "error", err)
+			return nil, err
+		}
+		if !jailed {
+			activeValidators = append(activeValidators, operatorAddr)
+		} else {
+			log.Debug("getAllValidators skipping jailed validator (after CopperRemix2FixRewardJailed), operatorAddr", operatorAddr)
+		}
+	}
+
+	return activeValidators, nil
 }
 
 func (p *Parlia) getValidatorsTotalPooled(blockNr rpc.BlockNumberOrHash) (*big.Int, error) {
@@ -372,6 +393,41 @@ func (p *Parlia) getValidatorConsensusAddress(blockNr rpc.BlockNumberOrHash, ope
 	}
 
 	return unpacked[0].(common.Address), nil
+}
+
+func (p *Parlia) getValidatorBasicInfo(blockNr rpc.BlockNumberOrHash, operatorAddr common.Address) (uint64, bool, uint64, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	method := "getValidatorBasicInfo"
+	toAddress := common.HexToAddress(systemcontracts.StakeHubContract)
+	gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
+
+	data, err := p.stakeHubABI.Pack(method, operatorAddr)
+	if err != nil {
+		log.Error("Unable to pack tx for getValidatorBasicInfo", "error", err)
+		return 0, false, 0, err
+	}
+	msgData := (hexutil.Bytes)(data)
+
+	result, err := p.ethAPI.Call(ctx, ethapi.TransactionArgs{
+		Gas:  &gas,
+		To:   &toAddress,
+		Data: &msgData,
+	}, &blockNr, nil, nil)
+	if err != nil {
+		return 0, false, 0, err
+	}
+
+	unpacked, err := p.stakeHubABI.Unpack(method, result)
+	if err != nil {
+		return 0, false, 0, err
+	}
+
+	createdTime := unpacked[0].(*big.Int)
+	jailed := unpacked[1].(bool)
+	jailUntil := unpacked[2].(*big.Int)
+
+	return createdTime.Uint64(), jailed, jailUntil.Uint64(), nil
 }
 
 func (p *Parlia) getValidatorCommissionRate(blockNr rpc.BlockNumberOrHash, val common.Address) (CommissionItem, error) {
@@ -682,7 +738,7 @@ func (p *Parlia) distributeBasicAndContributionRewardWithInterfaces(chain consen
 		"maxContributionRewardRatio", maxContributionRewardRatio, "totalIssuedSupply", totalIssuedSupply, "totalBurnedSupply", totalBurnedSupply,
 		"validatorsTotalPooled", validatorsTotalPooled,
 	)
-	allValidators, err := reader.GetAllValidators(blockNr)
+	allValidators, err := reader.GetAllValidators(blockNr, header.Number, header.Time)
 	if err != nil {
 		log.Warn("distributeBasicAndContributionReward getAllValidators failed", "blockNr", blockNr.BlockHash.Hex(), "error", err)
 		return nil, nil, nil, err
@@ -1097,8 +1153,8 @@ func (r *defaultEthAPIReader) GetValidatorsTotalPooled(blockNr rpc.BlockNumberOr
 	return r.parlia.getValidatorsTotalPooled(blockNr)
 }
 
-func (r *defaultEthAPIReader) GetAllValidators(blockNr rpc.BlockNumberOrHash) ([]common.Address, error) {
-	return r.parlia.getAllValidators(blockNr)
+func (r *defaultEthAPIReader) GetAllValidators(blockNr rpc.BlockNumberOrHash, num *big.Int, timestamp uint64) ([]common.Address, error) {
+	return r.parlia.getAllValidators(blockNr, num, timestamp)
 }
 
 func (r *defaultEthAPIReader) GetValidatorDelegatedAmount(blockNr rpc.BlockNumberOrHash, operatorAddr common.Address) (*big.Int, *big.Int, *big.Int, error) {

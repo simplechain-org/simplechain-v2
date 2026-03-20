@@ -344,6 +344,11 @@ var (
 		Usage:    "Manually specify the copperremix2fix fork timestamp, overriding the bundled setting",
 		Category: flags.EthCategory,
 	}
+	OverrideCopperRemix2FixRewardJailed = &cli.Uint64Flag{
+		Name:     "override.copperremix2fixrewardjailed",
+		Usage:    "Manually specify the copperremix2fixrewardjailed fork timestamp, enabling rewarding jailed validators, overriding the bundled setting",
+		Category: flags.EthCategory,
+	}
 	OverrideFullImmutabilityThreshold = &cli.Uint64Flag{
 		Name:     "override.immutabilitythreshold",
 		Usage:    "It is the number of blocks after which a chain segment is considered immutable, only for testing purpose",

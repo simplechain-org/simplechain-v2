@@ -275,6 +275,10 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		chainConfig.CopperRemix2FixTime = config.OverrideCopperRemix2Fix
 		overrides.OverrideCopperRemix2Fix = config.OverrideCopperRemix2Fix
 	}
+	if config.OverrideCopperRemix2FixRewardJailed != nil {
+		chainConfig.CopperRemix2FixRewardJailedTime = config.OverrideCopperRemix2FixRewardJailed
+		overrides.OverrideCopperRemix2FixRewardJailed = config.OverrideCopperRemix2FixRewardJailed
+	}
 	// startup ancient freeze
 	freezeDb := chainDb
 	if err = freezeDb.SetupFreezerEnv(&ethdb.FreezerEnv{

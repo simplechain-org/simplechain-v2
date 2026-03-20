@@ -380,35 +380,36 @@ var (
 	// AllEthashProtocolChanges contains every protocol change (EIPs) introduced
 	// and accepted by the Ethereum core developers into the Ethash consensus.
 	AllEthashProtocolChanges = &ChainConfig{
-		ChainID:                 big.NewInt(1337),
-		HomesteadBlock:          big.NewInt(0),
-		DAOForkBlock:            nil,
-		DAOForkSupport:          false,
-		EIP150Block:             big.NewInt(0),
-		EIP155Block:             big.NewInt(0),
-		EIP158Block:             big.NewInt(0),
-		ByzantiumBlock:          big.NewInt(0),
-		ConstantinopleBlock:     big.NewInt(0),
-		PetersburgBlock:         big.NewInt(0),
-		IstanbulBlock:           big.NewInt(0),
-		MuirGlacierBlock:        big.NewInt(0),
-		BerlinBlock:             big.NewInt(0),
-		LondonBlock:             big.NewInt(0),
-		ArrowGlacierBlock:       big.NewInt(0),
-		GrayGlacierBlock:        big.NewInt(0),
-		TerminalTotalDifficulty: big.NewInt(math.MaxInt64),
-		MergeNetsplitBlock:      nil,
-		ShanghaiTime:            nil,
-		CancunTime:              nil,
-		PragueTime:              nil,
-		OsakaTime:               nil,
-		VerkleTime:              nil,
-		NoBlockRewardTime:       nil,
-		CopperRemixTime:         nil,
-		CopperRemix2Time:        nil,
-		CopperRemix2FixTime:     nil,
-		Ethash:                  new(EthashConfig),
-		Clique:                  nil,
+		ChainID:                         big.NewInt(1337),
+		HomesteadBlock:                  big.NewInt(0),
+		DAOForkBlock:                    nil,
+		DAOForkSupport:                  false,
+		EIP150Block:                     big.NewInt(0),
+		EIP155Block:                     big.NewInt(0),
+		EIP158Block:                     big.NewInt(0),
+		ByzantiumBlock:                  big.NewInt(0),
+		ConstantinopleBlock:             big.NewInt(0),
+		PetersburgBlock:                 big.NewInt(0),
+		IstanbulBlock:                   big.NewInt(0),
+		MuirGlacierBlock:                big.NewInt(0),
+		BerlinBlock:                     big.NewInt(0),
+		LondonBlock:                     big.NewInt(0),
+		ArrowGlacierBlock:               big.NewInt(0),
+		GrayGlacierBlock:                big.NewInt(0),
+		TerminalTotalDifficulty:         big.NewInt(math.MaxInt64),
+		MergeNetsplitBlock:              nil,
+		ShanghaiTime:                    nil,
+		CancunTime:                      nil,
+		PragueTime:                      nil,
+		OsakaTime:                       nil,
+		VerkleTime:                      nil,
+		NoBlockRewardTime:               nil,
+		CopperRemixTime:                 nil,
+		CopperRemix2Time:                nil,
+		CopperRemix2FixTime:             nil,
+		CopperRemix2FixRewardJailedTime: nil,
+		Ethash:                          new(EthashConfig),
+		Clique:                          nil,
 	}
 
 	AllDevChainProtocolChanges = &ChainConfig{
@@ -439,103 +440,106 @@ var (
 	// AllCliqueProtocolChanges contains every protocol change (EIPs) introduced
 	// and accepted by the Ethereum core developers into the Clique consensus.
 	AllCliqueProtocolChanges = &ChainConfig{
-		ChainID:                 big.NewInt(1337),
-		HomesteadBlock:          big.NewInt(0),
-		DAOForkBlock:            nil,
-		DAOForkSupport:          false,
-		EIP150Block:             big.NewInt(0),
-		EIP155Block:             big.NewInt(0),
-		EIP158Block:             big.NewInt(0),
-		ByzantiumBlock:          big.NewInt(0),
-		ConstantinopleBlock:     big.NewInt(0),
-		PetersburgBlock:         big.NewInt(0),
-		IstanbulBlock:           big.NewInt(0),
-		MuirGlacierBlock:        big.NewInt(0),
-		BerlinBlock:             big.NewInt(0),
-		LondonBlock:             big.NewInt(0),
-		ArrowGlacierBlock:       nil,
-		GrayGlacierBlock:        nil,
-		MergeNetsplitBlock:      nil,
-		ShanghaiTime:            nil,
-		CancunTime:              nil,
-		PragueTime:              nil,
-		OsakaTime:               nil,
-		VerkleTime:              nil,
-		NoBlockRewardTime:       nil,
-		CopperRemixTime:         nil,
-		CopperRemix2Time:        nil,
-		CopperRemix2FixTime:     nil,
-		TerminalTotalDifficulty: big.NewInt(math.MaxInt64),
-		Ethash:                  nil,
-		Clique:                  &CliqueConfig{Period: 0, Epoch: 30000},
+		ChainID:                         big.NewInt(1337),
+		HomesteadBlock:                  big.NewInt(0),
+		DAOForkBlock:                    nil,
+		DAOForkSupport:                  false,
+		EIP150Block:                     big.NewInt(0),
+		EIP155Block:                     big.NewInt(0),
+		EIP158Block:                     big.NewInt(0),
+		ByzantiumBlock:                  big.NewInt(0),
+		ConstantinopleBlock:             big.NewInt(0),
+		PetersburgBlock:                 big.NewInt(0),
+		IstanbulBlock:                   big.NewInt(0),
+		MuirGlacierBlock:                big.NewInt(0),
+		BerlinBlock:                     big.NewInt(0),
+		LondonBlock:                     big.NewInt(0),
+		ArrowGlacierBlock:               nil,
+		GrayGlacierBlock:                nil,
+		MergeNetsplitBlock:              nil,
+		ShanghaiTime:                    nil,
+		CancunTime:                      nil,
+		PragueTime:                      nil,
+		OsakaTime:                       nil,
+		VerkleTime:                      nil,
+		NoBlockRewardTime:               nil,
+		CopperRemixTime:                 nil,
+		CopperRemix2Time:                nil,
+		CopperRemix2FixTime:             nil,
+		CopperRemix2FixRewardJailedTime: nil,
+		TerminalTotalDifficulty:         big.NewInt(math.MaxInt64),
+		Ethash:                          nil,
+		Clique:                          &CliqueConfig{Period: 0, Epoch: 30000},
 	}
 
 	// TestChainConfig contains every protocol change (EIPs) introduced
 	// and accepted by the Ethereum core developers for testing purposes.
 	TestChainConfig = &ChainConfig{
-		ChainID:                 big.NewInt(1),
-		HomesteadBlock:          big.NewInt(0),
-		DAOForkBlock:            nil,
-		DAOForkSupport:          false,
-		EIP150Block:             big.NewInt(0),
-		EIP155Block:             big.NewInt(0),
-		EIP158Block:             big.NewInt(0),
-		ByzantiumBlock:          big.NewInt(0),
-		ConstantinopleBlock:     big.NewInt(0),
-		PetersburgBlock:         big.NewInt(0),
-		IstanbulBlock:           big.NewInt(0),
-		MuirGlacierBlock:        big.NewInt(0),
-		BerlinBlock:             big.NewInt(0),
-		LondonBlock:             big.NewInt(0),
-		ArrowGlacierBlock:       big.NewInt(0),
-		GrayGlacierBlock:        big.NewInt(0),
-		MergeNetsplitBlock:      nil,
-		ShanghaiTime:            nil,
-		CancunTime:              nil,
-		PragueTime:              nil,
-		OsakaTime:               nil,
-		VerkleTime:              nil,
-		NoBlockRewardTime:       nil,
-		CopperRemixTime:         nil,
-		CopperRemix2Time:        nil,
-		CopperRemix2FixTime:     nil,
-		TerminalTotalDifficulty: big.NewInt(math.MaxInt64),
-		Ethash:                  new(EthashConfig),
-		Clique:                  nil,
+		ChainID:                         big.NewInt(1),
+		HomesteadBlock:                  big.NewInt(0),
+		DAOForkBlock:                    nil,
+		DAOForkSupport:                  false,
+		EIP150Block:                     big.NewInt(0),
+		EIP155Block:                     big.NewInt(0),
+		EIP158Block:                     big.NewInt(0),
+		ByzantiumBlock:                  big.NewInt(0),
+		ConstantinopleBlock:             big.NewInt(0),
+		PetersburgBlock:                 big.NewInt(0),
+		IstanbulBlock:                   big.NewInt(0),
+		MuirGlacierBlock:                big.NewInt(0),
+		BerlinBlock:                     big.NewInt(0),
+		LondonBlock:                     big.NewInt(0),
+		ArrowGlacierBlock:               big.NewInt(0),
+		GrayGlacierBlock:                big.NewInt(0),
+		MergeNetsplitBlock:              nil,
+		ShanghaiTime:                    nil,
+		CancunTime:                      nil,
+		PragueTime:                      nil,
+		OsakaTime:                       nil,
+		VerkleTime:                      nil,
+		NoBlockRewardTime:               nil,
+		CopperRemixTime:                 nil,
+		CopperRemix2Time:                nil,
+		CopperRemix2FixTime:             nil,
+		CopperRemix2FixRewardJailedTime: nil,
+		TerminalTotalDifficulty:         big.NewInt(math.MaxInt64),
+		Ethash:                          new(EthashConfig),
+		Clique:                          nil,
 	}
 
 	// MergedTestChainConfig contains every protocol change (EIPs) introduced
 	// and accepted by the Ethereum core developers for testing purposes.
 	MergedTestChainConfig = &ChainConfig{
-		ChainID:                 big.NewInt(1),
-		HomesteadBlock:          big.NewInt(0),
-		DAOForkBlock:            nil,
-		DAOForkSupport:          false,
-		EIP150Block:             big.NewInt(0),
-		EIP155Block:             big.NewInt(0),
-		EIP158Block:             big.NewInt(0),
-		ByzantiumBlock:          big.NewInt(0),
-		ConstantinopleBlock:     big.NewInt(0),
-		PetersburgBlock:         big.NewInt(0),
-		IstanbulBlock:           big.NewInt(0),
-		MuirGlacierBlock:        big.NewInt(0),
-		BerlinBlock:             big.NewInt(0),
-		LondonBlock:             big.NewInt(0),
-		ArrowGlacierBlock:       big.NewInt(0),
-		GrayGlacierBlock:        big.NewInt(0),
-		MergeNetsplitBlock:      big.NewInt(0),
-		ShanghaiTime:            newUint64(0),
-		CancunTime:              newUint64(0),
-		PragueTime:              newUint64(0),
-		OsakaTime:               newUint64(0),
-		VerkleTime:              nil,
-		NoBlockRewardTime:       nil,
-		CopperRemixTime:         nil,
-		CopperRemix2Time:        nil,
-		CopperRemix2FixTime:     nil,
-		TerminalTotalDifficulty: big.NewInt(0),
-		Ethash:                  new(EthashConfig),
-		Clique:                  nil,
+		ChainID:                         big.NewInt(1),
+		HomesteadBlock:                  big.NewInt(0),
+		DAOForkBlock:                    nil,
+		DAOForkSupport:                  false,
+		EIP150Block:                     big.NewInt(0),
+		EIP155Block:                     big.NewInt(0),
+		EIP158Block:                     big.NewInt(0),
+		ByzantiumBlock:                  big.NewInt(0),
+		ConstantinopleBlock:             big.NewInt(0),
+		PetersburgBlock:                 big.NewInt(0),
+		IstanbulBlock:                   big.NewInt(0),
+		MuirGlacierBlock:                big.NewInt(0),
+		BerlinBlock:                     big.NewInt(0),
+		LondonBlock:                     big.NewInt(0),
+		ArrowGlacierBlock:               big.NewInt(0),
+		GrayGlacierBlock:                big.NewInt(0),
+		MergeNetsplitBlock:              big.NewInt(0),
+		ShanghaiTime:                    newUint64(0),
+		CancunTime:                      newUint64(0),
+		PragueTime:                      newUint64(0),
+		OsakaTime:                       newUint64(0),
+		VerkleTime:                      nil,
+		NoBlockRewardTime:               nil,
+		CopperRemixTime:                 nil,
+		CopperRemix2Time:                nil,
+		CopperRemix2FixTime:             nil,
+		CopperRemix2FixRewardJailedTime: nil,
+		TerminalTotalDifficulty:         big.NewInt(0),
+		Ethash:                          new(EthashConfig),
+		Clique:                          nil,
 		BlobScheduleConfig: &BlobScheduleConfig{
 			Cancun: DefaultCancunBlobConfig,
 			Prague: DefaultPragueBlobConfig,
@@ -546,35 +550,36 @@ var (
 	// NonActivatedConfig defines the chain configuration without activating
 	// any protocol change (EIPs).
 	NonActivatedConfig = &ChainConfig{
-		ChainID:                 big.NewInt(1),
-		HomesteadBlock:          nil,
-		DAOForkBlock:            nil,
-		DAOForkSupport:          false,
-		EIP150Block:             nil,
-		EIP155Block:             nil,
-		EIP158Block:             nil,
-		ByzantiumBlock:          nil,
-		ConstantinopleBlock:     nil,
-		PetersburgBlock:         nil,
-		IstanbulBlock:           nil,
-		MuirGlacierBlock:        nil,
-		BerlinBlock:             nil,
-		LondonBlock:             nil,
-		ArrowGlacierBlock:       nil,
-		GrayGlacierBlock:        nil,
-		MergeNetsplitBlock:      nil,
-		ShanghaiTime:            nil,
-		CancunTime:              nil,
-		PragueTime:              nil,
-		OsakaTime:               nil,
-		VerkleTime:              nil,
-		NoBlockRewardTime:       nil,
-		CopperRemixTime:         nil,
-		CopperRemix2Time:        nil,
-		CopperRemix2FixTime:     nil,
-		TerminalTotalDifficulty: big.NewInt(math.MaxInt64),
-		Ethash:                  new(EthashConfig),
-		Clique:                  nil,
+		ChainID:                         big.NewInt(1),
+		HomesteadBlock:                  nil,
+		DAOForkBlock:                    nil,
+		DAOForkSupport:                  false,
+		EIP150Block:                     nil,
+		EIP155Block:                     nil,
+		EIP158Block:                     nil,
+		ByzantiumBlock:                  nil,
+		ConstantinopleBlock:             nil,
+		PetersburgBlock:                 nil,
+		IstanbulBlock:                   nil,
+		MuirGlacierBlock:                nil,
+		BerlinBlock:                     nil,
+		LondonBlock:                     nil,
+		ArrowGlacierBlock:               nil,
+		GrayGlacierBlock:                nil,
+		MergeNetsplitBlock:              nil,
+		ShanghaiTime:                    nil,
+		CancunTime:                      nil,
+		PragueTime:                      nil,
+		OsakaTime:                       nil,
+		VerkleTime:                      nil,
+		NoBlockRewardTime:               nil,
+		CopperRemixTime:                 nil,
+		CopperRemix2Time:                nil,
+		CopperRemix2FixTime:             nil,
+		CopperRemix2FixRewardJailedTime: nil,
+		TerminalTotalDifficulty:         big.NewInt(math.MaxInt64),
+		Ethash:                          new(EthashConfig),
+		Clique:                          nil,
 	}
 	TestRules = TestChainConfig.Rules(new(big.Int), false, 0)
 )
@@ -684,6 +689,9 @@ type ChainConfig struct {
 	CopperRemixFixTime  *uint64 `json:"copperRemixFixTime,omitempty"`  // CopperRemixFix switch time (nil = no fork, 0 = already on copperRemixFix)
 	CopperRemix2Time    *uint64 `json:"copperRemix2Time,omitempty"`    // CopperRemix2 switch time (nil = no fork, 0 = already on copperRemix2)
 	CopperRemix2FixTime *uint64 `json:"copperRemix2FixTime,omitempty"` // CopperRemix2Fix switch time (nil = no fork, 0 = already on copperRemix2Fix)
+	// CopperRemix2FixRewardJailed controls whether jailed validators are rewarded.
+	// nil = disabled (keep filtering jailed validators), 0 = already enabled.
+	CopperRemix2FixRewardJailedTime *uint64 `json:"copperRemix2FixRewardJailedTime,omitempty"`
 
 	// TerminalTotalDifficulty is the amount of total difficulty reached by
 	// the network that triggers the consensus upgrade.
@@ -886,9 +894,14 @@ func (c *ChainConfig) String() string {
 		CopperRemix2FixTime = big.NewInt(0).SetUint64(*c.CopperRemix2FixTime)
 	}
 
+	var CopperRemix2FixRewardJailedTime *big.Int
+	if c.CopperRemix2FixRewardJailedTime != nil {
+		CopperRemix2FixRewardJailedTime = big.NewInt(0).SetUint64(*c.CopperRemix2FixRewardJailedTime)
+	}
+
 	return fmt.Sprintf("{ChainID: %v, Engine: %v, Homestead: %v DAO: %v DAOSupport: %v EIP150: %v EIP155: %v EIP158: %v Byzantium: %v Constantinople: %v Petersburg: %v Istanbul: %v, Muir Glacier: %v, Ramanujan: %v, Niels: %v, "+
 		"MirrorSync: %v, Bruno: %v, Berlin: %v, YOLO v3: %v, CatalystBlock: %v, London: %v, ArrowGlacier: %v, MergeFork:%v, Euler: %v, Gibbs: %v, Nano: %v, Moran: %v, Planck: %v,Luban: %v, Plato: %v, Hertz: %v, Hertzfix: %v, Copper: %v, "+
-		"ShanghaiTime: %v, KeplerTime: %v, FeynmanTime: %v, FeynmanFixTime: %v, CancunTime: %v, HaberTime: %v, HaberFixTime: %v, BohrTime: %v, PascalTime: %v, PragueTime: %v, LorentzTime: %v, MaxwellTime: %v, FermiTime: %v, NoBlockRewardTime: %v, CopperRemixTime: %v, CopperRemixFixTime: %v, CopperRemix2Time: %v, CopperRemix2FixTime: %v}",
+		"ShanghaiTime: %v, KeplerTime: %v, FeynmanTime: %v, FeynmanFixTime: %v, CancunTime: %v, HaberTime: %v, HaberFixTime: %v, BohrTime: %v, PascalTime: %v, PragueTime: %v, LorentzTime: %v, MaxwellTime: %v, FermiTime: %v, NoBlockRewardTime: %v, CopperRemixTime: %v, CopperRemixFixTime: %v, CopperRemix2Time: %v, CopperRemix2FixTime: %v, CopperRemix2FixRewardJailedTime: %v}",
 		c.ChainID,
 		engine,
 		c.HomesteadBlock,
@@ -940,6 +953,7 @@ func (c *ChainConfig) String() string {
 		CopperRemixFixTime,
 		CopperRemix2Time,
 		CopperRemix2FixTime,
+		CopperRemix2FixRewardJailedTime,
 	)
 }
 
@@ -1435,6 +1449,20 @@ func (c *ChainConfig) IsOnCopperRemix2Fix(currentBlockNumber *big.Int, lastBlock
 	return !c.IsCopperRemix2Fix(lastBlockNumber, lastBlockTime) && c.IsCopperRemix2Fix(currentBlockNumber, currentBlockTime)
 }
 
+// IsCopperRemix2FixRewardJailed returns whether time is either equal to the CopperRemix2FixRewardJailed fork time or greater.
+func (c *ChainConfig) IsCopperRemix2FixRewardJailed(num *big.Int, time uint64) bool {
+	return c.IsCopper(num) && isTimestampForked(c.CopperRemix2FixRewardJailedTime, time)
+}
+
+// IsOnCopperRemix2FixRewardJailed returns whether currentBlockTime is either equal to the CopperRemix2FixRewardJailed fork time or greater firstly.
+func (c *ChainConfig) IsOnCopperRemix2FixRewardJailed(currentBlockNumber *big.Int, lastBlockTime uint64, currentBlockTime uint64) bool {
+	lastBlockNumber := new(big.Int)
+	if currentBlockNumber.Cmp(big.NewInt(1)) >= 0 {
+		lastBlockNumber.Sub(currentBlockNumber, big.NewInt(1))
+	}
+	return !c.IsCopperRemix2FixRewardJailed(lastBlockNumber, lastBlockTime) && c.IsCopperRemix2FixRewardJailed(currentBlockNumber, currentBlockTime)
+}
+
 // IsEIP4762 returns whether eip 4762 has been activated at given block.
 func (c *ChainConfig) IsEIP4762(num *big.Int, time uint64) bool {
 	return c.IsVerkle(num, time)
@@ -1509,6 +1537,7 @@ func (c *ChainConfig) CheckConfigForkOrder() error {
 		{name: "copperRemixFixTime", timestamp: c.CopperRemixFixTime, optional: true},
 		{name: "copperRemix2Time", timestamp: c.CopperRemix2Time, optional: true},
 		{name: "copperRemix2FixTime", timestamp: c.CopperRemix2FixTime, optional: true},
+		{name: "copperRemix2FixRewardJailedTime", timestamp: c.CopperRemix2FixRewardJailedTime, optional: true},
 	} {
 		if lastFork.name != "" {
 			switch {
@@ -1742,6 +1771,9 @@ func (c *ChainConfig) checkCompatible(newcfg *ChainConfig, headNumber *big.Int, 
 	if isForkTimestampIncompatible(c.CopperRemix2FixTime, newcfg.CopperRemix2FixTime, headTimestamp) {
 		return newTimestampCompatError("CopperRemix2Fix fork timestamp", c.CopperRemix2FixTime, newcfg.CopperRemix2FixTime)
 	}
+	if isForkTimestampIncompatible(c.CopperRemix2FixRewardJailedTime, newcfg.CopperRemix2FixRewardJailedTime, headTimestamp) {
+		return newTimestampCompatError("CopperRemix2FixRewardJailed fork timestamp", c.CopperRemix2FixRewardJailedTime, newcfg.CopperRemix2FixRewardJailedTime)
+	}
 	return nil
 }
 
@@ -1956,6 +1988,7 @@ type Rules struct {
 	IsBohr, IsPascal, IsPrague, IsLorentz, IsMaxwell                                              bool
 	IsFermi, IsOsaka, IsVerkle                                                                    bool
 	IsCooper, IsNoBlockReward, IsCopperRemix, IsCopperRemixFix, IsCopperRemix2, IsCopperRemix2Fix bool
+	IsCopperRemix2FixRewardJailed                                                                 bool
 }
 
 // Rules ensures c's ChainID is not nil.
@@ -1968,45 +2001,46 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 	isMerge = isMerge && c.IsLondon(num)
 	isVerkle := isMerge && c.IsVerkle(num, timestamp)
 	return Rules{
-		ChainID:           new(big.Int).Set(chainID),
-		IsHomestead:       c.IsHomestead(num),
-		IsEIP150:          c.IsEIP150(num),
-		IsEIP155:          c.IsEIP155(num),
-		IsEIP158:          c.IsEIP158(num),
-		IsByzantium:       c.IsByzantium(num),
-		IsConstantinople:  c.IsConstantinople(num),
-		IsPetersburg:      c.IsPetersburg(num),
-		IsIstanbul:        c.IsIstanbul(num),
-		IsBerlin:          c.IsBerlin(num),
-		IsEIP2929:         c.IsBerlin(num) && !isVerkle,
-		IsLondon:          c.IsLondon(num),
-		IsMerge:           isMerge,
-		IsNano:            c.IsNano(num),
-		IsMoran:           c.IsMoran(num),
-		IsPlanck:          c.IsPlanck(num),
-		IsLuban:           c.IsLuban(num),
-		IsPlato:           c.IsPlato(num),
-		IsHertz:           c.IsHertz(num),
-		IsHertzfix:        c.IsHertzfix(num),
-		IsShanghai:        c.IsShanghai(num, timestamp),
-		IsKepler:          c.IsKepler(num, timestamp),
-		IsFeynman:         c.IsFeynman(num, timestamp),
-		IsCancun:          c.IsCancun(num, timestamp),
-		IsHaber:           c.IsHaber(num, timestamp),
-		IsBohr:            c.IsBohr(num, timestamp),
-		IsPascal:          c.IsPascal(num, timestamp),
-		IsPrague:          c.IsPrague(num, timestamp),
-		IsLorentz:         c.IsLorentz(num, timestamp),
-		IsMaxwell:         c.IsMaxwell(num, timestamp),
-		IsFermi:           c.IsFermi(num, timestamp),
-		IsOsaka:           c.IsOsaka(num, timestamp),
-		IsVerkle:          c.IsVerkle(num, timestamp),
-		IsCooper:          c.IsCopper(num),
-		IsNoBlockReward:   c.IsNoBlockReward(num, timestamp),
-		IsCopperRemix:     c.IsCopperRemix(num, timestamp),
-		IsCopperRemixFix:  c.IsCopperRemixFix(num, timestamp),
-		IsCopperRemix2:    c.IsCopperRemix2(num, timestamp),
-		IsCopperRemix2Fix: c.IsCopperRemix2Fix(num, timestamp),
-		IsEIP4762:         isVerkle,
+		ChainID:                       new(big.Int).Set(chainID),
+		IsHomestead:                   c.IsHomestead(num),
+		IsEIP150:                      c.IsEIP150(num),
+		IsEIP155:                      c.IsEIP155(num),
+		IsEIP158:                      c.IsEIP158(num),
+		IsByzantium:                   c.IsByzantium(num),
+		IsConstantinople:              c.IsConstantinople(num),
+		IsPetersburg:                  c.IsPetersburg(num),
+		IsIstanbul:                    c.IsIstanbul(num),
+		IsBerlin:                      c.IsBerlin(num),
+		IsEIP2929:                     c.IsBerlin(num) && !isVerkle,
+		IsLondon:                      c.IsLondon(num),
+		IsMerge:                       isMerge,
+		IsNano:                        c.IsNano(num),
+		IsMoran:                       c.IsMoran(num),
+		IsPlanck:                      c.IsPlanck(num),
+		IsLuban:                       c.IsLuban(num),
+		IsPlato:                       c.IsPlato(num),
+		IsHertz:                       c.IsHertz(num),
+		IsHertzfix:                    c.IsHertzfix(num),
+		IsShanghai:                    c.IsShanghai(num, timestamp),
+		IsKepler:                      c.IsKepler(num, timestamp),
+		IsFeynman:                     c.IsFeynman(num, timestamp),
+		IsCancun:                      c.IsCancun(num, timestamp),
+		IsHaber:                       c.IsHaber(num, timestamp),
+		IsBohr:                        c.IsBohr(num, timestamp),
+		IsPascal:                      c.IsPascal(num, timestamp),
+		IsPrague:                      c.IsPrague(num, timestamp),
+		IsLorentz:                     c.IsLorentz(num, timestamp),
+		IsMaxwell:                     c.IsMaxwell(num, timestamp),
+		IsFermi:                       c.IsFermi(num, timestamp),
+		IsOsaka:                       c.IsOsaka(num, timestamp),
+		IsVerkle:                      c.IsVerkle(num, timestamp),
+		IsCooper:                      c.IsCopper(num),
+		IsNoBlockReward:               c.IsNoBlockReward(num, timestamp),
+		IsCopperRemix:                 c.IsCopperRemix(num, timestamp),
+		IsCopperRemixFix:              c.IsCopperRemixFix(num, timestamp),
+		IsCopperRemix2:                c.IsCopperRemix2(num, timestamp),
+		IsCopperRemix2Fix:             c.IsCopperRemix2Fix(num, timestamp),
+		IsCopperRemix2FixRewardJailed: c.IsCopperRemix2FixRewardJailed(num, timestamp),
+		IsEIP4762:                     isVerkle,
 	}
 }
