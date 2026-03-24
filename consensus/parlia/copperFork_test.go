@@ -918,7 +918,7 @@ func (m *mockEthAPIReader) GetValidatorsTotalPooled(blockNr rpc.BlockNumberOrHas
 	return m.validatorsTotalPooled, nil
 }
 
-func (m *mockEthAPIReader) GetAllValidators(blockNr rpc.BlockNumberOrHash) ([]common.Address, error) {
+func (m *mockEthAPIReader) GetAllValidators(blockNr rpc.BlockNumberOrHash, num *big.Int, timestamp uint64) ([]common.Address, error) {
 	if m.shouldError {
 		return nil, errors.New(m.errorMsg)
 	}
