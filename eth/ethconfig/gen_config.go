@@ -75,6 +75,11 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		OverrideFermi           *uint64 `toml:",omitempty"`
 		OverrideOsaka           *uint64 `toml:",omitempty"`
 		OverrideVerkle          *uint64 `toml:",omitempty"`
+		OverrideCopper          *uint64 `toml:",omitempty"`
+		OverrideNoBlockReward   *uint64 `toml:",omitempty"`
+		OverrideCopperRemix     *uint64 `toml:",omitempty"`
+		OverrideCopperRemixFix  *uint64 `toml:",omitempty"`
+		OverrideCopperRemix2    *uint64 `toml:",omitempty"`
 		BlobExtraReserve        uint64
 	}
 	var enc Config
@@ -136,6 +141,11 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.OverrideOsaka = c.OverrideOsaka
 	enc.OverrideVerkle = c.OverrideVerkle
 	enc.BlobExtraReserve = c.BlobExtraReserve
+	enc.OverrideCopper = c.OverrideCopper
+	enc.OverrideNoBlockReward = c.OverrideNoBlockReward
+	enc.OverrideCopperRemix = c.OverrideCopperRemix
+	enc.OverrideCopperRemixFix = c.OverrideCopperRemixFix
+	enc.OverrideCopperRemix2 = c.OverrideCopperRemix2
 	return &enc, nil
 }
 
