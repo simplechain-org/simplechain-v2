@@ -963,8 +963,10 @@ func (p *Parlia) updateCurrentTotalSupply(additionalIssuanceAmount *big.Int, add
 		balance, err := p.ethAPI.GetBalance(ctx, address, blockNr)
 		if err != nil {
 			log.Error("Failed to get balance for burned address", "address", address, "blockNumber", header.Number, "error", err)
-			// Fallback to current state if API call fails
-			burnedAmount.Add(burnedAmount, state.GetBalance(address).ToBig())
+			// Under no circumstances should the engine fallback to a different state view. If the required state cannot be read, the function must immediately return the error (return err) to abort the block processing.
+			// // Fallback to current state if API call fails
+			// burnedAmount.Add(burnedAmount, state.GetBalance(address).ToBig())
+			return err
 		} else {
 			burnedAmount.Add(burnedAmount, balance.ToInt())
 		}
