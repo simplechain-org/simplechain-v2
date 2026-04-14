@@ -496,6 +496,26 @@ func TestCalculateContributionRewardRate(t *testing.T) {
 	}
 }
 
+func TestCalculateContributionRewardRateReturnsScaledBasisPoints(t *testing.T) {
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
+
+	result := CalculateContributionRewardRate(
+		big.NewInt(500),   // 5% inflation in basis points
+		big.NewInt(10000), // 100% uptime
+		big.NewInt(10000),
+		big.NewInt(0), // 0% commission
+		new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil),                                    // 1 token delegated
+		new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil),                                    // 1 token pooled
+		new(big.Int).Mul(big.NewInt(100), new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)), // 100 validators pooled
+		new(big.Int).Mul(big.NewInt(100), new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)), // 100 total supply
+	)
+
+	expected := new(big.Int).Mul(big.NewInt(500), scale)
+	if result.Cmp(expected) != 0 {
+		t.Fatalf("CalculateContributionRewardRate() = %v, expected scaled basis points %v", result, expected)
+	}
+}
+
 // TestSqrtBigInt tests the sqrtBigInt function
 func TestSqrtBigInt(t *testing.T) {
 	tests := []struct {
@@ -533,13 +553,8 @@ func TestSqrtBigInt(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := sqrtBigInt(tt.input)
-			// Allow for small rounding differences
-			diff := new(big.Int).Sub(result, tt.expected)
-			diff.Abs(diff)
-			// Allow difference of up to 1% of expected value
-			tolerance := new(big.Int).Div(tt.expected, big.NewInt(100))
-			if diff.Cmp(tolerance) > 0 {
-				t.Errorf("sqrtBigInt() = %v, expected approximately %v (diff: %v)", result, tt.expected, diff)
+			if result.Cmp(tt.expected) != 0 {
+				t.Errorf("sqrtBigInt() = %v, expected %v", result, tt.expected)
 			}
 		})
 	}
@@ -795,7 +810,7 @@ func TestCalculateValidatorRewards(t *testing.T) {
 				TotalDelegated:             new(big.Int).Exp(big.NewInt(10), big.NewInt(19), nil), // 10 tokens
 				ValidatorsTotalPooled:      new(big.Int).Exp(big.NewInt(10), big.NewInt(21), nil), // 1000 tokens
 				TotalSupply:                new(big.Int).Exp(big.NewInt(10), big.NewInt(22), nil), // 10000 tokens
-				MaxContributionRewardRatio: new(big.Int).Mul(big.NewInt(1000), scale),             // 10% scaled
+				MaxContributionRewardRatio: big.NewInt(1000),                                      // 10% scaled
 			},
 			maxContributionRewardRate: new(big.Int).Mul(big.NewInt(1000), scale),
 			// Expected values would need to be calculated based on the actual formulas
@@ -817,7 +832,7 @@ func TestCalculateValidatorRewards(t *testing.T) {
 				TotalDelegated:             big.NewInt(0),
 				ValidatorsTotalPooled:      new(big.Int).Exp(big.NewInt(10), big.NewInt(21), nil),
 				TotalSupply:                new(big.Int).Exp(big.NewInt(10), big.NewInt(22), nil),
-				MaxContributionRewardRatio: new(big.Int).Mul(big.NewInt(1000), scale),
+				MaxContributionRewardRatio: big.NewInt(1000),
 			},
 			maxContributionRewardRate:  new(big.Int).Mul(big.NewInt(1000), scale),
 			expectedBasicReward:        big.NewInt(0),

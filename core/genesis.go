@@ -305,7 +305,7 @@ func (o *ChainOverrides) apply(cfg *params.ChainConfig) error {
 		cfg.VerkleTime = o.OverrideVerkle
 	}
 	if o.OverrideCopper != nil {
-		cfg.CopperBlock = big.NewInt(int64(*o.OverrideCopper))
+		cfg.CopperBlock = new(big.Int).SetUint64(*o.OverrideCopper)
 	}
 	if o.OverrideNoBlockReward != nil {
 		cfg.NoBlockRewardTime = o.OverrideNoBlockReward

@@ -2554,11 +2554,3 @@ func applyMessage(
 func proposalKey(header types.Header) string {
 	return header.ParentHash.String() + header.Coinbase.String()
 }
-
-// isFirstBlockOfNewYear checks if the current block is the first block of a new year
-// by comparing the year of parent block and current block timestamps
-func isFirstBlockOfNewYear(parentTime, currentTime uint64) bool {
-	parentYear := time.Unix(int64(parentTime), 0).UTC().Year()
-	currentYear := time.Unix(int64(currentTime), 0).UTC().Year()
-	return currentYear > parentYear
-}

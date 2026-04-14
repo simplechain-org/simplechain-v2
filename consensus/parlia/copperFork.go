@@ -57,20 +57,20 @@ type ethAPIWriter interface {
 // This struct is used to separate data fetching from calculation logic for easier testing
 type ValidatorRewardInput struct {
 	// Basic reward calculation inputs
-	NominalInterestRateScaled  *big.Int // Scaled by 10^18
+	NominalInterestRateScaled  *big.Int // Basis points scaled by 10^18 (e.g. 500 * 1e18 = 5%)
 	AnnualBlockCountEveryYear  *big.Int
 	AnnualBlockCountEveryEpoch *big.Int
 	TotalPooled                *big.Int
 
 	// Contribution reward calculation inputs
-	InflationRate              *big.Int
+	InflationRate              *big.Int // Unscaled basis points (e.g. 500 = 5%)
 	InTurnCounts               *big.Int
 	TotalTurnCounts            *big.Int
 	CommissionRate             *big.Int // In basis points
 	TotalDelegated             *big.Int
 	ValidatorsTotalPooled      *big.Int
 	TotalSupply                *big.Int
-	MaxContributionRewardRatio *big.Int // Scaled by 10^18
+	MaxContributionRewardRatio *big.Int
 }
 
 // ValidatorRewardResult contains the calculated reward results
@@ -500,15 +500,14 @@ func (p *Parlia) getMaxContributionRewardRatio(blockNr rpc.BlockNumberOrHash) (*
 	return unpacked[0].(*big.Int), nil
 }
 
-// CalculateRewardByRateWithBigInt calculates reward using big.Int arithmetic with fast exponentiation
-// rate is in basis points (e.g., 500 for 5%)
+// CalculateRewardByRateWithBigInt calculates reward using big.Int arithmetic with fast exponentiation.
+// rate must be basis points scaled by 10^18 (e.g. 500 * 1e18 = 5%).
 // Formula: reward = totalPooled * ((1 + rate/10000/annualBlockCountEveryYear)^annualBlockCountEveryEpoch - 1)
 func (p *Parlia) CalculateRewardByRate(rate *big.Int, annualBlockCountEveryYear *big.Int,
 	annualBlockCountEveryEpoch *big.Int, totalPooled *big.Int) *big.Int {
 
 	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
-	// ratePerBlock = rate / 10000 / annualBlockCountEveryYear
-	// ratePerBlockScaled = rate * 10000 / annualBlockCountEveryYear
+	// ratePerBlockScaled = (scaled basis points / 10000 / annualBlockCountEveryYear)
 	ratePerBlockScaled := new(big.Int).Set(rate)
 	ratePerBlockScaled.Div(ratePerBlockScaled, annualBlockCountEveryYear)
 	ratePerBlockScaled.Div(ratePerBlockScaled, big.NewInt(10000))
@@ -563,15 +562,15 @@ func powerWithScale(base *big.Int, exp *big.Int, scale *big.Int) *big.Int {
 	return result
 }
 
-// CalculateContributionRewardRate calculates the contribution reward rate using big.Int arithmetic
+// CalculateContributionRewardRate calculates the contribution reward rate using big.Int arithmetic.
 // Formula: contributionRewardRate = inflationRate * uptimeRate * (1 - commissionRate) / totalNetworkStakingRatio * sqrt(contributionStakingRatio)
-// All rates are in basis points (10000 = 100%)
-// Returns: reward rate in basis points
+// inflationRate and commissionRate are unscaled basis points (10000 = 100%).
+// Returns: reward rate in basis points scaled by 10^18.
 func CalculateContributionRewardRate(
-	inflationRate *big.Int, // basis points (e.g., 500 = 5%)
+	inflationRate *big.Int, // unscaled basis points (e.g. 500 = 5%)
 	inTurnCounts *big.Int,
 	totalTurnCounts *big.Int,
-	commissionRate *big.Int, // basis points (e.g., 1000 = 10%)
+	commissionRate *big.Int, // unscaled basis points (e.g. 1000 = 10%)
 	totalDelegated *big.Int,
 	totalPooled *big.Int,
 	validatorsTotalPooled *big.Int,
@@ -621,7 +620,7 @@ func CalculateContributionRewardRate(
 	}
 
 	// 6. Now calculate: inflationRate * uptimeRate * (1 - commissionRate) / totalNetworkStakingRatio * sqrt(contributionStakingRatio)
-	// Start with inflationRate (in basis points)
+	// Start with inflationRate and scale it to "scaled basis points".
 	result := new(big.Int).Mul(inflationRate, scale)
 
 	// result = inflationRate * uptimeRateScaled / scale
@@ -640,40 +639,17 @@ func CalculateContributionRewardRate(
 	result.Mul(result, scale)
 	result.Div(result, networkStakingRatioScaled)
 
-	// Result is now in basis points
+	// Result is now in basis points scaled by 10^18.
 	return result
 }
 
-// sqrtBigInt calculates the integer square root using Newton's method
+// sqrtBigInt calculates the integer square root.
 // For a number scaled by 10^18, the result will be scaled by 10^9
 func sqrtBigInt(n *big.Int) *big.Int {
-	if n.Cmp(big.NewInt(0)) <= 0 {
+	if n.Sign() <= 0 {
 		return big.NewInt(0)
 	}
-
-	// Initial guess: start with n/2
-	x := new(big.Int).Div(n, big.NewInt(2))
-	if x.Cmp(big.NewInt(0)) == 0 {
-		return big.NewInt(1)
-	}
-
-	// Newton's method: x_new = (x + n/x) / 2
-	for {
-		// Calculate n/x
-		nDivX := new(big.Int).Div(n, x)
-
-		// Calculate (x + n/x) / 2
-		xNew := new(big.Int).Add(x, nDivX)
-		xNew.Div(xNew, big.NewInt(2))
-
-		// Check convergence
-		diff := new(big.Int).Sub(x, xNew)
-		if diff.Abs(diff).Cmp(big.NewInt(1)) <= 0 {
-			return xNew
-		}
-
-		x = xNew
-	}
+	return new(big.Int).Sqrt(n)
 }
 
 func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeaderReader, state vm.StateDB, header *types.Header,
@@ -880,7 +856,7 @@ func calculateValidatorRewards(p *Parlia, input *ValidatorRewardInput, maxContri
 	)
 
 	// Calculate contribution reward rate
-	contributionRewardRate := CalculateContributionRewardRate(
+	contributionRewardRateScaled := CalculateContributionRewardRate(
 		input.InflationRate,
 		input.InTurnCounts,
 		input.TotalTurnCounts,
@@ -892,14 +868,14 @@ func calculateValidatorRewards(p *Parlia, input *ValidatorRewardInput, maxContri
 	)
 
 	// Cap contribution reward rate at maximum
-	if contributionRewardRate.Cmp(maxContributionRewardRate) > 0 {
-		contributionRewardRate = new(big.Int).Set(maxContributionRewardRate)
+	if contributionRewardRateScaled.Cmp(maxContributionRewardRate) > 0 {
+		contributionRewardRateScaled = new(big.Int).Set(maxContributionRewardRate)
 	}
 
 	// Calculate contribution reward with compound interest:
 	// totalPooled * ((1 + contributionRewardRate/annualBlockCountEveryYear)^annualBlockCountEveryEpoch - 1)
 	result.ContributionReward = p.CalculateRewardByRate(
-		contributionRewardRate,
+		contributionRewardRateScaled,
 		input.AnnualBlockCountEveryYear,
 		input.AnnualBlockCountEveryEpoch,
 		input.TotalPooled,
@@ -1062,11 +1038,8 @@ func calculateNewYearInflation(currentTotalSupply, lastYearTotalSupply *big.Int)
 	if additionalIssuanceAmount.Cmp(big.NewInt(0)) <= 0 {
 		return big.NewInt(0), big.NewInt(0)
 	}
-	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
-	additionalIssuanceAmountScaled := new(big.Int).Mul(additionalIssuanceAmount, scale)
-	additionalIssuanceAmountScaled.Mul(additionalIssuanceAmountScaled, new(big.Int).SetUint64(10000))
-	newInflationRate := new(big.Int).Div(additionalIssuanceAmountScaled, currentTotalSupply)
-	newInflationRate = newInflationRate.Div(newInflationRate, scale)
+	newInflationRate := new(big.Int).Mul(additionalIssuanceAmount, big.NewInt(10000))
+	newInflationRate.Div(newInflationRate, currentTotalSupply)
 	log.Debug("calculateNewYearInflation", "currentTotalSupply", currentTotalSupply, "lastYearTotalSupply", lastYearTotalSupply, "additionalIssuanceAmount", additionalIssuanceAmount, "newInflationRate", newInflationRate)
 	// max inflation rate is 500 basis points
 	if newInflationRate.Cmp(big.NewInt(MaxInflationRate)) > 0 {

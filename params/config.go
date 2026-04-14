@@ -1925,7 +1925,7 @@ type Rules struct {
 	IsShanghai, IsKepler, IsFeynman, IsCancun, IsHaber                         bool
 	IsBohr, IsPascal, IsPrague, IsLorentz, IsMaxwell                           bool
 	IsFermi, IsOsaka, IsVerkle                                                 bool
-	IsCooper, IsNoBlockReward, IsCopperRemix, IsCopperRemixFix, IsCopperRemix2 bool
+	IsCopper, IsNoBlockReward, IsCopperRemix, IsCopperRemixFix, IsCopperRemix2 bool
 }
 
 // Rules ensures c's ChainID is not nil.
@@ -1971,7 +1971,7 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 		IsFermi:          c.IsFermi(num, timestamp),
 		IsOsaka:          c.IsOsaka(num, timestamp),
 		IsVerkle:         c.IsVerkle(num, timestamp),
-		IsCooper:         c.IsCopper(num),
+		IsCopper:         c.IsCopper(num),
 		IsNoBlockReward:  c.IsNoBlockReward(num, timestamp),
 		IsCopperRemix:    c.IsCopperRemix(num, timestamp),
 		IsCopperRemixFix: c.IsCopperRemixFix(num, timestamp),
