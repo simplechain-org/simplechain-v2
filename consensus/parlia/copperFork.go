@@ -616,6 +616,10 @@ func CalculateContributionRewardRate(
 		return big.NewInt(0)
 	}
 
+	if networkStakingRatioScaled.Cmp(big.NewInt(0)) == 0 {
+		return big.NewInt(0)
+	}
+
 	// 6. Now calculate: inflationRate * uptimeRate * (1 - commissionRate) / totalNetworkStakingRatio * sqrt(contributionStakingRatio)
 	// Start with inflationRate (in basis points)
 	result := new(big.Int).Mul(inflationRate, scale)
