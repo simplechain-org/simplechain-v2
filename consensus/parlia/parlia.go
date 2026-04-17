@@ -254,12 +254,13 @@ type Parlia struct {
 
 	lock sync.RWMutex // Protects the signer fields
 
-	ethAPI                     *ethapi.BlockChainAPI
-	VotePool                   consensus.VotePool
-	validatorSetABIBeforeLuban abi.ABI
-	validatorSetABI            abi.ABI
-	slashABI                   abi.ABI
-	stakeHubABI                abi.ABI
+	ethAPI                            *ethapi.BlockChainAPI
+	VotePool                          consensus.VotePool
+	validatorSetABIBeforeLuban        abi.ABI
+	validatorSetABIBeforeCopperRemix2 abi.ABI
+	validatorSetABI                   abi.ABI
+	slashABI                          abi.ABI
+	stakeHubABI                       abi.ABI
 
 	// The fields below are for testing only
 	fakeDiff bool // Skip difficulty verifications
@@ -280,6 +281,10 @@ func New(
 	if err != nil {
 		panic(err)
 	}
+	vABIBeforeCopperRemix2, err := abi.JSON(strings.NewReader(validatorSetABIBeforeCopperRemix2))
+	if err != nil {
+		panic(err)
+	}
 	vABI, err := abi.JSON(strings.NewReader(validatorSetABI))
 	if err != nil {
 		panic(err)
@@ -293,19 +298,20 @@ func New(
 		panic(err)
 	}
 	c := &Parlia{
-		chainConfig:                chainConfig,
-		config:                     parliaConfig,
-		genesisHash:                genesisHash,
-		db:                         db,
-		ethAPI:                     ethAPI,
-		recentSnaps:                lru.NewCache[common.Hash, *Snapshot](inMemorySnapshots),
-		recentHeaders:              lru.NewCache[string, common.Hash](inMemoryHeaders),
-		signatures:                 lru.NewCache[common.Hash, common.Address](inMemorySignatures),
-		validatorSetABIBeforeLuban: vABIBeforeLuban,
-		validatorSetABI:            vABI,
-		slashABI:                   sABI,
-		stakeHubABI:                stABI,
-		signer:                     types.LatestSigner(chainConfig),
+		chainConfig:                       chainConfig,
+		config:                            parliaConfig,
+		genesisHash:                       genesisHash,
+		db:                                db,
+		ethAPI:                            ethAPI,
+		recentSnaps:                       lru.NewCache[common.Hash, *Snapshot](inMemorySnapshots),
+		recentHeaders:                     lru.NewCache[string, common.Hash](inMemoryHeaders),
+		signatures:                        lru.NewCache[common.Hash, common.Address](inMemorySignatures),
+		validatorSetABIBeforeLuban:        vABIBeforeLuban,
+		validatorSetABIBeforeCopperRemix2: vABIBeforeCopperRemix2,
+		validatorSetABI:                   vABI,
+		slashABI:                          sABI,
+		stakeHubABI:                       stABI,
+		signer:                            types.LatestSigner(chainConfig),
 	}
 
 	return c
@@ -1453,7 +1459,7 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 		additionalBasicIssuanceAmount = *additionalBasicReward
 		additionalContributionIssuanceAmount = *additionalContributionReward
 	} else {
-		totalReward, err := p.distributeIncoming(val, state, header, cx, txs, receipts, systemTxs, usedGas, false, tracer)
+		totalReward, err := p.distributeIncoming(val, nil, state, header, cx, txs, receipts, systemTxs, usedGas, false, tracer)
 		if err != nil {
 			return err
 		}
@@ -1582,7 +1588,7 @@ func (p *Parlia) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *
 		additionalBasicIssuanceAmount = *additionalBasicReward
 		additionalContributionIssuanceAmount = *additionalContributionReward
 	} else {
-		totalReward, err := p.distributeIncoming(p.val, state, header, cx, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
+		totalReward, err := p.distributeIncoming(p.val, nil, state, header, cx, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2014,9 +2020,21 @@ func (p *Parlia) isIntentionalDelayMining(chain consensus.ChainHeaderReader, hea
 }
 
 // distributeIncoming distributes system incoming of the block
-func (p *Parlia) distributeIncoming(val common.Address, state vm.StateDB, header *types.Header, chain core.ChainContext,
+func (p *Parlia) distributeIncoming(val common.Address, transactionFee *big.Int, state vm.StateDB, header *types.Header, chain core.ChainContext,
 	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) (*big.Int, error) {
 	coinbase := header.Coinbase
+
+	if p.chainConfig.IsCopperRemix2(header.Number, header.Time) {
+		if transactionFee == nil {
+			if val == coinbase {
+				transactionFee = state.GetBalance(consensus.SystemAddress).ToBig()
+			} else {
+				transactionFee = common.Big0
+			}
+		}
+	} else {
+		transactionFee = common.Big0
+	}
 
 	doDistributeSysReward := !p.chainConfig.IsKepler(header.Number, header.Time) &&
 		state.GetBalance(common.HexToAddress(systemcontracts.SystemRewardContract)).Cmp(maxSystemBalance) < 0
@@ -2042,24 +2060,29 @@ func (p *Parlia) distributeIncoming(val common.Address, state vm.StateDB, header
 	log.Info("distributeIncoming ", "val", val.Hex(), "coinbase", coinbase.Hex())
 	state.SetBalance(consensus.SystemAddress, common.U2560, tracing.BalanceDecreaseBSCDistributeReward)
 
-	blockNr := rpc.BlockNumberOrHashWithHash(header.ParentHash, false)
-	reward, err := p.getBlockReward(blockNr)
-	if err != nil {
-		log.Error("Unable to get block reward", "error", err)
-		return nil, err
-	}
-	if val == coinbase {
-		balance = new(uint256.Int).Add(balance, uint256.NewInt(reward.Uint64()))
-	} else {
-		reward = big.NewInt(0)
+	blockReward := big.NewInt(0)
+	if !p.chainConfig.IsNoBlockReward(header.Number, header.Time) {
+		log.Debug("have block reward", "number", header.Number, "time", header.Time, "noBlockRewardTime", p.chainConfig.NoBlockRewardTime)
+		blockNr := rpc.BlockNumberOrHashWithHash(header.ParentHash, false)
+		reward, err := p.getBlockReward(blockNr)
+		if err != nil {
+			log.Error("Unable to get block reward", "error", err)
+			return nil, err
+		}
+		if val == coinbase {
+			balance = new(uint256.Int).Add(balance, uint256.NewInt(reward.Uint64()))
+		} else {
+			reward = big.NewInt(0)
+		}
+		blockReward = reward
 	}
 	if balance.Cmp(common.U2560) <= 0 {
 		return big.NewInt(0), nil
 	}
 	state.AddBalance(coinbase, balance, tracing.BalanceIncreaseBSCDistributeReward)
 
-	log.Trace("distribute to validator contract", "block hash", header.Hash(), "val", val.Hex(), "amount", balance, "blockReward", reward)
-	return reward, p.distributeToValidator(balance.ToBig(), val, state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
+	log.Trace("distribute to validator contract", "block hash", header.Hash(), "val", val.Hex(), "amount", balance, "blockReward", blockReward, "transactionFee", transactionFee)
+	return blockReward, p.distributeToValidator(balance.ToBig(), val, transactionFee, state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
 }
 
 // slash spoiled validators
@@ -2124,16 +2147,26 @@ func (p *Parlia) distributeToSystem(amount *big.Int, state vm.StateDB, header *t
 }
 
 // distributeToValidator deposits validator reward to validator contract
-func (p *Parlia) distributeToValidator(amount *big.Int, validator common.Address,
+func (p *Parlia) distributeToValidator(amount *big.Int, validator common.Address, transactionFee *big.Int,
 	state vm.StateDB, header *types.Header, chain core.ChainContext,
 	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) error {
 	// method
 	method := "deposit"
+	var data []byte
+	var err error
+	if p.chainConfig.IsCopperRemix2(header.Number, header.Time) {
+		// get packed data
+		data, err = p.validatorSetABI.Pack(method,
+			validator,
+			transactionFee,
+		)
+	} else {
+		// get packed data
+		data, err = p.validatorSetABIBeforeCopperRemix2.Pack(method,
+			validator,
+		)
+	}
 
-	// get packed data
-	data, err := p.validatorSetABI.Pack(method,
-		validator,
-	)
 	if err != nil {
 		log.Error("Unable to pack tx for deposit", "error", err)
 		return err
@@ -2520,12 +2553,4 @@ func applyMessage(
 // proposalKey build a key which is a combination of the block number and the proposer address.
 func proposalKey(header types.Header) string {
 	return header.ParentHash.String() + header.Coinbase.String()
-}
-
-// isFirstBlockOfNewYear checks if the current block is the first block of a new year
-// by comparing the year of parent block and current block timestamps
-func isFirstBlockOfNewYear(parentTime, currentTime uint64) bool {
-	parentYear := time.Unix(int64(parentTime), 0).UTC().Year()
-	currentYear := time.Unix(int64(currentTime), 0).UTC().Year()
-	return currentYear > parentYear
 }

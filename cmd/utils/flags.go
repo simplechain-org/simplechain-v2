@@ -319,6 +319,26 @@ var (
 		Usage:    "Manually specify the copper fork block, overriding the bundled setting",
 		Category: flags.EthCategory,
 	}
+	OverrideNoBlockReward = &cli.Uint64Flag{
+		Name:     "override.noblockreward",
+		Usage:    "Manually specify the noblockreward fork timestamp, overriding the bundled setting",
+		Category: flags.EthCategory,
+	}
+	OverrideCopperRemix = &cli.Uint64Flag{
+		Name:     "override.copperremix",
+		Usage:    "Manually specify the copperremix fork timestamp, overriding the bundled setting",
+		Category: flags.EthCategory,
+	}
+	OverrideCopperRemixFix = &cli.Uint64Flag{
+		Name:     "override.copperremixfix",
+		Usage:    "Manually specify the copperremixfix fork timestamp, overriding the bundled setting",
+		Category: flags.EthCategory,
+	}
+	OverrideCopperRemix2 = &cli.Uint64Flag{
+		Name:     "override.copperremix2",
+		Usage:    "Manually specify the copperremix2 fork timestamp, overriding the bundled setting",
+		Category: flags.EthCategory,
+	}
 	OverrideFullImmutabilityThreshold = &cli.Uint64Flag{
 		Name:     "override.immutabilitythreshold",
 		Usage:    "It is the number of blocks after which a chain segment is considered immutable, only for testing purpose",

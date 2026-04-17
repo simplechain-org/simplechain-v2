@@ -255,7 +255,22 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		chainConfig.CopperBlock = big.NewInt(int64(*config.OverrideCopper))
 		overrides.OverrideCopper = config.OverrideCopper
 	}
-
+	if config.OverrideNoBlockReward != nil {
+		chainConfig.NoBlockRewardTime = config.OverrideNoBlockReward
+		overrides.OverrideNoBlockReward = config.OverrideNoBlockReward
+	}
+	if config.OverrideCopperRemix != nil {
+		chainConfig.CopperRemixTime = config.OverrideCopperRemix
+		overrides.OverrideCopperRemix = config.OverrideCopperRemix
+	}
+	if config.OverrideCopperRemixFix != nil {
+		chainConfig.CopperRemixFixTime = config.OverrideCopperRemixFix
+		overrides.OverrideCopperRemixFix = config.OverrideCopperRemixFix
+	}
+	if config.OverrideCopperRemix2 != nil {
+		chainConfig.CopperRemix2Time = config.OverrideCopperRemix2
+		overrides.OverrideCopperRemix2 = config.OverrideCopperRemix2
+	}
 	// startup ancient freeze
 	freezeDb := chainDb
 	if err = freezeDb.SetupFreezerEnv(&ethdb.FreezerEnv{
