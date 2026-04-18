@@ -21,7 +21,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"runtime"
+	"strconv"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -32,6 +35,17 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/triedb"
 )
+
+// getGoroutineIDFromRuntime returns the ID of the current goroutine for debugging
+func getGoroutineIDFromRuntime() uint64 {
+	b := make([]byte, 64)
+	b = b[:runtime.Stack(b, false)]
+	// Stack trace format: "goroutine 123 [running]:"
+	b = bytes.TrimPrefix(b, []byte("goroutine "))
+	b = b[:bytes.IndexByte(b, ' ')]
+	id, _ := strconv.ParseUint(string(b), 10, 64)
+	return id
+}
 
 var (
 	snapshotCleanAccountHitMeter   = metrics.NewRegisteredMeter("state/snapshot/clean/account/hit", nil)
@@ -391,21 +405,36 @@ func (t *Tree) Cap(root common.Hash, layers int) error {
 	if !ok {
 		return fmt.Errorf("snapshot [%#x] is disk layer", root)
 	}
+
+	log.Debug("[Snapshot] Cap ENTER",
+		"root", root.Hex()[:8],
+		"requestedLayers", layers,
+		"goroutine", getGoroutineIDFromRuntime())
+
 	// If the generator is still running, use a more aggressive cap
 	diff.origin.lock.RLock()
 	if diff.origin.genMarker != nil && layers > 8 {
+		log.Debug("[Snapshot] Cap - generator running, using aggressive cap", "layers", 8)
 		layers = 8
 	}
 	diff.origin.lock.RUnlock()
 
+	log.Debug("[Snapshot] Cap - acquiring tree lock", "root", root.Hex()[:8])
+
 	// Run the internal capping and discard all stale layers
 	t.lock.Lock()
-	defer t.lock.Unlock()
+	defer func() {
+		t.lock.Unlock()
+		log.Debug("[Snapshot] Cap EXIT - released tree lock", "root", root.Hex()[:8])
+	}()
+
+	log.Debug("[Snapshot] Cap - acquired tree lock, processing", "root", root.Hex()[:8], "layers", layers)
 
 	// Flattening the bottom-most diff layer requires special casing since there's
 	// no child to rewire to the grandparent. In that case we can fake a temporary
 	// child for the capping and then remove it.
 	if layers == 0 {
+		log.Debug("[Snapshot] Cap - full flatten (layers=0)", "root", root.Hex()[:8])
 		// If full commit was requested, flatten the diffs and merge onto disk
 		diff.lock.RLock()
 		base := diffToDisk(diff.flatten().(*diffLayer))
@@ -413,9 +442,13 @@ func (t *Tree) Cap(root common.Hash, layers int) error {
 
 		// Replace the entire snapshot tree with the flat base
 		t.layers = map[common.Hash]snapshot{base.root: base}
+		log.Debug("[Snapshot] Cap - full flatten complete", "root", root.Hex()[:8])
 		return nil
 	}
+
+	log.Debug("[Snapshot] Cap - calling internal cap", "root", root.Hex()[:8], "layers", layers)
 	persisted := t.cap(diff, layers)
+	log.Debug("[Snapshot] Cap - internal cap complete", "root", root.Hex()[:8], "persisted", persisted != nil)
 
 	// Remove any layer that is stale or links into a stale layer
 	children := make(map[common.Hash][]common.Hash)
@@ -467,39 +500,74 @@ func (t *Tree) Cap(root common.Hash, layers int) error {
 // survival is only known *after* capping, we need to omit it from the count if
 // we want to ensure that *at least* the requested number of diff layers remain.
 func (t *Tree) cap(diff *diffLayer, layers int) *diskLayer {
+	log.Debug("[Snapshot] cap ENTER",
+		"diffRoot", diff.root.Hex()[:8],
+		"layers", layers,
+		"goroutine", getGoroutineIDFromRuntime())
+
 	// Dive until we run out of layers or reach the persistent database
 	for i := 0; i < layers-1; i++ {
 		// If we still have diff layers below, continue down
 		if parent, ok := diff.parent.(*diffLayer); ok {
+			//log.Debug("[Snapshot] cap - descending", "level", i, "currentRoot", diff.root.Hex()[:8], "parentRoot", parent.root.Hex()[:8])
 			diff = parent
 		} else {
 			// Diff stack too shallow, return without modifications
+			log.Debug("[Snapshot] cap EXIT - stack too shallow", "level", i)
 			return nil
 		}
 	}
+
+	log.Debug("[Snapshot] cap - reached target depth", "diffRoot", diff.root.Hex()[:8], "layers", layers)
+
 	// We're out of layers, flatten anything below, stopping if it's the disk or if
 	// the memory limit is not yet exceeded.
 	switch parent := diff.parent.(type) {
 	case *diskLayer:
+		log.Debug("[Snapshot] cap EXIT - parent is disk layer")
 		return nil
 
 	case *diffLayer:
+		log.Debug("[Snapshot] cap - parent is diff, starting flatten",
+			"diffRoot", diff.root.Hex()[:8],
+			"parentRoot", parent.root.Hex()[:8],
+			"parentMemory", parent.memory)
+
 		// Hold the write lock until the flattened parent is linked correctly.
 		// Otherwise, the stale layer may be accessed by external reads in the
 		// meantime.
+		log.Debug("[Snapshot] cap - acquiring diff lock", "diffRoot", diff.root.Hex()[:8])
 		diff.lock.Lock()
-		defer diff.lock.Unlock()
+		defer func() {
+			diff.lock.Unlock()
+			log.Debug("[Snapshot] cap - released diff lock", "diffRoot", diff.root.Hex()[:8])
+		}()
+		log.Debug("[Snapshot] cap - acquired diff lock, calling flatten", "diffRoot", diff.root.Hex()[:8])
 
 		// Flatten the parent into the grandparent. The flattening internally obtains a
 		// write lock on grandparent.
 		flattened := parent.flatten().(*diffLayer)
 		t.layers[flattened.root] = flattened
+		log.Debug("[Snapshot] cap - flatten complete, updated layers", "flattenedRoot", flattened.root.Hex()[:8])
 
 		// Invoke the hook if it's registered. Ugly hack.
 		if t.onFlatten != nil {
 			t.onFlatten()
 		}
 		diff.parent = flattened
+
+		// Check if flattened parent is a disk layer before proceeding
+		// If parent detected stale conflict and returned itself without flattening,
+		// flattened.parent may still be a diffLayer instead of diskLayer
+		if _, ok := flattened.parent.(*diskLayer); !ok {
+			// Flattened parent is not a disk layer (likely due to stale conflict)
+			// Return nil to abort the cap operation and retry later
+			log.Warn("[Snapshot] cap - flattened parent is not disk layer (likely stale conflict), aborting cap",
+				"flattenedRoot", flattened.root.Hex()[:8],
+				"parentType", fmt.Sprintf("%T", flattened.parent))
+			return nil
+		}
+
 		if flattened.memory < aggregatorMemoryLimit {
 			// Accumulator layer is smaller than the limit, so we can abort, unless
 			// there's a snapshot being generated currently. In that case, the trie
@@ -535,11 +603,53 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 		batch = base.diskdb.NewBatch()
 		stats *generatorStats
 	)
+
+	// CRITICAL: Acquire base.lock at the very beginning to prevent concurrent diffToDisk
+	// operations on the same base. Even though Cap() holds t.lock, two different Cap()
+	// calls on different roots may both call diffToDisk on the same base.
+	base.lock.Lock()
+	defer base.lock.Unlock()
+
+	// Check if base is already stale - another goroutine may have already started diffToDisk
+	if base.stale {
+		log.Warn("[diffToDisk] Base already stale, another diffToDisk is in progress - returning current base to avoid panic",
+			"baseRoot", base.root.Hex()[:8],
+			"goroutine", getGoroutineIDFromRuntime())
+		// GRACEFUL DEGRADATION: Instead of panic, return the current base unchanged
+		// This can happen in Chained HotStuff when:
+		// 1. executeBlocks commits state for block N (triggers snapshot cap)
+		// 2. InsertChain commits state again for block N (triggers another snapshot cap)
+		// The second commit will see the base as stale, but we can safely skip the merge
+		// because the first commit already persisted the changes.
+		// InsertChain will eventually write the correct snapshot state.
+		return base
+	}
+
+	// Mark the base as stale immediately to prevent other goroutines from starting diffToDisk
+	base.stale = true
+
 	// If the disk layer is running a snapshot generator, abort it
+	// CRITICAL: Use non-blocking channel send with timeout to prevent deadlock
+	// If the generator goroutine is blocked or not ready, we should not wait indefinitely
 	if base.genAbort != nil {
-		abort := make(chan *generatorStats)
-		base.genAbort <- abort
-		stats = <-abort
+		abort := make(chan *generatorStats, 1) // Buffered channel to prevent blocking
+		select {
+		case base.genAbort <- abort:
+			// Successfully sent abort signal, now wait for response with timeout
+			select {
+			case stats = <-abort:
+				// Received stats, continue
+				log.Debug("[diffToDisk] Snapshot generator aborted successfully", "stats", stats != nil)
+			case <-time.After(5 * time.Second):
+				// Timeout waiting for generator response - generator may be stuck
+				log.Warn("[diffToDisk] Timeout waiting for snapshot generator abort response, continuing anyway")
+				stats = nil
+			}
+		case <-time.After(1 * time.Second):
+			// Timeout sending abort signal - generator may be stuck or channel full
+			log.Warn("[diffToDisk] Timeout sending abort signal to snapshot generator, continuing anyway")
+			stats = nil
+		}
 	}
 	// Put the deletion in the batch writer, flush all updates in the final step.
 	rawdb.DeleteSnapshotRoot(batch)

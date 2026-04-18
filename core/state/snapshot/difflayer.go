@@ -17,21 +17,122 @@
 package snapshot
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"maps"
 	"math"
 	"math/rand"
+	"os"
+	"runtime"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
 	bloomfilter "github.com/holiman/bloomfilter/v2"
 )
+
+// getGoroutineID returns the ID of the current goroutine for debugging
+func getGoroutineID() uint64 {
+	b := make([]byte, 64)
+	b = b[:runtime.Stack(b, false)]
+	// Stack trace format: "goroutine 123 [running]:"
+	b = bytes.TrimPrefix(b, []byte("goroutine "))
+	idx := bytes.IndexByte(b, ' ')
+	if idx == -1 {
+		return 0
+	}
+	b = b[:idx]
+	id, _ := strconv.ParseUint(string(b), 10, 64)
+	return id
+}
+
+// shouldBlockOnStaleConflict returns true if we should block instead of panic on stale conflict
+func shouldBlockOnStaleConflict() bool {
+	return os.Getenv("DIFFLAYER_BLOCK_ON_STALE") == "true" || os.Getenv("DIFFLAYER_BLOCK_ON_STALE") == "1"
+}
+
+// getBlockDuration returns the duration to block when stale conflict is detected
+func getBlockDuration() time.Duration {
+	durationStr := os.Getenv("DIFFLAYER_BLOCK_DURATION")
+	if durationStr == "" {
+		return 60 * time.Second // Default: block for 60 seconds
+	}
+	duration, err := time.ParseDuration(durationStr)
+	if err != nil {
+		log.Warn("Invalid DIFFLAYER_BLOCK_DURATION, using default 60s", "error", err, "value", durationStr)
+		return 60 * time.Second
+	}
+	return duration
+}
+
+// shouldPanicAfterBlock returns true if we should panic after blocking
+func shouldPanicAfterBlock() bool {
+	return os.Getenv("DIFFLAYER_PANIC_AFTER_BLOCK") == "true" || os.Getenv("DIFFLAYER_PANIC_AFTER_BLOCK") == "1"
+}
+
+// blockOnStaleConflict blocks for a configurable duration when stale conflict is detected,
+// allowing observation of all goroutines via pprof or other tools
+func blockOnStaleConflict(childRoot, parentRoot common.Hash, currentGoroutineID uint64, blockDuration time.Duration) {
+	log.Error("=" + strings.Repeat("=", 100))
+	log.Error("DIFFLAYER STALE CONFLICT DETECTED - ENTERING BLOCK MODE FOR DIAGNOSIS")
+	log.Error("=" + strings.Repeat("=", 100))
+	log.Error("Conflict Details",
+		"childRoot", childRoot.Hex()[:8],
+		"parentRoot", parentRoot.Hex()[:8],
+		"currentGoroutine", currentGoroutineID,
+		"blockDuration", blockDuration,
+		"timestamp", time.Now().Format(time.RFC3339Nano))
+
+	// Print current goroutine stack
+	buf := make([]byte, 1024*64) // 64KB buffer
+	n := runtime.Stack(buf, false)
+	log.Error("Current Goroutine Stack", "goroutine", currentGoroutineID, "stack", string(buf[:n]))
+
+	// Print all goroutines periodically during block
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	startTime := time.Now()
+	iteration := 0
+
+	log.Error("BLOCKING - Use pprof or other tools to observe all goroutines")
+	log.Error("Set DIFFLAYER_BLOCK_DURATION to change block duration (default: 60s)")
+	log.Error("Set DIFFLAYER_PANIC_AFTER_BLOCK=true to panic after blocking")
+
+	for {
+		select {
+		case <-ticker.C:
+			iteration++
+			elapsed := time.Since(startTime)
+			log.Error("Still blocking...",
+				"iteration", iteration,
+				"elapsed", elapsed,
+				"remaining", blockDuration-elapsed,
+				"goroutine", currentGoroutineID)
+
+			// Print all goroutines every 15 seconds (every 3rd tick)
+			if iteration%3 == 0 {
+				buf := make([]byte, 1024*1024) // 1MB buffer for all goroutines
+				n := runtime.Stack(buf, true)
+				log.Error("All Goroutines Stack Dump", "size", n, "stack", string(buf[:n]))
+			}
+
+		case <-time.After(blockDuration):
+			log.Error("=" + strings.Repeat("=", 100))
+			log.Error("BLOCK MODE COMPLETE - Exiting block")
+			log.Error("=" + strings.Repeat("=", 100))
+			return
+		}
+	}
+}
 
 var (
 	// aggregatorMemoryLimit is the maximum size of the bottom-most diff layer
@@ -390,24 +491,114 @@ func (dl *diffLayer) Update(blockRoot common.Hash, accounts map[common.Hash][]by
 // a single diff at the bottom. Since usually the lowermost diff is the largest,
 // the flattening builds up from there in reverse.
 func (dl *diffLayer) flatten() snapshot {
+	log.Debug("[DiffLayer] flatten ENTER",
+		"childRoot", dl.root.Hex()[:8],
+		"childMemory", dl.memory,
+		"goroutine", getGoroutineID())
+
 	// If the parent is not diff, we're the first in line, return unmodified
 	parent, ok := dl.parent.(*diffLayer)
 	if !ok {
+		log.Debug("[DiffLayer] flatten EXIT - parent is disk layer",
+			"childRoot", dl.root.Hex()[:8])
 		return dl
 	}
+
+	log.Info("[DiffLayer] flatten - parent is diff, recursing",
+		"childRoot", dl.root.Hex()[:8],
+		"parentRoot", parent.root.Hex()[:8],
+		"parentStale", parent.stale.Load(),
+		"goroutine", getGoroutineID())
+
 	// Parent is a diff, flatten it first (note, apart from weird corned cases,
 	// flatten will realistically only ever merge 1 layer, so there's no need to
 	// be smarter about grouping flattens together).
+	// CRITICAL: This recursive call happens WITHOUT holding any lock!
+	// If two different Cap operations both reach the same parent through different paths,
+	// they could both recursively flatten the same parent concurrently.
+	// However, since Cap() holds t.lock, this should not happen in practice.
+	// But we add a check here to detect if parent was already flattened by another goroutine.
+	log.Info("[DiffLayer] flatten - calling parent.flatten() recursively (NO LOCK HELD)",
+		"childRoot", dl.root.Hex()[:8],
+		"parentRoot", parent.root.Hex()[:8],
+		"parentStaleBeforeRecurse", parent.stale.Load(),
+		"goroutine", getGoroutineID())
+
+	// Check if parent was already flattened by another goroutine (should not happen with t.lock)
+	// If parent is already stale, it means another goroutine has already flattened it.
+	// In this case, we MUST NOT modify the parent, as it's being used by another goroutine.
+	// Instead, we return dl as-is, without flattening into the parent.
+	if parent.stale.Load() {
+		log.Warn("[DiffLayer] Parent already stale before recursive flatten - another goroutine already flattened it",
+			"childRoot", dl.root.Hex()[:8],
+			"parentRoot", parent.root.Hex()[:8],
+			"goroutine", getGoroutineID(),
+			"NOTE", "Parent was already flattened by another goroutine, returning self without flattening")
+		// Parent is already flattened and stale, we cannot modify it.
+		// Return dl as-is, without flattening into the parent.
+		// This is safe because the parent will be cleaned up by the other goroutine.
+		return dl
+	}
+
+	// Parent is not stale, so we need to flatten it first
 	parent = parent.flatten().(*diffLayer)
 
+	log.Info("[DiffLayer] flatten - parent.flatten() returned",
+		"childRoot", dl.root.Hex()[:8],
+		"parentRoot", parent.root.Hex()[:8],
+		"parentStaleAfterRecurse", parent.stale.Load(),
+		"goroutine", getGoroutineID())
+
+	log.Debug("[DiffLayer] flatten - acquiring parent lock",
+		"childRoot", dl.root.Hex()[:8],
+		"parentRoot", parent.root.Hex()[:8],
+		"parentStale", parent.stale.Load())
+
 	parent.lock.Lock()
-	defer parent.lock.Unlock()
+	defer func() {
+		parent.lock.Unlock()
+		log.Debug("[DiffLayer] flatten - released parent lock",
+			"childRoot", dl.root.Hex()[:8],
+			"parentRoot", parent.root.Hex()[:8])
+	}()
+
+	log.Info("[DiffLayer] flatten - acquired parent lock, checking stale",
+		"childRoot", dl.root.Hex()[:8],
+		"parentRoot", parent.root.Hex()[:8],
+		"parentStaleBeforeSwap", parent.stale.Load(),
+		"goroutine", getGoroutineID())
 
 	// Before actually writing all our data to the parent, first ensure that the
 	// parent hasn't been 'corrupted' by someone else already flattening into it
+	// CRITICAL: This check detects concurrent flatten operations on the same parent
+	// If Swap returns true, it means another goroutine already marked this parent as stale
 	if parent.stale.Swap(true) {
-		panic("parent diff layer is stale") // we've flattened into the same parent from two children, boo
+		currentGoroutineID := getGoroutineID()
+		log.Warn("[DiffLayer] STALE CONFLICT DETECTED - parent was already stale after acquiring lock!",
+			"childRoot", dl.root.Hex()[:8],
+			"parentRoot", parent.root.Hex()[:8],
+			"goroutine", currentGoroutineID,
+			"NOTE", "Another goroutine flattened this parent between our stale check and lock acquisition")
+
+		// This is a race condition: between our initial stale check (line 530) and acquiring
+		// the lock (line 554), another goroutine flattened this parent.
+		// We MUST NOT modify the parent data, as it's already been flattened.
+		// Return dl as-is, without flattening into the parent.
+		log.Warn("[DiffLayer] Returning self without flattening (race condition detected)",
+			"childRoot", dl.root.Hex()[:8],
+			"parentRoot", parent.root.Hex()[:8],
+			"goroutine", currentGoroutineID)
+
+		// Return dl as-is
+		return dl
 	}
+
+	log.Debug("[DiffLayer] flatten - marked parent as stale, merging data",
+		"childRoot", dl.root.Hex()[:8],
+		"parentRoot", parent.root.Hex()[:8],
+		"accountsToMerge", len(dl.accountData),
+		"storageToMerge", len(dl.storageData))
+
 	maps.Copy(parent.accountData, dl.accountData)
 	// Overwrite all the updated storage slots (individually)
 	for accountHash, storage := range dl.storageData {
@@ -419,6 +610,12 @@ func (dl *diffLayer) flatten() snapshot {
 		// Storage exists in both parent and child, merge the slots
 		maps.Copy(parent.storageData[accountHash], storage)
 	}
+
+	log.Debug("[DiffLayer] flatten EXIT - merge complete",
+		"childRoot", dl.root.Hex()[:8],
+		"parentRoot", parent.root.Hex()[:8],
+		"resultRoot", dl.root.Hex()[:8])
+
 	// Return the combo parent
 	return &diffLayer{
 		parent:      parent.parent,

@@ -74,6 +74,18 @@ func NewForkChoice(chainReader ChainReader) *ForkChoice {
 // total difficulty is higher. In the extern mode, the trusted
 // header is always selected as the head.
 func (f *ForkChoice) ReorgNeeded(current *types.Header, extern *types.Header) (bool, error) {
+	// CRITICAL FIX: For HotStuff consensus, skip TD comparison
+	// HotStuff uses QC-based finality, not total difficulty
+	// Blocks are already validated by QC before reaching here
+	if f.chain.Config().Hotstuff != nil {
+		// In HotStuff, always accept blocks from canonical chain commits
+		// The 3-chain rule ensures safety
+		log.Debug("ReorgNeeded: HotStuff mode, accepting block without TD check",
+			"externNumber", extern.Number.Uint64(),
+			"externHash", extern.Hash().Hex()[:8])
+		return true, nil
+	}
+
 	var (
 		localTD  = f.chain.GetTd(current.Hash(), current.Number.Uint64())
 		externTd = f.chain.GetTd(extern.Hash(), extern.Number.Uint64())

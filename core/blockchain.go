@@ -1714,7 +1714,13 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 		first := blockChain[0]
 		ptd := bc.GetTd(first.ParentHash(), first.NumberU64()-1)
 		if ptd == nil {
-			return 0, consensus.ErrUnknownAncestor
+			// In HotStuff mode, TD is not used for fork choice, so we provide a default value
+			if bc.chainConfig.Hotstuff != nil {
+				log.Debug("writeLive: using default TD for HotStuff mode", "block", first.NumberU64(), "hash", first.Hash().Hex()[:8])
+				ptd = big.NewInt(int64(first.NumberU64() - 1))
+			} else {
+				return 0, consensus.ErrUnknownAncestor
+			}
 		}
 		tdSum := new(big.Int).Set(ptd)
 		for i, block := range blockChain {
@@ -1846,7 +1852,13 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	// Calculate the total difficulty of the block
 	ptd := bc.GetTd(block.ParentHash(), block.NumberU64()-1)
 	if ptd == nil {
-		return consensus.ErrUnknownAncestor
+		// In HotStuff mode, TD is not used for fork choice, so we provide a default value
+		if bc.chainConfig.Hotstuff != nil {
+			log.Debug("writeBlockWithState: using default TD for HotStuff mode", "block", block.NumberU64(), "hash", block.Hash().Hex()[:8])
+			ptd = big.NewInt(int64(block.NumberU64() - 1))
+		} else {
+			return consensus.ErrUnknownAncestor
+		}
 	}
 	// Make sure no inconsistent state is leaked during insertion
 	externTd := new(big.Int).Add(block.Difficulty(), ptd)

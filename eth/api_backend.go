@@ -43,6 +43,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/miner"
+	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 )
@@ -572,4 +573,9 @@ func (b *EthAPIBackend) SendBid(ctx context.Context, bid *types.BidArgs) (common
 
 func (b *EthAPIBackend) MinerInTurn() bool {
 	return b.Miner().InTurn()
+}
+
+// Server returns the p2p server instance
+func (b *EthAPIBackend) Server() *p2p.Server {
+	return b.eth.p2pServer
 }

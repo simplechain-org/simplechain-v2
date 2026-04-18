@@ -30,6 +30,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/beacon"
+	"github.com/ethereum/go-ethereum/consensus/hotstuff"
 	"github.com/ethereum/go-ethereum/consensus/parlia"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/monitor"
@@ -42,6 +43,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth/fetcher"
 	"github.com/ethereum/go-ethereum/eth/protocols/bsc"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
+	"github.com/ethereum/go-ethereum/eth/protocols/hs"
 	"github.com/ethereum/go-ethereum/eth/protocols/snap"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
@@ -459,6 +461,12 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
 		peer.Log().Error("Bsc extension barrier failed", "err", err)
 		return err
 	}
+	// Wait for hs extension (optional)
+	hsPeer, err := h.peers.waitHsExtension(peer)
+	if err != nil {
+		peer.Log().Error("Hs extension barrier failed", "err", err)
+		return err
+	}
 
 	// Execute the Ethereum handshake
 	var (
@@ -509,7 +517,7 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
 	}
 
 	// Register the peer locally
-	if err := h.peers.registerPeer(peer, snap, bsc); err != nil {
+	if err := h.peers.registerPeer(peer, snap, bsc, hsPeer); err != nil {
 		peer.Log().Error("Ethereum peer registration failed", "err", err)
 		return err
 	}
@@ -633,6 +641,21 @@ func (h *handler) runBscExtension(peer *bsc.Peer, handler bsc.Handler) error {
 			}
 		}
 		peer.Log().Error("Bsc extension registration failed", "err", err, "name", peer.Name())
+		return err
+	}
+	return handler(peer)
+}
+
+// runHsExtension registers a `hs` peer into the joint eth/hs peerset and
+// starts handling inbound messages.
+func (h *handler) runHsExtension(peer *hs.Peer, handler func(*hs.Peer) error) error {
+	if !h.incHandlers() {
+		return p2p.DiscQuitting
+	}
+	defer h.decHandlers()
+
+	if err := h.peers.registerHsExtension(peer); err != nil {
+		peer.Log().Error("Hs extension registration failed", "err", err, "name", peer.Name())
 		return err
 	}
 	return handler(peer)
@@ -789,6 +812,24 @@ func (h *handler) Stop() {
 	log.Info("Ethereum protocol stopped")
 }
 
+// refreshValidatorNodeIDsMap queries the consensus engine for validator->nodeIDs mapping
+// and updates the peerset's internal map to support hs address resolution and EVN features.
+func (h *handler) refreshValidatorNodeIDsMap() {
+	// Engine should provide GetNodeIDsMap
+	type nodeIDsProvider interface {
+		GetNodeIDsMap() (map[common.Address][]enode.ID, error)
+	}
+	eng, ok := h.chain.Engine().(nodeIDsProvider)
+	if !ok {
+		return
+	}
+	m, err := eng.GetNodeIDsMap()
+	if err != nil || m == nil {
+		return
+	}
+	h.peers.enableEVNFeatures(m, h.evnNodeIdsWhitelistMap)
+}
+
 // BroadcastBlock will either propagate a block to a subset of its peers, or
 // will only announce its availability (depending what's requested).
 func (h *handler) BroadcastBlock(block *types.Block, propagate bool) {
@@ -874,22 +915,37 @@ func (h *handler) needFullBroadcastInEVN(block *types.Block) bool {
 }
 
 func (h *handler) queryValidatorNodeIDsMap() map[common.Address][]enode.ID {
+	log.Debug("queryValidatorNodeIDsMap")
 	latest := h.chain.CurrentHeader()
 	if !h.chain.Config().IsMaxwell(latest.Number, latest.Time) {
+		log.Debug("queryValidatorNodeIDsMap: not after maxwell", "number", latest.Number, "time", latest.Time)
 		return nil
 	}
 
 	log.Debug("queryValidatorNodeIDs after maxwell", "number", latest.Number, "time", latest.Time)
-	parlia, ok := h.chain.Engine().(*parlia.Parlia)
-	if !ok {
-		return nil
+
+	// Try Parlia engine first
+	if parlia, ok := h.chain.Engine().(*parlia.Parlia); ok {
+		nodeIDsMap, err := parlia.GetNodeIDsMap()
+		if err != nil {
+			log.Debug("Failed to get node IDs map from Parlia", "err", err)
+			return nil
+		}
+		return nodeIDsMap
 	}
 
-	nodeIDsMap, err := parlia.GetNodeIDsMap()
-	if err != nil {
-		return nil
+	// Try HotStuff engine
+	if hotstuff, ok := h.chain.Engine().(*hotstuff.Hotstuff); ok {
+		nodeIDsMap, err := hotstuff.GetNodeIDsMap()
+		if err != nil {
+			log.Debug("Failed to get node IDs map from HotStuff", "err", err)
+			return nil
+		}
+		return nodeIDsMap
 	}
-	return nodeIDsMap
+
+	log.Debug("Engine does not support GetNodeIDsMap", "engine", fmt.Sprintf("%T", h.chain.Engine()))
+	return nil
 }
 
 // BroadcastTransactions will propagate a batch of transactions

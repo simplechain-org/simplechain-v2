@@ -28,12 +28,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/consensus/hotstuff"
 	"github.com/ethereum/go-ethereum/metrics"
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/consensus"
+	//"github.com/ethereum/go-ethereum/consensus/hotstuff"
 	"github.com/ethereum/go-ethereum/consensus/parlia"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/filtermaps"
@@ -53,6 +55,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth/gasprice"
 	"github.com/ethereum/go-ethereum/eth/protocols/bsc"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
+	"github.com/ethereum/go-ethereum/eth/protocols/hs"
 	"github.com/ethereum/go-ethereum/eth/protocols/snap"
 	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -305,10 +308,15 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		log.Info("Unprotected transactions allowed")
 	}
 	ethAPI := ethapi.NewBlockChainAPI(eth.APIBackend)
-	eth.engine, err = ethconfig.CreateConsensusEngine(chainConfig, chainDb, ethAPI, genesisHash)
+	eth.engine, err = ethconfig.CreateConsensusEngine(chainConfig, chainDb, ethAPI, genesisHash, nil, stack.Config())
 	if err != nil {
 		return nil, err
 	}
+	// Inject txpool for proposal building
+	if hsTP, ok := eth.engine.(interface{ SetTxPool(any) }); ok {
+		hsTP.SetTxPool(eth.txPool)
+	}
+	// Relab engine adapter removed: built-in HotStuff handles protocol flow
 
 	bcVersion := rawdb.ReadDatabaseVersion(chainDb)
 	var dbVer = "<nil>"
@@ -489,6 +497,26 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 				return nil, err
 			}
 			log.Info("Create voteManager successfully")
+		}
+	}
+
+	// If engine is HotStuff, inject chain reader and hs network adapter, and BLS signer
+	if hsEng, ok := eth.engine.(*hotstuff.Hotstuff); ok {
+		// chain reader
+		if cr, ok2 := any(eth).(interface{ BlockChain() *core.BlockChain }); ok2 {
+			hsEng.SetChainReader(cr.BlockChain())
+		}
+		// hs network
+		adapter := newHsNetworkAdapter(eth.handler)
+		hsEng.SetHsNetwork(adapter)
+		// BLS vote signer (reuse vote manager signer if available)
+		// Attempt to construct a BLS signer from node config if files provided
+		if cfg := stack.Config(); cfg != nil && cfg.BLSPasswordFile != "" && cfg.BLSWalletDir != "" {
+			if signer, err2 := vote.NewVoteSigner(cfg.BLSPasswordFile, cfg.BLSWalletDir); err2 == nil {
+				hsEng.SetBLSVoteSigner(signer)
+			} else {
+				log.Warn("Failed to create BLS signer for HotStuff", "err", err2)
+			}
 		}
 	}
 	eth.APIBackend.gpo = gasprice.NewOracle(eth.APIBackend, config.GPO, config.Miner.GasPrice)
@@ -737,6 +765,159 @@ func (s *Ethereum) handleAdditions(parlia *parlia.Parlia, nonce uint64, register
 	return nil
 }
 
+// todo: the copy for hotstuff,need optimism
+// waitForSyncAndMaxwell waits for the node to be fully synced and Maxwell fork to be active
+func (s *Ethereum) waitForSyncAndMaxwellHotstuff(hotstuff *hotstuff.Hotstuff) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	retryCount := 0
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			if !s.Synced() {
+				continue
+			}
+			// Check if Maxwell fork is active
+			header := s.blockchain.CurrentHeader()
+			if header == nil {
+				continue
+			}
+			chainConfig := s.blockchain.Config()
+			if !chainConfig.IsMaxwell(header.Number, header.Time) {
+				continue
+			}
+			log.Info("Node is synced and Maxwell fork is active, proceeding with node ID registration")
+			err := s.updateNodeIDHotstuff(hotstuff)
+			if err == nil {
+				return
+			}
+			retryCount++
+			if retryCount > 3 {
+				log.Error("Failed to update node ID exceed max retry count", "retryCount", retryCount, "err", err)
+				return
+			}
+		}
+	}
+}
+
+// updateNodeID registers the node ID with the StakeHub contract
+func (s *Ethereum) updateNodeIDHotstuff(hotstuff *hotstuff.Hotstuff) error {
+	nonce, err := s.APIBackend.GetPoolNonce(context.Background(), s.etherbase)
+	if err != nil {
+		return fmt.Errorf("failed to get nonce: %v", err)
+	}
+
+	// Get currently registered node IDs
+	registeredIDs, err := hotstuff.GetNodeIDs()
+	if err != nil {
+		log.Error("Failed to get registered node IDs", "err", err)
+		return err
+	}
+
+	// Create a set of registered IDs for quick lookup
+	registeredSet := make(map[enode.ID]struct{}, len(registeredIDs))
+	for _, id := range registeredIDs {
+		registeredSet[id] = struct{}{}
+	}
+
+	// Handle removals first
+	if err := s.handleRemovalsHotstuff(hotstuff, nonce, registeredSet); err != nil {
+		return err
+	}
+	nonce++
+
+	// Handle additions
+	return s.handleAdditionsHotstuff(hotstuff, nonce, registeredSet)
+}
+
+func (s *Ethereum) handleRemovalsHotstuff(hotstuff *hotstuff.Hotstuff, nonce uint64, registeredSet map[enode.ID]struct{}) error {
+	if len(s.config.EVNNodeIDsToRemove) == 0 {
+		return nil
+	}
+
+	// Handle wildcard removal
+	if len(s.config.EVNNodeIDsToRemove) == 1 {
+		var zeroID enode.ID // This will be all zeros
+		if s.config.EVNNodeIDsToRemove[0] == zeroID {
+			trx, err := hotstuff.RemoveNodeIDs([]enode.ID{}, nonce)
+			if err != nil {
+				return fmt.Errorf("failed to create node ID removal transaction: %v", err)
+			}
+			if err := s.txPool.Add([]*types.Transaction{trx}, false); err != nil {
+				return fmt.Errorf("failed to add node ID removal transaction to pool: %v", err)
+			}
+			log.Info("Submitted node ID removal transaction for all node IDs")
+			return nil
+		}
+	}
+
+	// Create a set of node IDs to add for quick lookup
+	addSet := make(map[enode.ID]struct{}, len(s.config.EVNNodeIDsToAdd))
+	for _, id := range s.config.EVNNodeIDsToAdd {
+		addSet[id] = struct{}{}
+	}
+
+	// Filter out node IDs that are in the add set
+	nodeIDsToRemove := make([]enode.ID, 0, len(s.config.EVNNodeIDsToRemove))
+	for _, id := range s.config.EVNNodeIDsToRemove {
+		if _, exists := registeredSet[id]; exists {
+			if _, exists := addSet[id]; !exists {
+				nodeIDsToRemove = append(nodeIDsToRemove, id)
+			} else {
+				log.Debug("Skipping node ID removal", "id", id, "reason", "also in EVNNodeIDsToAdd")
+			}
+		} else {
+			log.Debug("Skipping node ID removal", "id", id, "reason", "not registered")
+		}
+	}
+
+	if len(nodeIDsToRemove) == 0 {
+		log.Debug("No node IDs to remove after filtering")
+		return nil
+	}
+
+	trx, err := hotstuff.RemoveNodeIDs(nodeIDsToRemove, nonce)
+	if err != nil {
+		return fmt.Errorf("failed to create node ID removal transaction: %v", err)
+	}
+	if errs := s.txPool.Add([]*types.Transaction{trx}, false); len(errs) > 0 && errs[0] != nil {
+		return fmt.Errorf("failed to add node ID removal transaction to pool: %v", errs)
+	}
+	log.Info("Submitted node ID removal transaction", "nodeIDs", nodeIDsToRemove)
+	return nil
+}
+
+func (s *Ethereum) handleAdditionsHotstuff(hotstuff *hotstuff.Hotstuff, nonce uint64, registeredSet map[enode.ID]struct{}) error {
+	if len(s.config.EVNNodeIDsToAdd) == 0 {
+		return nil
+	}
+
+	// Filter out already registered IDs in a single pass
+	nodeIDsToAdd := make([]enode.ID, 0, len(s.config.EVNNodeIDsToAdd))
+	for _, id := range s.config.EVNNodeIDsToAdd {
+		if _, exists := registeredSet[id]; !exists {
+			nodeIDsToAdd = append(nodeIDsToAdd, id)
+		}
+	}
+
+	if len(nodeIDsToAdd) == 0 {
+		log.Info("No new node IDs to register after deduplication")
+		return nil
+	}
+
+	trx, err := hotstuff.AddNodeIDs(nodeIDsToAdd, nonce)
+	if err != nil {
+		return fmt.Errorf("failed to create node ID registration transaction: %v", err)
+	}
+	if errs := s.txPool.Add([]*types.Transaction{trx}, false); len(errs) > 0 && errs[0] != nil {
+		return fmt.Errorf("failed to add node ID registration transaction to pool: %v", errs)
+	}
+	log.Info("Submitted node ID registration transaction", "nodeIDs", nodeIDsToAdd)
+	return nil
+}
+
 // StartMining starts the miner with the given number of CPU threads. If mining
 // is already running, this method adjust the number of threads allowed to use
 // and updates the minimum price required by the transaction pool.
@@ -766,6 +947,20 @@ func (s *Ethereum) StartMining() error {
 			// Start a goroutine to handle node ID registration after sync
 			go func() {
 				s.waitForSyncAndMaxwell(parlia)
+			}()
+		}
+
+		if hotstuff, ok := s.engine.(*hotstuff.Hotstuff); ok {
+			wallet, err := s.accountManager.Find(accounts.Account{Address: eb})
+			if wallet == nil || err != nil {
+				log.Error("Etherbase account unavailable locally", "err", err)
+				return fmt.Errorf("signer missing: %v", err)
+			}
+			hotstuff.Authorize(eb, wallet.SignData, wallet.SignTx)
+
+			// Start a goroutine to handle node ID registration after sync
+			go func() {
+				s.waitForSyncAndMaxwellHotstuff(hotstuff)
 			}()
 		}
 
@@ -817,6 +1012,7 @@ func (s *Ethereum) Protocols() []p2p.Protocol {
 		protos = append(protos, snap.MakeProtocols((*snapHandler)(s.handler))...)
 	}
 	protos = append(protos, bsc.MakeProtocols((*bscHandler)(s.handler))...)
+	protos = append(protos, hs.MakeProtocols((*hsHandler)(s.handler))...)
 
 	return protos
 }
@@ -835,6 +1031,22 @@ func (s *Ethereum) Start() error {
 
 	// Start the networking layer
 	s.handler.Start(s.p2pServer.MaxPeers, s.p2pServer.MaxPeersPerIP)
+
+	// Periodically refresh validator node IDs map for hs singlecast resolution
+	go func() {
+		// initial refresh
+		s.handler.refreshValidatorNodeIDsMap()
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				s.handler.refreshValidatorNodeIDsMap()
+			case <-s.stopCh:
+				return
+			}
+		}
+	}()
 
 	go s.reportRecentBlocksLoop()
 

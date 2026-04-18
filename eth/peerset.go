@@ -26,6 +26,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/eth/protocols/bsc"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
+	"github.com/ethereum/go-ethereum/eth/protocols/hs"
 	"github.com/ethereum/go-ethereum/eth/protocols/snap"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
@@ -84,6 +85,9 @@ type peerSet struct {
 	bscWait map[string]chan *bsc.Peer // Peers connected on `eth` waiting for their bsc extension
 	bscPend map[string]*bsc.Peer      // Peers connected on the `bsc` protocol, but not yet on `eth`
 
+	hsWait map[string]chan *hs.Peer // Peers connected on `eth` waiting for their hs extension
+	hsPend map[string]*hs.Peer      // Peers connected on the `hs` protocol, but not yet on `eth`
+
 	lock   sync.RWMutex
 	closed bool
 	quitCh chan struct{} // Quit channel to signal termination
@@ -97,6 +101,8 @@ func newPeerSet() *peerSet {
 		snapPend: make(map[string]*snap.Peer),
 		bscWait:  make(map[string]chan *bsc.Peer),
 		bscPend:  make(map[string]*bsc.Peer),
+		hsWait:   make(map[string]chan *hs.Peer),
+		hsPend:   make(map[string]*hs.Peer),
 		quitCh:   make(chan struct{}),
 	}
 }
@@ -158,6 +164,33 @@ func (ps *peerSet) registerBscExtension(peer *bsc.Peer) error {
 		return nil
 	}
 	ps.bscPend[id] = peer
+	return nil
+}
+
+// registerHsExtension unblocks an already connected `eth` peer waiting for its
+// `hs` extension, or if no such peer exists, tracks the extension for the time
+// being until the `eth` main protocol starts looking for it.
+func (ps *peerSet) registerHsExtension(peer *hs.Peer) error {
+	// Require peers to also run eth
+	if !peer.RunningCap(eth.ProtocolName, eth.ProtocolVersions) {
+		return fmt.Errorf("peer connected on hs without compatible eth support")
+	}
+	ps.lock.Lock()
+	defer ps.lock.Unlock()
+
+	id := peer.ID()
+	if _, ok := ps.peers[id]; ok {
+		return errPeerAlreadyRegistered
+	}
+	if _, ok := ps.hsPend[id]; ok {
+		return errPeerAlreadyRegistered
+	}
+	if wait, ok := ps.hsWait[id]; ok {
+		delete(ps.hsWait, id)
+		wait <- peer
+		return nil
+	}
+	ps.hsPend[id] = peer
 	return nil
 }
 
@@ -275,9 +308,52 @@ func (ps *peerSet) waitBscExtension(peer *eth.Peer) (*bsc.Peer, error) {
 	}
 }
 
+// waitHsExtension blocks until all satellite protocols are connected and tracked
+// by the peerset.
+func (ps *peerSet) waitHsExtension(peer *eth.Peer) (*hs.Peer, error) {
+	if !peer.RunningCap(hs.ProtocolName, hs.ProtocolVersions) {
+		return nil, nil
+	}
+	ps.lock.Lock()
+
+	id := peer.ID()
+	if _, ok := ps.peers[id]; ok {
+		ps.lock.Unlock()
+		return nil, errPeerAlreadyRegistered
+	}
+	if _, ok := ps.hsWait[id]; ok {
+		ps.lock.Unlock()
+		return nil, errPeerAlreadyRegistered
+	}
+	if hsPeer, ok := ps.hsPend[id]; ok {
+		delete(ps.hsPend, id)
+
+		ps.lock.Unlock()
+		return hsPeer, nil
+	}
+	wait := make(chan *hs.Peer)
+	ps.hsWait[id] = wait
+	ps.lock.Unlock()
+
+	select {
+	case peer := <-wait:
+		return peer, nil
+	case <-time.After(extensionWaitTimeout):
+		ps.lock.Lock()
+		delete(ps.hsWait, id)
+		ps.lock.Unlock()
+		return nil, errPeerWaitTimeout
+	case <-ps.quitCh:
+		ps.lock.Lock()
+		delete(ps.hsWait, id)
+		ps.lock.Unlock()
+		return nil, errPeerSetClosed
+	}
+}
+
 // registerPeer injects a new `eth` peer into the working set, or returns an error
 // if the peer is already known.
-func (ps *peerSet) registerPeer(peer *eth.Peer, ext *snap.Peer, bscExt *bsc.Peer) error {
+func (ps *peerSet) registerPeer(peer *eth.Peer, ext *snap.Peer, bscExt *bsc.Peer, hsExt *hs.Peer) error {
 	// Start tracking the new peer
 	ps.lock.Lock()
 	defer ps.lock.Unlock()
@@ -298,6 +374,9 @@ func (ps *peerSet) registerPeer(peer *eth.Peer, ext *snap.Peer, bscExt *bsc.Peer
 	}
 	if bscExt != nil {
 		eth.bscExt = &bscPeer{bscExt}
+	}
+	if hsExt != nil {
+		eth.hsExt = &hsPeer{hsExt}
 	}
 	ps.peers[id] = eth
 	return nil

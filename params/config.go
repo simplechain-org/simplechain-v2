@@ -720,6 +720,7 @@ type ChainConfig struct {
 	Ethash             *EthashConfig       `json:"ethash,omitempty"`
 	Clique             *CliqueConfig       `json:"clique,omitempty"`
 	Parlia             *ParliaConfig       `json:"parlia,omitempty"`
+	Hotstuff           *HotstuffConfig     `json:"hotstuff,omitempty"`
 	BlobScheduleConfig *BlobScheduleConfig `json:"blobSchedule,omitempty"`
 }
 
@@ -752,6 +753,13 @@ func (b *ParliaConfig) String() string {
 	return "parlia"
 }
 
+// ParliaConfig is the consensus engine configs for proof-of-staked-authority based sealing.
+type HotstuffConfig struct{}
+
+// String implements the stringer interface, returning the consensus engine details.
+func (b *HotstuffConfig) String() string {
+	return "hotstuff"
+}
 func (c *ChainConfig) Description() string {
 	var banner string
 
@@ -1978,4 +1986,18 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 		IsCopperRemix2:   c.IsCopperRemix2(num, timestamp),
 		IsEIP4762:        isVerkle,
 	}
+}
+
+// HotStuffConfig contains configuration options for HotStuff consensus.
+type HotStuffConfig struct {
+	// Static peers for HotStuff consensus (used when dynamic peer discovery fails)
+	StaticPeers []string `toml:",omitempty"`
+	// Static peer configurations with detailed information
+	StaticPeerConfigs []StaticPeerConfig `toml:",omitempty"`
+}
+
+// StaticPeerConfig represents a static peer configuration for HotStuff consensus
+type StaticPeerConfig struct {
+	ID      uint32 `toml:"ID"`      // Replica ID
+	Address string `toml:"Address"` // Network address (IP:port or hostname:port)
 }

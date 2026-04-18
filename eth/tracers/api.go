@@ -294,6 +294,18 @@ func (api *API) traceChain(start, end *types.Block, config *TraceConfig, closed 
 								beforeSystemTx = false
 							}
 						}
+						if hs, ok := api.backend.Engine().(consensus.HotStuff); ok {
+							if isSystem, _ := hs.IsSystemTransaction(tx, task.block.Header()); isSystem {
+								balance := task.statedb.GetBalance(consensus.SystemAddress)
+								if balance.Cmp(common.U2560) > 0 {
+									task.statedb.SetBalance(consensus.SystemAddress, uint256.NewInt(0), tracing.BalanceChangeUnspecified)
+									task.statedb.AddBalance(blockCtx.Coinbase, balance, tracing.BalanceChangeUnspecified)
+								}
+
+								systemcontracts.TryUpdateBuildInSystemContract(api.backend.ChainConfig(), task.block.Number(), task.parent.Time(), task.block.Time(), task.statedb, false)
+								beforeSystemTx = false
+							}
+						}
 					}
 
 					msg, _ := core.TransactionToMessage(tx, signer, task.block.BaseFee())
@@ -595,6 +607,20 @@ func (api *API) IntermediateRoots(ctx context.Context, hash common.Hash, config 
 				}
 			}
 		}
+		if hs, ok := api.backend.Engine().(consensus.HotStuff); ok {
+			if isSystem, _ := hs.IsSystemTransaction(tx, block.Header()); isSystem {
+				balance := statedb.GetBalance(consensus.SystemAddress)
+				if balance.Cmp(common.U2560) > 0 {
+					statedb.SetBalance(consensus.SystemAddress, uint256.NewInt(0), tracing.BalanceChangeUnspecified)
+					statedb.AddBalance(vmctx.Coinbase, balance, tracing.BalanceChangeUnspecified)
+				}
+
+				if beforeSystemTx {
+					systemcontracts.TryUpdateBuildInSystemContract(api.backend.ChainConfig(), block.Number(), parent.Time(), block.Time(), statedb, false)
+					beforeSystemTx = false
+				}
+			}
+		}
 
 		msg, _ := core.TransactionToMessage(tx, signer, block.BaseFee())
 		statedb.SetTxContext(tx.Hash(), i)
@@ -693,6 +719,18 @@ func (api *API) traceBlock(ctx context.Context, block *types.Block, config *Trac
 					beforeSystemTx = false
 				}
 			}
+			if hs, ok := api.backend.Engine().(consensus.HotStuff); ok {
+				if isSystem, _ := hs.IsSystemTransaction(tx, block.Header()); isSystem {
+					balance := statedb.GetBalance(consensus.SystemAddress)
+					if balance.Cmp(common.U2560) > 0 {
+						statedb.SetBalance(consensus.SystemAddress, uint256.NewInt(0), tracing.BalanceChangeUnspecified)
+						statedb.AddBalance(blockCtx.Coinbase, balance, tracing.BalanceChangeUnspecified)
+					}
+
+					systemcontracts.TryUpdateBuildInSystemContract(api.backend.ChainConfig(), block.Number(), parent.Time(), block.Time(), statedb, false)
+					beforeSystemTx = false
+				}
+			}
 		}
 
 		// Generate the next state snapshot fast without tracing
@@ -776,6 +814,18 @@ txloop:
 		if beforeSystemTx {
 			if posa, ok := api.backend.Engine().(consensus.PoSA); ok {
 				if isSystem, _ := posa.IsSystemTransaction(tx, block.Header()); isSystem {
+					balance := statedb.GetBalance(consensus.SystemAddress)
+					if balance.Cmp(common.U2560) > 0 {
+						statedb.SetBalance(consensus.SystemAddress, uint256.NewInt(0), tracing.BalanceChangeUnspecified)
+						statedb.AddBalance(block.Header().Coinbase, balance, tracing.BalanceChangeUnspecified)
+					}
+
+					systemcontracts.TryUpdateBuildInSystemContract(api.backend.ChainConfig(), block.Number(), parent.Time(), block.Time(), statedb, false)
+					beforeSystemTx = false
+				}
+			}
+			if hs, ok := api.backend.Engine().(consensus.HotStuff); ok {
+				if isSystem, _ := hs.IsSystemTransaction(tx, block.Header()); isSystem {
 					balance := statedb.GetBalance(consensus.SystemAddress)
 					if balance.Cmp(common.U2560) > 0 {
 						statedb.SetBalance(consensus.SystemAddress, uint256.NewInt(0), tracing.BalanceChangeUnspecified)
@@ -890,6 +940,18 @@ func (api *API) standardTraceBlockToFile(ctx context.Context, block *types.Block
 		if beforeSystemTx {
 			if posa, ok := api.backend.Engine().(consensus.PoSA); ok {
 				if isSystem, _ := posa.IsSystemTransaction(tx, block.Header()); isSystem {
+					balance := statedb.GetBalance(consensus.SystemAddress)
+					if balance.Cmp(common.U2560) > 0 {
+						statedb.SetBalance(consensus.SystemAddress, uint256.NewInt(0), tracing.BalanceChangeUnspecified)
+						statedb.AddBalance(vmctx.Coinbase, balance, tracing.BalanceChangeUnspecified)
+					}
+
+					systemcontracts.TryUpdateBuildInSystemContract(api.backend.ChainConfig(), block.Number(), parent.Time(), block.Time(), statedb, false)
+					beforeSystemTx = false
+				}
+			}
+			if hs, ok := api.backend.Engine().(consensus.HotStuff); ok {
+				if isSystem, _ := hs.IsSystemTransaction(tx, block.Header()); isSystem {
 					balance := statedb.GetBalance(consensus.SystemAddress)
 					if balance.Cmp(common.U2560) > 0 {
 						statedb.SetBalance(consensus.SystemAddress, uint256.NewInt(0), tracing.BalanceChangeUnspecified)

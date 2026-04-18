@@ -103,3 +103,23 @@ func (signer *VoteSigner) SignVote(vote *types.VoteEnvelope) error {
 	copy(vote.Signature[:], signature.Marshal()[:])
 	return nil
 }
+
+// SignRoot signs a 32-byte root (e.g., keccak256 hash) using the BLS key and
+// returns the public key and signature in types' fixed-size formats.
+func (signer *VoteSigner) SignRoot(root [32]byte) (types.BLSPublicKey, types.BLSSignature, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), voteSignerTimeout)
+	defer cancel()
+
+	signature, err := (*signer.km).Sign(ctx, &validatorpb.SignRequest{
+		PublicKey:   signer.PubKey[:],
+		SigningRoot: root[:],
+	})
+	if err != nil {
+		return types.BLSPublicKey{}, types.BLSSignature{}, err
+	}
+	var pub types.BLSPublicKey
+	var sig types.BLSSignature
+	copy(pub[:], signer.PubKey[:])
+	copy(sig[:], signature.Marshal()[:])
+	return pub, sig, nil
+}

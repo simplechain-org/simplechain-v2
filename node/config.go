@@ -29,6 +29,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
@@ -66,6 +67,9 @@ type Config struct {
 
 	// Configuration of peer-to-peer networking.
 	P2P p2p.Config
+
+	// HotStuff consensus configuration
+	HotStuff params.HotStuffConfig `toml:",omitempty"`
 
 	// KeyStoreDir is the file system folder that contains private keys. The directory can
 	// be specified as a relative path, in which case it is resolved relative to the

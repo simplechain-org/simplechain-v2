@@ -429,6 +429,9 @@ func getVoteAttestationFromHeader(header *types.Header, chainConfig *params.Chai
 	if header.Number.Uint64()%epochLength != 0 {
 		attestationBytes = header.Extra[extraVanity : len(header.Extra)-extraSeal]
 	} else {
+		if len(header.Extra) <= extraVanity+extraSeal {
+			return nil, nil
+		}
 		num := int(header.Extra[extraVanity])
 		start := extraVanity + validatorNumberSize + num*validatorBytesLength
 		if chainConfig.IsBohr(header.Number, header.Time) {

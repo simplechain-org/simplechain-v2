@@ -26,6 +26,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/beacon"
 	"github.com/ethereum/go-ethereum/consensus/clique"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
+	"github.com/ethereum/go-ethereum/consensus/hotstuff"
 	"github.com/ethereum/go-ethereum/consensus/parlia"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/history"
@@ -36,6 +37,8 @@ import (
 	"github.com/ethereum/go-ethereum/internal/ethapi"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/miner/minerconfig"
+	"github.com/ethereum/go-ethereum/node"
+	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/params"
 )
@@ -233,7 +236,7 @@ type Config struct {
 // CreateConsensusEngine creates a consensus engine for the given chain config.
 // Clique is allowed for now to live standalone, but ethash is forbidden and can
 // only exist on already merged networks.
-func CreateConsensusEngine(config *params.ChainConfig, db ethdb.Database, ee *ethapi.BlockChainAPI, genesisHash common.Hash) (consensus.Engine, error) {
+func CreateConsensusEngine(config *params.ChainConfig, db ethdb.Database, ee *ethapi.BlockChainAPI, genesisHash common.Hash, net *p2p.Server, nodeCfg interface{}) (consensus.Engine, error) {
 	if config.Parlia != nil {
 		return parlia.New(config, db, ee, genesisHash), nil
 	}
@@ -244,6 +247,15 @@ func CreateConsensusEngine(config *params.ChainConfig, db ethdb.Database, ee *et
 	// If proof-of-authority is requested, set it up
 	if config.Clique != nil {
 		return clique.New(config.Clique, db), nil
+	}
+	if config.Hotstuff != nil {
+		var hotstuffCfg *params.HotStuffConfig
+		if nodeCfg != nil {
+			if nc, ok := nodeCfg.(*node.Config); ok && nc != nil {
+				hotstuffCfg = &nc.HotStuff
+			}
+		}
+		return hotstuff.New(config, db, ee, genesisHash, net, hotstuffCfg), nil
 	}
 	return beacon.New(ethash.NewFaker()), nil
 }

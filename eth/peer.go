@@ -22,6 +22,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/eth/protocols/bsc"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
+	"github.com/ethereum/go-ethereum/eth/protocols/hs"
 	"github.com/ethereum/go-ethereum/eth/protocols/snap"
 )
 
@@ -43,6 +44,7 @@ type ethPeer struct {
 	*eth.Peer
 	snapExt *snapPeer // Satellite `snap` connection
 	bscExt  *bscPeer  // Satellite `bsc` connection
+	hsExt   *hsPeer   // Satellite `hs` connection
 }
 
 // info gathers and returns some `eth` protocol metadata known about a peer.
@@ -87,6 +89,17 @@ type bscPeer struct {
 	*bsc.Peer
 }
 
+// hsPeerInfo represents a short summary of the `hs` sub-protocol metadata known
+// about a connected peer.
+type hsPeerInfo struct {
+	Version uint `json:"version"` // hs protocol version negotiated
+}
+
+// hsPeer is a wrapper around hs.Peer to maintain a few extra metadata.
+type hsPeer struct {
+	*hs.Peer
+}
+
 // info gathers and returns some `snap` protocol metadata known about a peer.
 func (p *snapPeer) info() *snapPeerInfo {
 	return &snapPeerInfo{
@@ -97,6 +110,13 @@ func (p *snapPeer) info() *snapPeerInfo {
 // info gathers and returns some `bsc` protocol metadata known about a peer.
 func (p *bscPeer) info() *bscPeerInfo {
 	return &bscPeerInfo{
+		Version: p.Version(),
+	}
+}
+
+// info gathers and returns some `hs` protocol metadata known about a peer.
+func (p *hsPeer) info() *hsPeerInfo {
+	return &hsPeerInfo{
 		Version: p.Version(),
 	}
 }

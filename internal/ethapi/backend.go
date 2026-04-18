@@ -33,6 +33,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 )
@@ -94,6 +95,9 @@ type Backend interface {
 	// CurrentValidators return the list of validator at the latest block
 	CurrentValidators() ([]common.Address, error)
 	HistoryPruningCutoff() uint64
+
+	// Server returns the p2p server instance
+	Server() *p2p.Server
 
 	// This is copied from filters.Backend
 	// eth/filters needs to be initialized from this backend type, so methods needed by

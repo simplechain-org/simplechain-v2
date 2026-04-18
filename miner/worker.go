@@ -25,6 +25,7 @@ import (
 	"time"
 
 	mapset "github.com/deckarep/golang-set/v2"
+	"github.com/ethereum/go-ethereum/consensus/hotstuff"
 	"github.com/holiman/uint256"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -106,17 +107,20 @@ type environment struct {
 	blobs    int
 
 	witness *stateless.Witness
+
+	committed bool
 }
 
 // copy creates a deep copy of environment.
 func (env *environment) copy() *environment {
 	cpy := &environment{
-		signer:   env.signer,
-		state:    env.state.Copy(),
-		tcount:   env.tcount,
-		coinbase: env.coinbase,
-		header:   types.CopyHeader(env.header),
-		receipts: copyReceipts(env.receipts),
+		signer:    env.signer,
+		state:     env.state.Copy(),
+		tcount:    env.tcount,
+		coinbase:  env.coinbase,
+		header:    types.CopyHeader(env.header),
+		receipts:  copyReceipts(env.receipts),
+		committed: env.committed,
 	}
 	if env.gasPool != nil {
 		gasPool := *env.gasPool
@@ -417,6 +421,14 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 	defer timer.Stop()
 	<-timer.C // discard the initial tick
 
+	// Get notifyMinerCh from Hotstuff engine if available
+	// This allows Hotstuff to immediately trigger block production when view changes
+	var notifyMinerCh <-chan struct{}
+	if hsEngine, ok := w.engine.(*hotstuff.Hotstuff); ok {
+		notifyMinerCh = hsEngine.GetNotifyMinerCh()
+		log.Info("Worker: registered Hotstuff miner notification channel")
+	}
+
 	// commit aborts in-flight transaction execution with given signal and resubmits a new one.
 	commit := func(reason int32) {
 		if interruptCh != nil {
@@ -497,6 +509,21 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 			if w.resubmitHook != nil {
 				w.resubmitHook(minRecommit, recommit)
 			}
+
+		case <-notifyMinerCh:
+			// Hotstuff view changed and this node is now the leader - immediately produce a block
+			if !w.isRunning() {
+				continue
+			}
+			log.Info("Worker: received Hotstuff miner notification, immediately committing work")
+			if interruptCh != nil {
+				interruptCh <- commitInterruptNewHead
+				close(interruptCh)
+				interruptCh = nil
+			}
+			clearPending(w.chain.CurrentBlock().Number.Uint64())
+			timestamp = time.Now().Unix()
+			commit(commitInterruptNewHead)
 
 		case <-w.exitCh:
 			return
@@ -1024,10 +1051,38 @@ func (w *worker) prepareWork(genParams *generateParams, witness bool) (*environm
 	parent := w.chain.CurrentBlock()
 	if genParams.parentHash != (common.Hash{}) {
 		block := w.chain.GetBlockByHash(genParams.parentHash)
+		if block != nil {
+			log.Warn("Worker: parent found in canonical chain",
+				"genParamsParentHash", genParams.parentHash.Hex()[:8],
+				"blockHash", block.Hash().Hex()[:8],
+				"blockNumber", block.NumberU64())
+		}
 		if block == nil {
-			return nil, errors.New("missing parent")
+			// In Chained HotStuff, we build on highQC block which may only be prewritten (not committed)
+			// Try to get the block from HotStuff engine's state or rawdb
+			if hs, ok := w.engine.(*hotstuff.Hotstuff); ok {
+				block = hs.GetBlockFromState(genParams.parentHash)
+				if block != nil {
+					log.Debug("Worker: got parent block from HotStuff state",
+						"parentHash", genParams.parentHash.Hex()[:8],
+						"parentNumber", block.NumberU64())
+				}
+			}
+
+			// If still not found, return error
+			if block == nil {
+				return nil, fmt.Errorf("missing parent: %s (not in canonical chain or HotStuff state)",
+					genParams.parentHash.Hex()[:8])
+			}
 		}
 		parent = block.Header()
+		log.Warn("Worker: parent set from GetBlockFromState result",
+			"genParamsParentHash", genParams.parentHash.Hex()[:8],
+			"blockHash", block.Hash().Hex()[:8],
+			"blockHeaderHash", block.Header().Hash().Hex()[:8],
+			"parentVariableHash", parent.Hash().Hex()[:8],
+			"blockNumber", block.NumberU64(),
+			"headerNumber", block.Header().Number.Uint64())
 	}
 	// Sanity check the timestamp correctness, recap the timestamp
 	// to parent+1 if the mutation is allowed.
@@ -1046,6 +1101,14 @@ func (w *worker) prepareWork(genParams *generateParams, witness bool) (*environm
 		Time:       timestamp,
 		Coinbase:   genParams.coinbase,
 	}
+
+	log.Warn("Worker: constructing header with gas limit",
+		"blockNumber", header.Number.Uint64(),
+		"parentHash", parent.Hash().Hex()[:10],
+		"parentNumber", parent.Number.Uint64(),
+		"parentGasLimit", parent.GasLimit,
+		"calculatedGasLimit", header.GasLimit,
+		"gasCeil", w.config.GasCeil)
 	// Set the extra field.
 	if len(w.extra) != 0 {
 		header.Extra = w.extra
@@ -1057,7 +1120,7 @@ func (w *worker) prepareWork(genParams *generateParams, witness bool) (*environm
 	// Set baseFee and GasLimit if we are on an EIP-1559 chain
 	if w.chainConfig.IsLondon(header.Number) {
 		header.BaseFee = eip1559.CalcBaseFee(w.chainConfig, parent)
-		if w.chainConfig.Parlia == nil && !w.chainConfig.IsLondon(parent.Number) {
+		if w.chainConfig.Parlia == nil && w.chainConfig.Hotstuff == nil && !w.chainConfig.IsLondon(parent.Number) {
 			parentGasLimit := parent.GasLimit * w.chainConfig.ElasticityMultiplier()
 			header.GasLimit = core.CalcGasLimit(parentGasLimit, w.config.GasCeil)
 		}
@@ -1076,7 +1139,7 @@ func (w *worker) prepareWork(genParams *generateParams, witness bool) (*environm
 		}
 		header.BlobGasUsed = new(uint64)
 		header.ExcessBlobGas = &excessBlobGas
-		if w.chainConfig.Parlia == nil {
+		if w.chainConfig.Parlia == nil && w.chainConfig.Hotstuff == nil {
 			header.ParentBeaconRoot = genParams.beaconRoot
 		} else {
 			header.WithdrawalsHash = &types.EmptyWithdrawalsHash
@@ -1239,6 +1302,20 @@ func (w *worker) generateWork(params *generateParams, witness bool) *newPayloadR
 	}
 
 	fees := work.state.GetBalance(consensus.SystemAddress)
+
+	// DEBUG: Check state root before FinalizeAndAssemble
+	parentHeader := w.chain.GetHeaderByHash(work.header.ParentHash)
+	if parentHeader != nil {
+		checkRoot := work.state.IntermediateRoot(w.chain.Config().IsEIP158(work.header.Number))
+		log.Warn("[Worker-newPayload] State before FinalizeAndAssemble",
+			"block", work.header.Number,
+			"parentRoot", parentHeader.Root.Hex()[:10],
+			"workStateRoot", checkRoot.Hex()[:10],
+			"txCount", len(body.Transactions),
+			"receiptCount", len(work.receipts),
+			"match", checkRoot == parentHeader.Root)
+	}
+
 	block, receipts, err := w.engine.FinalizeAndAssemble(w.chain, work.header, work.state, &body, work.receipts, nil)
 	if err != nil {
 		return &newPayloadResult{err: err}
@@ -1258,8 +1335,10 @@ func (w *worker) generateWork(params *generateParams, witness bool) *newPayloadR
 // commitWork generates several new sealing tasks based on the parent block
 // and submit them to the sealer.
 func (w *worker) commitWork(interruptCh chan int32, timestamp int64) {
+	log.Info("[Miner commitWork] ENTER", "timestamp", timestamp)
 	// Abort committing if node is still syncing
 	if w.syncing.Load() {
+		log.Info("[Miner commitWork] EXIT - node is syncing")
 		return
 	}
 	start := time.Now()
@@ -1269,9 +1348,12 @@ func (w *worker) commitWork(interruptCh chan int32, timestamp int64) {
 	if w.isRunning() {
 		coinbase = w.etherbase()
 		if coinbase == (common.Address{}) {
-			log.Error("Refusing to mine without etherbase")
+			log.Error("[Miner commitWork] EXIT - Refusing to mine without etherbase")
 			return
 		}
+		log.Info("[Miner commitWork] Worker is running", "coinbase", coinbase.Hex())
+	} else {
+		log.Info("[Miner commitWork] Worker is NOT running")
 	}
 
 	stopTimer := time.NewTimer(0)
@@ -1285,6 +1367,24 @@ func (w *worker) commitWork(interruptCh chan int32, timestamp int64) {
 	// validator can try several times to get the most profitable block,
 	// as long as the timestamp is not reached.
 	workList := make([]*environment, 0, 10)
+
+	// For HotStuff, use highQC block as parent (not committed chain head)
+	// This enables chained pipelining: Block1 <- QC <- Block2 <- QC <- Block3
+	parentHash := w.chain.CurrentBlock().Hash()
+	if hs, ok := w.engine.(*hotstuff.Hotstuff); ok {
+		// CRITICAL CHECK: Don't create duplicate proposals for the same view
+		// HotStuff requires exactly one proposal per view
+		currentView := hs.GetCurrentView()
+		if hs.HasProposalForView(currentView) {
+			log.Debug("commitWork: already have proposal for current view, skipping",
+				"view", currentView)
+			return
+		}
+
+		parentHash = hs.GetProposalParent(w.chain)
+		log.Debug("Using HotStuff highQC as proposal parent", "parent", parentHash)
+	}
+
 	var prevWork *environment
 	// workList clean up
 	defer func() {
@@ -1482,7 +1582,9 @@ LOOP:
 		}
 	}
 
+	log.Info("[Miner commitWork] Calling w.commit with bestWork", "blockNumber", bestWork.header.Number.Uint64())
 	w.commit(bestWork, w.fullTaskHook, true, start)
+	log.Info("[Miner commitWork] EXIT - commit called", "blockNumber", bestWork.header.Number.Uint64())
 
 	// Swap out the old work with the new one, terminating any leftover
 	// prefetcher processes in the mean time and starting a new one.
@@ -1503,7 +1605,13 @@ func (w *worker) inTurn() bool {
 // Note the assumption is held that the mutation is allowed to the passed env, do
 // the deep copy first.
 func (w *worker) commit(env *environment, interval func(), update bool, start time.Time) error {
+	log.Info("[Miner commit] ENTER", "blockNumber", env.header.Number.Uint64(), "isRunning", w.isRunning())
 	if w.isRunning() {
+		if env.committed {
+			log.Warn("[Miner commit] Invalid work commit: already committed", "number", env.header.Number.Uint64())
+			return nil
+		}
+		log.Info("[Miner commit] Worker is running, proceeding with commit")
 		if interval != nil {
 			interval()
 		}
@@ -1515,10 +1623,25 @@ func (w *worker) commit(env *environment, interval func(), update bool, start ti
 		if env.header.EmptyWithdrawalsHash() {
 			body.Withdrawals = make([]*types.Withdrawal, 0)
 		}
+
+		log.Info("[Miner commit] Calling FinalizeAndAssemble", "blockNumber", env.header.Number.Uint64())
 		block, receipts, err := w.engine.FinalizeAndAssemble(w.chain, types.CopyHeader(env.header), env.state, &body, env.receipts, nil)
+		env.committed = true
 		if err != nil {
+			log.Warn("[Miner commit] FinalizeAndAssemble failed", "err", err)
 			return err
 		}
+		log.Info("[Miner commit] FinalizeAndAssemble succeeded", "blockNumber", block.NumberU64(), "blockHash", block.Hash().Hex()[:10])
+		//todo:For chained hotstuff, if the empty block does not reach consensus, then the low transaction volume may
+		//cause the transactions in the last two blocks to fail to be committed.
+		//But empty block consensus will waste resources
+		//if _, ok := w.engine.(*hotstuff.Hotstuff); ok {
+		//	//Hotstuff does not need to handle empty block
+		//	if len(body.Transactions) == 0 {
+		//		log.Debug("Hotstuff does not need to handle empty block")
+		//		return nil
+		//	}
+		//}
 		env.txs = body.Transactions
 		env.receipts = receipts
 		finalizeBlockTimer.UpdateSince(finalizeStart)
@@ -1533,14 +1656,17 @@ func (w *worker) commit(env *environment, interval func(), update bool, start ti
 
 		block = block.WithSidecars(env.sidecars)
 
+		log.Info("[Miner commit] Sending task to taskCh", "blockNumber", block.Number())
 		select {
 		case w.taskCh <- &task{receipts: receipts, state: env.state, block: block, createdAt: time.Now(), miningStartAt: start}:
-			log.Info("Commit new sealing work", "number", block.Number(), "sealhash", w.engine.SealHash(block.Header()),
-				"txs", env.tcount, "blobs", env.blobs, "gas", block.GasUsed(), "fees", feesInEther, "elapsed", common.PrettyDuration(time.Since(start)))
+			log.Info("[Miner commit] ✅ Commit new sealing work sent to taskCh", "number", block.Number(), "sealhash", w.engine.SealHash(block.Header()).Hex()[:10],
+				"txs", len(env.txs), "blobs", env.blobs, "gas", block.GasUsed(), "fees", feesInEther, "elapsed", common.PrettyDuration(time.Since(start)))
 
 		case <-w.exitCh:
-			log.Info("Worker has exited")
+			log.Info("[Miner commit] Worker has exited")
 		}
+	} else {
+		log.Info("[Miner commit] EXIT - Worker is NOT running, skipping commit")
 	}
 	if update {
 		w.updateSnapshot(env)

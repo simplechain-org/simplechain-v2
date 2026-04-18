@@ -160,3 +160,14 @@ type PoSA interface {
 	IsActiveValidatorAt(chain ChainHeaderReader, header *types.Header, checkVoteKeyFn func(bLSPublicKey *types.BLSPublicKey) bool) bool
 	NextProposalBlock(chain ChainHeaderReader, header *types.Header, proposer common.Address) (uint64, uint64, error)
 }
+
+type HotStuff interface {
+	Engine
+	IsSystemTransaction(tx *types.Transaction, header *types.Header) (bool, error)
+	IsSystemContract(to *common.Address) bool
+	EnoughDistance(chain ChainReader, header *types.Header) bool
+	IsLocalBlock(header *types.Header) bool
+	VerifyVote(chain ChainHeaderReader, vote *types.VoteEnvelope) error
+	IsActiveValidatorAt(chain ChainHeaderReader, header *types.Header, checkVoteKeyFn func(bLSPublicKey *types.BLSPublicKey) bool) bool
+	NextProposalBlock(chain ChainHeaderReader, header *types.Header, proposer common.Address) (uint64, uint64, error)
+}
