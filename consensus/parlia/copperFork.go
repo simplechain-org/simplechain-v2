@@ -36,7 +36,7 @@ type ethAPIReader interface {
 	GetMaxContributionRewardRatio(blockNr rpc.BlockNumberOrHash) (*big.Int, error)
 	GetTotalSupply(blockNr rpc.BlockNumberOrHash) (*big.Int, *big.Int, error)
 	GetValidatorsTotalPooled(blockNr rpc.BlockNumberOrHash) (*big.Int, error)
-	GetAllValidators(blockNr rpc.BlockNumberOrHash) ([]common.Address, error)
+	GetAllValidators(blockNr rpc.BlockNumberOrHash, num *big.Int, timestamp uint64) ([]common.Address, error)
 	GetValidatorDelegatedAmount(blockNr rpc.BlockNumberOrHash, operatorAddr common.Address) (*big.Int, *big.Int, *big.Int, error)
 	GetValidatorConsensusAddress(blockNr rpc.BlockNumberOrHash, operatorAddr common.Address) (common.Address, error)
 	GetValidatorUptimeRecord(blockNr rpc.BlockNumberOrHash, val common.Address, index *big.Int) (*big.Int, *big.Int, error)
@@ -49,7 +49,7 @@ type ethAPIWriter interface {
 	SetBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason)
 	AddBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason)
 	GetBalance(addr common.Address) *uint256.Int
-	DistributeIncoming(val common.Address, state vm.StateDB, header *types.Header, chain core.ChainContext,
+	DistributeIncoming(val common.Address, transactionFee *big.Int, state vm.StateDB, header *types.Header, chain core.ChainContext,
 		txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) (*big.Int, error)
 }
 
@@ -57,20 +57,20 @@ type ethAPIWriter interface {
 // This struct is used to separate data fetching from calculation logic for easier testing
 type ValidatorRewardInput struct {
 	// Basic reward calculation inputs
-	NominalInterestRateScaled  *big.Int // Scaled by 10^18
+	NominalInterestRateScaled  *big.Int // Basis points scaled by 10^18 (e.g. 500 * 1e18 = 5%)
 	AnnualBlockCountEveryYear  *big.Int
 	AnnualBlockCountEveryEpoch *big.Int
 	TotalPooled                *big.Int
 
 	// Contribution reward calculation inputs
-	InflationRate              *big.Int
+	InflationRate              *big.Int // Unscaled basis points (e.g. 500 = 5%)
 	InTurnCounts               *big.Int
 	TotalTurnCounts            *big.Int
 	CommissionRate             *big.Int // In basis points
 	TotalDelegated             *big.Int
 	ValidatorsTotalPooled      *big.Int
 	TotalSupply                *big.Int
-	MaxContributionRewardRatio *big.Int // Scaled by 10^18
+	MaxContributionRewardRatio *big.Int
 }
 
 // ValidatorRewardResult contains the calculated reward results
@@ -259,7 +259,7 @@ func (p *Parlia) getTotalIssuanceAmountOfReward(blockNr rpc.BlockNumberOrHash) (
 
 	return unpacked[0].(*big.Int), unpacked[1].(*big.Int), nil
 }
-func (p *Parlia) getAllValidators(blockNr rpc.BlockNumberOrHash) ([]common.Address, error) {
+func (p *Parlia) getAllValidators(blockNr rpc.BlockNumberOrHash, num *big.Int, timestamp uint64) ([]common.Address, error) {
 	method := "getValidators"
 	toAddress := common.HexToAddress(systemcontracts.StakeHubContract)
 	gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
@@ -310,7 +310,27 @@ func (p *Parlia) getAllValidators(blockNr rpc.BlockNumberOrHash) ([]common.Addre
 		offset += uint64(len(operatorAddrs))
 	}
 
-	return allOperatorAddrs, nil
+	// - Before CopperRemix2 fork: do not check jailed status; reward all validators (including jailed).
+	// - After CopperRemix2 fork: skip jailed validators.
+	if !p.chainConfig.IsCopperRemix2(num, timestamp) {
+		return allOperatorAddrs, nil
+	}
+
+	var activeValidators []common.Address
+	for _, operatorAddr := range allOperatorAddrs {
+		_, jailed, _, err := p.getValidatorBasicInfo(blockNr, operatorAddr)
+		if err != nil {
+			log.Warn("getAllValidators getValidatorBasicInfo failed, including validator anyway", "operatorAddr", operatorAddr, "error", err)
+			return nil, err
+		}
+		if !jailed {
+			activeValidators = append(activeValidators, operatorAddr)
+		} else {
+			log.Debug("getAllValidators skipping jailed validator (after CopperRemix2), operatorAddr", operatorAddr)
+		}
+	}
+
+	return activeValidators, nil
 }
 
 func (p *Parlia) getValidatorsTotalPooled(blockNr rpc.BlockNumberOrHash) (*big.Int, error) {
@@ -372,6 +392,41 @@ func (p *Parlia) getValidatorConsensusAddress(blockNr rpc.BlockNumberOrHash, ope
 	}
 
 	return unpacked[0].(common.Address), nil
+}
+
+func (p *Parlia) getValidatorBasicInfo(blockNr rpc.BlockNumberOrHash, operatorAddr common.Address) (uint64, bool, uint64, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	method := "getValidatorBasicInfo"
+	toAddress := common.HexToAddress(systemcontracts.StakeHubContract)
+	gas := (hexutil.Uint64)(uint64(math.MaxUint64 / 2))
+
+	data, err := p.stakeHubABI.Pack(method, operatorAddr)
+	if err != nil {
+		log.Error("Unable to pack tx for getValidatorBasicInfo", "error", err)
+		return 0, false, 0, err
+	}
+	msgData := (hexutil.Bytes)(data)
+
+	result, err := p.ethAPI.Call(ctx, ethapi.TransactionArgs{
+		Gas:  &gas,
+		To:   &toAddress,
+		Data: &msgData,
+	}, &blockNr, nil, nil)
+	if err != nil {
+		return 0, false, 0, err
+	}
+
+	unpacked, err := p.stakeHubABI.Unpack(method, result)
+	if err != nil {
+		return 0, false, 0, err
+	}
+
+	createdTime := unpacked[0].(*big.Int)
+	jailed := unpacked[1].(bool)
+	jailUntil := unpacked[2].(*big.Int)
+
+	return createdTime.Uint64(), jailed, jailUntil.Uint64(), nil
 }
 
 func (p *Parlia) getValidatorCommissionRate(blockNr rpc.BlockNumberOrHash, val common.Address) (CommissionItem, error) {
@@ -445,15 +500,14 @@ func (p *Parlia) getMaxContributionRewardRatio(blockNr rpc.BlockNumberOrHash) (*
 	return unpacked[0].(*big.Int), nil
 }
 
-// CalculateRewardByRateWithBigInt calculates reward using big.Int arithmetic with fast exponentiation
-// rate is in basis points (e.g., 500 for 5%)
+// CalculateRewardByRateWithBigInt calculates reward using big.Int arithmetic with fast exponentiation.
+// rate must be basis points scaled by 10^18 (e.g. 500 * 1e18 = 5%).
 // Formula: reward = totalPooled * ((1 + rate/10000/annualBlockCountEveryYear)^annualBlockCountEveryEpoch - 1)
 func (p *Parlia) CalculateRewardByRate(rate *big.Int, annualBlockCountEveryYear *big.Int,
 	annualBlockCountEveryEpoch *big.Int, totalPooled *big.Int) *big.Int {
 
 	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
-	// ratePerBlock = rate / 10000 / annualBlockCountEveryYear
-	// ratePerBlockScaled = rate * 10000 / annualBlockCountEveryYear
+	// ratePerBlockScaled = (scaled basis points / 10000 / annualBlockCountEveryYear)
 	ratePerBlockScaled := new(big.Int).Set(rate)
 	ratePerBlockScaled.Div(ratePerBlockScaled, annualBlockCountEveryYear)
 	ratePerBlockScaled.Div(ratePerBlockScaled, big.NewInt(10000))
@@ -508,15 +562,15 @@ func powerWithScale(base *big.Int, exp *big.Int, scale *big.Int) *big.Int {
 	return result
 }
 
-// CalculateContributionRewardRate calculates the contribution reward rate using big.Int arithmetic
+// CalculateContributionRewardRate calculates the contribution reward rate using big.Int arithmetic.
 // Formula: contributionRewardRate = inflationRate * uptimeRate * (1 - commissionRate) / totalNetworkStakingRatio * sqrt(contributionStakingRatio)
-// All rates are in basis points (10000 = 100%)
-// Returns: reward rate in basis points
+// inflationRate and commissionRate are unscaled basis points (10000 = 100%).
+// Returns: reward rate in basis points scaled by 10^18.
 func CalculateContributionRewardRate(
-	inflationRate *big.Int, // basis points (e.g., 500 = 5%)
+	inflationRate *big.Int, // unscaled basis points (e.g. 500 = 5%)
 	inTurnCounts *big.Int,
 	totalTurnCounts *big.Int,
-	commissionRate *big.Int, // basis points (e.g., 1000 = 10%)
+	commissionRate *big.Int, // unscaled basis points (e.g. 1000 = 10%)
 	totalDelegated *big.Int,
 	totalPooled *big.Int,
 	validatorsTotalPooled *big.Int,
@@ -561,8 +615,12 @@ func CalculateContributionRewardRate(
 		return big.NewInt(0)
 	}
 
+	if networkStakingRatioScaled.Cmp(big.NewInt(0)) == 0 {
+		return big.NewInt(0)
+	}
+
 	// 6. Now calculate: inflationRate * uptimeRate * (1 - commissionRate) / totalNetworkStakingRatio * sqrt(contributionStakingRatio)
-	// Start with inflationRate (in basis points)
+	// Start with inflationRate and scale it to "scaled basis points".
 	result := new(big.Int).Mul(inflationRate, scale)
 
 	// result = inflationRate * uptimeRateScaled / scale
@@ -581,40 +639,17 @@ func CalculateContributionRewardRate(
 	result.Mul(result, scale)
 	result.Div(result, networkStakingRatioScaled)
 
-	// Result is now in basis points
+	// Result is now in basis points scaled by 10^18.
 	return result
 }
 
-// sqrtBigInt calculates the integer square root using Newton's method
+// sqrtBigInt calculates the integer square root.
 // For a number scaled by 10^18, the result will be scaled by 10^9
 func sqrtBigInt(n *big.Int) *big.Int {
-	if n.Cmp(big.NewInt(0)) <= 0 {
+	if n.Sign() <= 0 {
 		return big.NewInt(0)
 	}
-
-	// Initial guess: start with n/2
-	x := new(big.Int).Div(n, big.NewInt(2))
-	if x.Cmp(big.NewInt(0)) == 0 {
-		return big.NewInt(1)
-	}
-
-	// Newton's method: x_new = (x + n/x) / 2
-	for {
-		// Calculate n/x
-		nDivX := new(big.Int).Div(n, x)
-
-		// Calculate (x + n/x) / 2
-		xNew := new(big.Int).Add(x, nDivX)
-		xNew.Div(xNew, big.NewInt(2))
-
-		// Check convergence
-		diff := new(big.Int).Sub(x, xNew)
-		if diff.Abs(diff).Cmp(big.NewInt(1)) <= 0 {
-			return xNew
-		}
-
-		x = xNew
-	}
+	return new(big.Int).Sqrt(n)
 }
 
 func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeaderReader, state vm.StateDB, header *types.Header,
@@ -682,7 +717,7 @@ func (p *Parlia) distributeBasicAndContributionRewardWithInterfaces(chain consen
 		"maxContributionRewardRatio", maxContributionRewardRatio, "totalIssuedSupply", totalIssuedSupply, "totalBurnedSupply", totalBurnedSupply,
 		"validatorsTotalPooled", validatorsTotalPooled,
 	)
-	allValidators, err := reader.GetAllValidators(blockNr)
+	allValidators, err := reader.GetAllValidators(blockNr, header.Number, header.Time)
 	if err != nil {
 		log.Warn("distributeBasicAndContributionReward getAllValidators failed", "blockNr", blockNr.BlockHash.Hex(), "error", err)
 		return nil, nil, nil, err
@@ -746,7 +781,12 @@ func (p *Parlia) distributeBasicAndContributionRewardWithInterfaces(chain consen
 		writer.AddBalance(consensus.SystemAddress, uint256.MustFromBig(rewardResult.ContributionReward), tracing.BalanceIncreaseContributionReward)
 
 		// Distribute fixed block reward (this still requires state access)
-		fixedBlockReward, err := writer.DistributeIncoming(validatorData.ConsensusAddress, state, header, cx, txs, receipts, receivedTxs, usedGas, mining, tracer)
+		txFee := common.Big0
+		if validatorData.ConsensusAddress == header.Coinbase {
+			// Only pass the breatheBlockFee once (on coinbase) to avoid double counting.
+			txFee = breatheBlockFee.ToBig()
+		}
+		fixedBlockReward, err := writer.DistributeIncoming(validatorData.ConsensusAddress, txFee, state, header, cx, txs, receipts, receivedTxs, usedGas, mining, tracer)
 		if err != nil {
 			log.Warn("distributeBasicAndContributionReward distributeIncoming failed", "blockNr", blockNr.BlockHash.Hex(), "error", err)
 			return nil, nil, nil, err
@@ -816,7 +856,7 @@ func calculateValidatorRewards(p *Parlia, input *ValidatorRewardInput, maxContri
 	)
 
 	// Calculate contribution reward rate
-	contributionRewardRate := CalculateContributionRewardRate(
+	contributionRewardRateScaled := CalculateContributionRewardRate(
 		input.InflationRate,
 		input.InTurnCounts,
 		input.TotalTurnCounts,
@@ -828,14 +868,14 @@ func calculateValidatorRewards(p *Parlia, input *ValidatorRewardInput, maxContri
 	)
 
 	// Cap contribution reward rate at maximum
-	if contributionRewardRate.Cmp(maxContributionRewardRate) > 0 {
-		contributionRewardRate = new(big.Int).Set(maxContributionRewardRate)
+	if contributionRewardRateScaled.Cmp(maxContributionRewardRate) > 0 {
+		contributionRewardRateScaled = new(big.Int).Set(maxContributionRewardRate)
 	}
 
 	// Calculate contribution reward with compound interest:
 	// totalPooled * ((1 + contributionRewardRate/annualBlockCountEveryYear)^annualBlockCountEveryEpoch - 1)
 	result.ContributionReward = p.CalculateRewardByRate(
-		contributionRewardRate,
+		contributionRewardRateScaled,
 		input.AnnualBlockCountEveryYear,
 		input.AnnualBlockCountEveryEpoch,
 		input.TotalPooled,
@@ -903,8 +943,10 @@ func (p *Parlia) updateCurrentTotalSupply(additionalIssuanceAmount *big.Int, add
 		balance, err := p.ethAPI.GetBalance(ctx, address, blockNr)
 		if err != nil {
 			log.Error("Failed to get balance for burned address", "address", address, "blockNumber", header.Number, "error", err)
-			// Fallback to current state if API call fails
-			burnedAmount.Add(burnedAmount, state.GetBalance(address).ToBig())
+			// Under no circumstances should the engine fallback to a different state view. If the required state cannot be read, the function must immediately return the error (return err) to abort the block processing.
+			// // Fallback to current state if API call fails
+			// burnedAmount.Add(burnedAmount, state.GetBalance(address).ToBig())
+			return err
 		} else {
 			burnedAmount.Add(burnedAmount, balance.ToInt())
 		}
@@ -996,11 +1038,8 @@ func calculateNewYearInflation(currentTotalSupply, lastYearTotalSupply *big.Int)
 	if additionalIssuanceAmount.Cmp(big.NewInt(0)) <= 0 {
 		return big.NewInt(0), big.NewInt(0)
 	}
-	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
-	additionalIssuanceAmountScaled := new(big.Int).Mul(additionalIssuanceAmount, scale)
-	additionalIssuanceAmountScaled.Mul(additionalIssuanceAmountScaled, new(big.Int).SetUint64(10000))
-	newInflationRate := new(big.Int).Div(additionalIssuanceAmountScaled, currentTotalSupply)
-	newInflationRate = newInflationRate.Div(newInflationRate, scale)
+	newInflationRate := new(big.Int).Mul(additionalIssuanceAmount, big.NewInt(10000))
+	newInflationRate.Div(newInflationRate, currentTotalSupply)
 	log.Debug("calculateNewYearInflation", "currentTotalSupply", currentTotalSupply, "lastYearTotalSupply", lastYearTotalSupply, "additionalIssuanceAmount", additionalIssuanceAmount, "newInflationRate", newInflationRate)
 	// max inflation rate is 500 basis points
 	if newInflationRate.Cmp(big.NewInt(MaxInflationRate)) > 0 {
@@ -1092,8 +1131,8 @@ func (r *defaultEthAPIReader) GetValidatorsTotalPooled(blockNr rpc.BlockNumberOr
 	return r.parlia.getValidatorsTotalPooled(blockNr)
 }
 
-func (r *defaultEthAPIReader) GetAllValidators(blockNr rpc.BlockNumberOrHash) ([]common.Address, error) {
-	return r.parlia.getAllValidators(blockNr)
+func (r *defaultEthAPIReader) GetAllValidators(blockNr rpc.BlockNumberOrHash, num *big.Int, timestamp uint64) ([]common.Address, error) {
+	return r.parlia.getAllValidators(blockNr, num, timestamp)
 }
 
 func (r *defaultEthAPIReader) GetValidatorDelegatedAmount(blockNr rpc.BlockNumberOrHash, operatorAddr common.Address) (*big.Int, *big.Int, *big.Int, error) {
@@ -1131,7 +1170,7 @@ func (w *defaultEthAPIWriter) GetBalance(addr common.Address) *uint256.Int {
 	return w.state.GetBalance(addr)
 }
 
-func (w *defaultEthAPIWriter) DistributeIncoming(val common.Address, state vm.StateDB, header *types.Header, chain core.ChainContext,
+func (w *defaultEthAPIWriter) DistributeIncoming(val common.Address, transactionFee *big.Int, state vm.StateDB, header *types.Header, chain core.ChainContext,
 	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) (*big.Int, error) {
-	return w.parlia.distributeIncoming(val, state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
+	return w.parlia.distributeIncoming(val, transactionFee, state, header, chain, txs, receipts, receivedTxs, usedGas, mining, tracer)
 }

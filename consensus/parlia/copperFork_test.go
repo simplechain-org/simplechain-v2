@@ -496,6 +496,26 @@ func TestCalculateContributionRewardRate(t *testing.T) {
 	}
 }
 
+func TestCalculateContributionRewardRateReturnsScaledBasisPoints(t *testing.T) {
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
+
+	result := CalculateContributionRewardRate(
+		big.NewInt(500),   // 5% inflation in basis points
+		big.NewInt(10000), // 100% uptime
+		big.NewInt(10000),
+		big.NewInt(0), // 0% commission
+		new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil),                                    // 1 token delegated
+		new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil),                                    // 1 token pooled
+		new(big.Int).Mul(big.NewInt(100), new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)), // 100 validators pooled
+		new(big.Int).Mul(big.NewInt(100), new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)), // 100 total supply
+	)
+
+	expected := new(big.Int).Mul(big.NewInt(500), scale)
+	if result.Cmp(expected) != 0 {
+		t.Fatalf("CalculateContributionRewardRate() = %v, expected scaled basis points %v", result, expected)
+	}
+}
+
 // TestSqrtBigInt tests the sqrtBigInt function
 func TestSqrtBigInt(t *testing.T) {
 	tests := []struct {
@@ -533,13 +553,8 @@ func TestSqrtBigInt(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := sqrtBigInt(tt.input)
-			// Allow for small rounding differences
-			diff := new(big.Int).Sub(result, tt.expected)
-			diff.Abs(diff)
-			// Allow difference of up to 1% of expected value
-			tolerance := new(big.Int).Div(tt.expected, big.NewInt(100))
-			if diff.Cmp(tolerance) > 0 {
-				t.Errorf("sqrtBigInt() = %v, expected approximately %v (diff: %v)", result, tt.expected, diff)
+			if result.Cmp(tt.expected) != 0 {
+				t.Errorf("sqrtBigInt() = %v, expected %v", result, tt.expected)
 			}
 		})
 	}
@@ -795,7 +810,7 @@ func TestCalculateValidatorRewards(t *testing.T) {
 				TotalDelegated:             new(big.Int).Exp(big.NewInt(10), big.NewInt(19), nil), // 10 tokens
 				ValidatorsTotalPooled:      new(big.Int).Exp(big.NewInt(10), big.NewInt(21), nil), // 1000 tokens
 				TotalSupply:                new(big.Int).Exp(big.NewInt(10), big.NewInt(22), nil), // 10000 tokens
-				MaxContributionRewardRatio: new(big.Int).Mul(big.NewInt(1000), scale),             // 10% scaled
+				MaxContributionRewardRatio: big.NewInt(1000),                                      // 10% scaled
 			},
 			maxContributionRewardRate: new(big.Int).Mul(big.NewInt(1000), scale),
 			// Expected values would need to be calculated based on the actual formulas
@@ -817,7 +832,7 @@ func TestCalculateValidatorRewards(t *testing.T) {
 				TotalDelegated:             big.NewInt(0),
 				ValidatorsTotalPooled:      new(big.Int).Exp(big.NewInt(10), big.NewInt(21), nil),
 				TotalSupply:                new(big.Int).Exp(big.NewInt(10), big.NewInt(22), nil),
-				MaxContributionRewardRatio: new(big.Int).Mul(big.NewInt(1000), scale),
+				MaxContributionRewardRatio: big.NewInt(1000),
 			},
 			maxContributionRewardRate:  new(big.Int).Mul(big.NewInt(1000), scale),
 			expectedBasicReward:        big.NewInt(0),
@@ -918,7 +933,7 @@ func (m *mockEthAPIReader) GetValidatorsTotalPooled(blockNr rpc.BlockNumberOrHas
 	return m.validatorsTotalPooled, nil
 }
 
-func (m *mockEthAPIReader) GetAllValidators(blockNr rpc.BlockNumberOrHash) ([]common.Address, error) {
+func (m *mockEthAPIReader) GetAllValidators(blockNr rpc.BlockNumberOrHash, num *big.Int, timestamp uint64) ([]common.Address, error) {
 	if m.shouldError {
 		return nil, errors.New(m.errorMsg)
 	}
@@ -1021,7 +1036,7 @@ func (m *mockEthAPIWriter) GetBalance(addr common.Address) *uint256.Int {
 	return uint256.NewInt(0)
 }
 
-func (m *mockEthAPIWriter) DistributeIncoming(val common.Address, state vm.StateDB, header *types.Header, chain core.ChainContext,
+func (m *mockEthAPIWriter) DistributeIncoming(val common.Address, transactionFee *big.Int, state vm.StateDB, header *types.Header, chain core.ChainContext,
 	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) (*big.Int, error) {
 	if m.distributeIncomingError != nil {
 		return nil, m.distributeIncomingError
@@ -1166,7 +1181,7 @@ func TestMockEthAPIWriter(t *testing.T) {
 
 	// Test DistributeIncoming
 	writer.distributeIncomingResult = big.NewInt(100)
-	result, err := writer.DistributeIncoming(testAddr, nil, nil, nil, nil, nil, nil, nil, false, nil)
+	result, err := writer.DistributeIncoming(testAddr, big.NewInt(0), nil, nil, nil, nil, nil, nil, nil, false, nil)
 	if err != nil {
 		t.Errorf("DistributeIncoming failed: %v", err)
 	}
@@ -1176,7 +1191,7 @@ func TestMockEthAPIWriter(t *testing.T) {
 
 	// Test DistributeIncoming with error
 	writer.distributeIncomingError = errors.New("test error")
-	_, err = writer.DistributeIncoming(testAddr, nil, nil, nil, nil, nil, nil, nil, false, nil)
+	_, err = writer.DistributeIncoming(testAddr, big.NewInt(0), nil, nil, nil, nil, nil, nil, nil, false, nil)
 	if err == nil {
 		t.Error("expected error from DistributeIncoming but got nil")
 	}

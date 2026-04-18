@@ -24,23 +24,25 @@ func _() {
 	_ = x[BalanceDecreaseSelfdestruct-13]
 	_ = x[BalanceDecreaseSelfdestructBurn-14]
 	_ = x[BalanceChangeRevert-15]
+	_ = x[BalanceIncreaseBasicReward-16]
+	_ = x[BalanceIncreaseContributionReward-17]
 	_ = x[BalanceDecreaseBSCDistributeReward-210]
 	_ = x[BalanceIncreaseBSCDistributeReward-211]
 }
 
 const (
-	_BalanceChangeReason_name_0 = "UnspecifiedBalanceIncreaseRewardMineUncleBalanceIncreaseRewardMineBlockBalanceIncreaseWithdrawalBalanceIncreaseGenesisBalanceBalanceIncreaseRewardTransactionFeeBalanceDecreaseGasBuyBalanceIncreaseGasReturnBalanceIncreaseDaoContractBalanceDecreaseDaoAccountTransferTouchAccountBalanceIncreaseSelfdestructBalanceDecreaseSelfdestructBalanceDecreaseSelfdestructBurnRevert"
+	_BalanceChangeReason_name_0 = "UnspecifiedBalanceIncreaseRewardMineUncleBalanceIncreaseRewardMineBlockBalanceIncreaseWithdrawalBalanceIncreaseGenesisBalanceBalanceIncreaseRewardTransactionFeeBalanceDecreaseGasBuyBalanceIncreaseGasReturnBalanceIncreaseDaoContractBalanceDecreaseDaoAccountTransferTouchAccountBalanceIncreaseSelfdestructBalanceDecreaseSelfdestructBalanceDecreaseSelfdestructBurnRevertBalanceIncreaseBasicRewardBalanceIncreaseContributionReward"
 	_BalanceChangeReason_name_1 = "BalanceDecreaseBSCDistributeRewardBalanceIncreaseBSCDistributeReward"
 )
 
 var (
-	_BalanceChangeReason_index_0 = [...]uint16{0, 11, 41, 71, 96, 125, 160, 181, 205, 231, 256, 264, 276, 303, 330, 361, 367}
+	_BalanceChangeReason_index_0 = [...]uint16{0, 11, 41, 71, 96, 125, 160, 181, 205, 231, 256, 264, 276, 303, 330, 361, 367, 393, 426}
 	_BalanceChangeReason_index_1 = [...]uint8{0, 34, 68}
 )
 
 func (i BalanceChangeReason) String() string {
 	switch {
-	case i <= 15:
+	case i <= 17:
 		return _BalanceChangeReason_name_0[_BalanceChangeReason_index_0[i]:_BalanceChangeReason_index_0[i+1]]
 	case 210 <= i && i <= 211:
 		i -= 210
