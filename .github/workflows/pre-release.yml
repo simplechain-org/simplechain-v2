@@ -148,13 +148,9 @@ jobs:
           name: arm64
           path: ./arm64
       
-      - name: Download Config File
+      - name: Package Config
         run: |
-          . ./.github/release.env
-          echo "mainnet.zip url: $MAINNET_FILE_URL"
-          echo "testnet.zip url: $TESTNET_FILE_URL"
-          curl -L $MAINNET_FILE_URL -o ./mainnet.zip
-          curl -L $TESTNET_FILE_URL -o ./testnet.zip
+          cd packaging && zip -r ../testnet.zip testnet/
       # ==============================
       #       Create release
       # ==============================
@@ -178,7 +174,6 @@ jobs:
           draft: true
           prerelease: true
           files: |
-            ./mainnet.zip
             ./testnet.zip
             ./linux/geth_linux
             ./macos/geth_macos
