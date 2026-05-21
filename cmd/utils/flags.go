@@ -182,6 +182,11 @@ var (
 		Usage:    "Chapel network: pre-configured Proof-of-Stake-Authority BSC test network",
 		Category: flags.EthCategory,
 	}
+	SimplechainTestnetFlag = &cli.BoolFlag{
+		Name:     "spc-testnet",
+		Usage:    "Simplechain testnet: pre-configured Proof-of-Stake-Authority simplechain test network",
+		Category: flags.EthCategory,
+	}
 	// Dev mode
 	DeveloperFlag = &cli.BoolFlag{
 		Name:     "dev",
@@ -1300,6 +1305,7 @@ var (
 	// TestnetFlags is the flag group of all built-in supported testnets.
 	TestnetFlags = []cli.Flag{
 		ChapelFlag,
+		SimplechainTestnetFlag,
 	}
 	// NetworkFlags is the flag group of all built-in supported networks.
 	NetworkFlags = append([]cli.Flag{BSCMainnetFlag}, TestnetFlags...)
@@ -2213,6 +2219,12 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 		}
 		cfg.Genesis = core.DefaultChapelGenesisBlock()
 		SetDNSDiscoveryDefaults(cfg, params.ChapelGenesisHash)
+	case ctx.Bool(SimplechainTestnetFlag.Name) || cfg.NetworkId == 1913:
+		if !ctx.IsSet(NetworkIdFlag.Name) {
+			cfg.NetworkId = 1913
+		}
+		cfg.Genesis = core.DefaultSimplechainTestnetGenesisBlock()
+		SetDNSDiscoveryDefaults(cfg, params.SimplechainTestnetGenesisHash)
 	case ctx.Bool(DeveloperFlag.Name):
 		cfg.NetworkId = 1337
 		cfg.SyncMode = ethconfig.FullSync
@@ -2693,6 +2705,8 @@ func MakeGenesis(ctx *cli.Context) *core.Genesis {
 		genesis = core.DefaultBSCGenesisBlock()
 	case ctx.Bool(ChapelFlag.Name):
 		genesis = core.DefaultChapelGenesisBlock()
+	case ctx.Bool(SimplechainTestnetFlag.Name):
+		genesis = core.DefaultSimplechainTestnetGenesisBlock()
 	case ctx.Bool(DeveloperFlag.Name):
 		Fatalf("Developer chains are ephemeral")
 	}

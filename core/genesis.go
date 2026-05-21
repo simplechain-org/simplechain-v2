@@ -697,6 +697,22 @@ func DefaultChapelGenesisBlock() *Genesis {
 	}
 }
 
+// DefaultSimplechainTestnetGenesisBlock returns the Simplechain testnet genesis block.
+func DefaultSimplechainTestnetGenesisBlock() *Genesis {
+	alloc := decodePrealloc(simplechainTestnetAllocData)
+	return &Genesis{
+		Config:     params.SimplechainTestnetChainConfig,
+		Nonce:      0,
+		ExtraData:  hexutil.MustDecode("0x0000000000000000000000000000000000000000000000000000000000000000d696f87c2edcabf71f3b045063c254c9181f0f340000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+		GasLimit:   40000000,
+		Difficulty: big.NewInt(1),
+		Mixhash:    common.Hash(hexutil.MustDecode("0x0000000000000000000000000000000000000000000000000000000000000000")),
+		Coinbase:   common.HexToAddress("0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE"),
+		Timestamp:  0x5e9da7ce,
+		Alloc:      alloc,
+	}
+}
+
 // DeveloperGenesisBlock returns the 'geth --dev' genesis block.
 func DeveloperGenesisBlock(gasLimit uint64, faucet *common.Address) *Genesis {
 	// Override the default period to the user requested one

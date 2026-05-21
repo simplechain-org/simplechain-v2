@@ -39,12 +39,14 @@ WSModules = ["net", "web3", "eth"]
 MaxPeers = 50
 NoDiscovery = false
 TrustedNodes = []
-StaticNodes = []
+StaticNodes = [
+    'enode://1bdb4b91c575bac64c50e90868041f68cb851ad504b326ff17ad31eb05d076e2fa6fcc80c0f99d4722a5d256cac4180adad8d08e364fb388574664d6e6a352e8@159.138.147.172:30303'
+]
 ListenAddr = ":30311"
 EnableMsgEvents = false
 
 [Node.LogConfig]
-FileRoot = ""
-FilePath = "simplechain.log"
+# FileRoot = ""
+# FilePath = "simplechain.log"
 MaxBytesSize = 10485760
 Level = "info"
