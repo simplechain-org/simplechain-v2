@@ -19,7 +19,6 @@ while read line; do
         CHANGE_LOG+="$line\n"
     fi
 done < ${change_log_file}
-MAINNET_ZIP_SUM="$(checksum ./mainnet.zip)"
 TESTNET_ZIP_SUM="$(checksum ./testnet.zip)"
 LINUX_BIN_SUM="$(checksum ./linux/geth)"
 MAC_BIN_SUM="$(checksum ./macos/geth)"
@@ -31,7 +30,6 @@ ${CHANGE_LOG}\n
 ## Assets\n
 |    Assets    | Sha256 Checksum  |
 | :-----------: |------------|
-| mainnet.zip | ${MAINNET_ZIP_SUM} |
 | testnet.zip | ${TESTNET_ZIP_SUM} |
 | geth_linux | ${LINUX_BIN_SUM} |
 | geth_mac  | ${MAC_BIN_SUM} |
