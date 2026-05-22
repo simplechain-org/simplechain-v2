@@ -1,6 +1,6 @@
 ---
 name: Report a bug
-about: Something with BSC geth client is not working as expected
+about: Something with SPC geth client is not working as expected
 title: ''
 labels: 'type:bug'
 assignees: ''

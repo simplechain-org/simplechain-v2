@@ -5,7 +5,7 @@ Temporary Maintenance is supposed to last one or a few hours. The validator seat
 - **enterMaintenance**: Validator can claim itself to enter scheduled maintenance by sending a transaction signed by the consensus key. 
 - **exitMaintenance**: The validator can claim itself to exit maintenance by sending another transaction.
 
-More details in [BEP-127](https://github.com/bnb-chain/BEPs/blob/master/BEP127.md).
+More details in [BEP-127](https://github.com/bnb-chain/BEPs/blob/master/BEP127.md) (upstream reference).
 
 
 ## How to enter/exit maintenance

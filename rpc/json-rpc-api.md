@@ -116,7 +116,7 @@ This document provides a comprehensive list of JSON-RPC API methods supported. E
 | txpool_contentFrom(...)                         | `Address`                                        |
 | txpool_status()                                 | -                                                |
 |                                                 |                                                  |
-| **BSC-Specific APIs**                           |                                                  |
+| **SPC-Specific APIs**                           |                                                  |
 | eth_getHeaderByNumber(...)                      | `BlockNumber\|Tag` with "finalized"              |
 | eth_getBlockByNumber(...)                       | `BlockNumber\|Tag` with "finalized", `Boolean`   |
 | eth_newFinalizedHeaderFilter()                  | -                                                |
@@ -151,7 +151,7 @@ This document provides a comprehensive list of JSON-RPC API methods supported. E
 ### Notes
 
 - Methods that show (...) have parameters that were simplified for readability.
-- APIs marked with "BSC-Specific" are only available on BSC nodes.
+- APIs marked with "SPC-Specific" are only available on SPC nodes.
 - Parameters in backticks (`) represent the expected data type.
 - Some methods accept multiple parameter formats; consult detailed documentation for complete usage.
 

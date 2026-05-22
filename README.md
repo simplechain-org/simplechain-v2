@@ -5,8 +5,8 @@ SimpleChain2.0 starts its development based on go-ethereum fork. So you may see 
 [![API Reference](
 https://pkg.go.dev/badge/github.com/ethereum/go-ethereum
 )](https://pkg.go.dev/github.com/ethereum/go-ethereum?tab=doc)
-[![Build Test](https://github.com/bnb-chain/spc/actions/workflows/build-test.yml/badge.svg)](https://github.com/bnb-chain/spc/actions)
-[![Discord](https://img.shields.io/badge/discord-join%20chat-blue.svg)](https://discord.gg/z2VpC455eU)
+[![Build Test](https://github.com/simplechain-org/simplechain-v2/actions/workflows/build-test.yml/badge.svg)](https://github.com/simplechain-org/simplechain-v2/actions)
+[![Discord](https://img.shields.io/badge/discord-join%20chat-blue.svg)](https://discord.gg/KHAefUjuRd)
 
 But from that baseline of EVM compatible, SimpleChain2.0 introduces a system of 21 validators with Proof of Staked Authority (PoSA) consensus that can support short block time and lower fees. The most bonded validator candidates of staking will become validators and produce blocks. The double-sign detection and other slashing logic guarantee security, stability, and chain finality.
 
@@ -14,16 +14,16 @@ But from that baseline of EVM compatible, SimpleChain2.0 introduces a system of 
 
 - **A self-sovereign blockchain**: Provides security and safety with elected validators.
 - **EVM-compatible**: Supports all the existing Ethereum tooling along with faster finality and cheaper transaction fees.
-- **Distributed with on-chain governance**: Proof of Staked Authority brings in decentralization and community participants. As the native token, BNB will serve as both the gas of smart contract execution and tokens for staking.
+- **Distributed with on-chain governance**: Proof of Staked Authority brings in decentralization and community participants. As the native token, SRW will serve as both the gas of smart contract execution and tokens for staking.
 
-More details in [White Paper](https://github.com/bnb-chain/whitepaper/blob/master/WHITEPAPER.md).
+More details in [White Paper](https://www.simplechain.com/ecosystem/whitepaper).
 
 ## Release Types
 There are three types of release, each with a clear purpose and version scheme:
 
-- **1.Stable Release**: production-ready builds for the vast majority of users.  Format: `v<Major>.<Minor>.<Patch>`, example: [v1.5.19](https://github.com/bnb-chain/spc/releases/tag/v1.5.19).
-- **2.Feature Release**: early access to a single feature without affecting the core product. Format: `v<Major>.<Minor>.<Patch>-feature-<FeatureName>`, example: [v1.5.19-feature-SI](https://github.com/bnb-chain/spc/releases/tag/v1.5.19-feature-SI).
-- **3.Preview Release**: bleeding-edge builds for users who want the latest code. Format: `v<Major>.<Minor>.<Patch>-<Meta>`, Meta values indicate maturity: alpha (experimental), beta (largely complete), rc (release candidate), example: [v1.5.0-alpha](https://github.com/bnb-chain/spc/releases/tag/v1.5.0-alpha).
+- **1.Stable Release**: production-ready builds for the vast majority of users.  Format: `v<Major>.<Minor>.<Patch>`, example: [v1.5.19](https://github.com/simplechain-org/simplechain-v2/releases/tag/v1.5.19).
+- **2.Feature Release**: early access to a single feature without affecting the core product. Format: `v<Major>.<Minor>.<Patch>-feature-<FeatureName>`, example: [v1.5.19-feature-SI](https://github.com/simplechain-org/simplechain-v2/releases/tag/v1.5.19-feature-SI).
+- **3.Preview Release**: bleeding-edge builds for users who want the latest code. Format: `v<Major>.<Minor>.<Patch>-<Meta>`, Meta values indicate maturity: alpha (experimental), beta (largely complete), rc (release candidate), example: [v1.5.0-alpha](https://github.com/simplechain-org/simplechain-v2/releases/tag/v1.5.0-alpha).
 
 ## Key features
 
@@ -40,12 +40,12 @@ To combine DPoS and PoA for consensus, SimpleChain2.0 implement a novel consensu
 1. Blocks are produced by a limited set of validators.
 2. Validators take turns to produce blocks in a PoA manner, similar to Ethereum's Clique consensus engine.
 3. Validator set are elected in and out based on a staking based governance on SimpleChain2.0.
-4. Parlia consensus engine will interact with a set of [system contracts](https://docs.bnbchain.org/bnb-smart-chain/staking/overview/#system-contracts) to achieve liveness slash, revenue distributing and validator set renewing func.
+4. Parlia consensus engine will interact with a set of [system contracts](https://docs.simplechain.com/) to achieve liveness slash, revenue distributing and validator set renewing func.
 
 ## Native Token
 
-BNB will run on SimpleChain2.0 in the same way as ETH runs on Ethereum so that it remains as `native token` for spc. This means,
-BNB will be used to:
+SRW will run on SimpleChain2.0 in the same way as ETH runs on Ethereum so that it remains as `native token` for spc. This means,
+SRW will be used to:
 
 1. pay `gas` to deploy or invoke Smart Contract on spc
 
@@ -132,11 +132,11 @@ chmod -v u+x geth
 #### 2. Download the config files
 ```shell
 //== mainnet
-wget $(curl -s https://api.github.com/repos/bnb-chain/spc/releases/latest |grep browser_ |grep mainnet |cut -d\" -f4)
+wget $(curl -s https://api.github.com/repos/simplechain-org/simplechain-v2/releases/latest |grep browser_ |grep mainnet |cut -d\" -f4)
 unzip mainnet.zip
 
 //== testnet
-wget $(curl -s https://api.github.com/repos/bnb-chain/spc/releases/latest |grep browser_ |grep testnet |cut -d\" -f4)
+wget $(curl -s https://api.github.com/repos/simplechain-org/simplechain-v2/releases/latest |grep browser_ |grep testnet |cut -d\" -f4)
 unzip testnet.zip
 ```
 
@@ -171,7 +171,7 @@ This tool is optional and if you leave it out you can always attach to an alread
 
 #### 7. More
 
-More details about [running a node](https://docs.bnbchain.org/bnb-smart-chain/developers/node_operators/full_node/) and [becoming a validator](https://docs.bnbchain.org/bnb-smart-chain/validator/create-val/)
+More details about [running a node](https://docs.simplechain.com/) and [becoming a validator](https://docs.simplechain.com/)
 
 *Note: Although some internal protective measures prevent transactions from
 crossing over between the main network and test network, you should always
@@ -236,7 +236,7 @@ running web servers, so malicious web pages could try to subvert locally availab
 APIs!**
 
 ### Operating a private network
-- [spc-Deploy](https://github.com/bnb-chain/node-deploy/): deploy tool for setting up SimpleChain2.0.
+- [spc-Deploy](https://github.com/simplechain-org/node-deploy/): deploy tool for setting up SimpleChain2.0.
 
 ## Running a bootnode
 
@@ -273,7 +273,7 @@ from anyone on the internet, and are grateful for even the smallest of fixes!
 
 If you'd like to contribute to spc, please fork, fix, commit and send a pull request
 for the maintainers to review and merge into the main code base. If you wish to submit
-more complex changes though, please check up with the core devs first on [our discord channel](https://discord.gg/bnbchain)
+more complex changes though, please check up with the core devs first on [our discord channel](https://discord.gg/KHAefUjuRd)
 to ensure those changes are in line with the general philosophy of the project and/or get
 some early feedback which can make both your efforts much lighter as well as our review
 and merge procedures quick and simple.
