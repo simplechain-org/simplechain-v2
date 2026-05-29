@@ -505,7 +505,6 @@ func (p *Parlia) getMaxContributionRewardRatio(blockNr rpc.BlockNumberOrHash) (*
 // Formula: reward = totalPooled * ((1 + rate/10000/annualBlockCountEveryYear)^annualBlockCountEveryEpoch - 1)
 func (p *Parlia) CalculateRewardByRate(rate *big.Int, annualBlockCountEveryYear *big.Int,
 	annualBlockCountEveryEpoch *big.Int, totalPooled *big.Int) *big.Int {
-
 	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
 	// ratePerBlockScaled = (scaled basis points / 10000 / annualBlockCountEveryYear)
 	ratePerBlockScaled := new(big.Int).Set(rate)
