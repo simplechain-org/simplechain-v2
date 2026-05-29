@@ -46,6 +46,10 @@ truffle-test:
 	docker compose -f ./tests/truffle/docker-compose.yml up genesis
 	docker compose -f ./tests/truffle/docker-compose.yml up -d bsc-rpc bsc-validator1
 	sleep 60
+	@echo "=== bsc-rpc logs ==="
+	docker compose -f ./tests/truffle/docker-compose.yml logs bsc-rpc 2>&1 | tail -30
+	@echo "=== bsc-validator1 logs ==="
+	docker compose -f ./tests/truffle/docker-compose.yml logs bsc-validator1 2>&1 | tail -30
 	docker compose -f ./tests/truffle/docker-compose.yml up --exit-code-from truffle-test truffle-test
 	docker compose -f ./tests/truffle/docker-compose.yml down
 
