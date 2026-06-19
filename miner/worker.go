@@ -157,6 +157,14 @@ type task struct {
 	miningStartAt time.Time
 }
 
+type hotstuffMiningEngine interface {
+	IsHotstuffMining(number *big.Int) bool
+}
+
+type hotstuffProposalEngine interface {
+	HasPendingProposal() bool
+}
+
 const (
 	commitInterruptNone int32 = iota
 	commitInterruptNewHead
@@ -399,6 +407,25 @@ func (w *worker) isRunning() bool {
 	return w.running.Load()
 }
 
+func (w *worker) isHotstuffMiningNumber(number *big.Int) bool {
+	engine, ok := w.engine.(hotstuffMiningEngine)
+	return ok && engine.IsHotstuffMining(number)
+}
+
+func (w *worker) isNextHotstuffBlock() bool {
+	head := w.chain.CurrentBlock()
+	if head == nil || head.Number == nil {
+		return false
+	}
+	next := new(big.Int).Add(head.Number, common.Big1)
+	return w.isHotstuffMiningNumber(next)
+}
+
+func (w *worker) hasHotstuffPendingProposal() bool {
+	engine, ok := w.engine.(hotstuffProposalEngine)
+	return ok && engine.HasPendingProposal()
+}
+
 // close terminates all background threads maintained by the worker.
 // Note the worker does not support being closed multiple times.
 func (w *worker) close() {
@@ -492,6 +519,11 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 			// higher priced transactions. Disable this overhead for pending blocks.
 			if w.isRunning() && ((w.chainConfig.Clique != nil &&
 				w.chainConfig.Clique.Period > 0) || (w.chainConfig.Parlia != nil)) {
+				if w.isNextHotstuffBlock() {
+					log.Debug("Skipping periodic miner recommit in HotStuff mode")
+					timer.Reset(recommit)
+					continue
+				}
 				// Short circuit if no new transaction arrives.
 				commit(commitInterruptResubmit)
 			}
@@ -584,6 +616,13 @@ func (w *worker) taskLoop() {
 			// Reject duplicate sealing work due to resubmitting.
 			sealHash := w.engine.SealHash(task.block.Header())
 			if sealHash == prev {
+				continue
+			}
+			if w.isHotstuffMiningNumber(task.block.Number()) && w.hasHotstuffPendingProposal() {
+				log.Debug("Skipping replacement sealing task in HotStuff mode",
+					"number", task.block.NumberU64(),
+					"sealhash", sealHash.Hex()[:10],
+					"current", prev.Hex()[:10])
 				continue
 			}
 			// Interrupt previous sealing operation

@@ -451,6 +451,18 @@ func (h *Hotstuff) GetNotifyMinerCh() <-chan struct{} {
 	return h.notifyMinerCh
 }
 
+func (h *Hotstuff) IsHotstuffMining(number *big.Int) bool {
+	return true
+}
+
+func (h *Hotstuff) HasPendingProposal() bool {
+	st := h.getHsState()
+	if st == nil {
+		return false
+	}
+	return h.HasProposalForView(st.currentView)
+}
+
 // ConsensusAddress returns the consensus address of the validator
 func (h *Hotstuff) ConsensusAddress() common.Address {
 	return h.val

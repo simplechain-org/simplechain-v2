@@ -41,7 +41,11 @@ func (t *Transition) SetBLSVoteSigner(vs interface{}) { t.hotstuff.SetBLSVoteSig
 func (t *Transition) GetNotifyMinerCh() <-chan struct{} {
 	return t.hotstuff.GetNotifyMinerCh()
 }
-func (t *Transition) GetCurrentView() uint64 { return t.hotstuff.GetCurrentView() }
+func (t *Transition) IsHotstuffMining(number *big.Int) bool {
+	return t.hotstuff.chainConfig.IsHotstuff(number)
+}
+func (t *Transition) HasPendingProposal() bool { return t.hotstuff.HasPendingProposal() }
+func (t *Transition) GetCurrentView() uint64   { return t.hotstuff.GetCurrentView() }
 func (t *Transition) HasProposalForView(view uint64) bool {
 	return t.hotstuff.HasProposalForView(view)
 }
