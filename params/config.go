@@ -33,6 +33,8 @@ var (
 	BSCGenesisHash    = common.HexToHash("0x0d21840abff46b96c84b2ac9e10e4f5cdaeb5693cb665db62a2f3b02d2d57b5b")
 	ChapelGenesisHash = common.HexToHash("0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34")
 	RialtoGenesisHash = common.HexToHash("0xee835a629f9cf5510b48b6ba41d69e0ff7d6ef10f977166ef939db41f59f5501")
+
+	SimplechainTestnetGenesisHash = common.HexToHash("0x607f58adc6ea6b71c680cb0b3e6d63fe9fd3dff56d9fd98e83b442f621c19dc6")
 )
 
 func newUint64(val uint64) *uint64 { return &val }
@@ -336,6 +338,58 @@ var (
 		},
 	}
 
+	SimplechainTestnetChainConfig = &ChainConfig{
+		ChainID:             big.NewInt(1913),
+		HomesteadBlock:      big.NewInt(0),
+		EIP150Block:         big.NewInt(0),
+		EIP155Block:         big.NewInt(0),
+		EIP158Block:         big.NewInt(0),
+		ByzantiumBlock:      big.NewInt(0),
+		ConstantinopleBlock: big.NewInt(0),
+		PetersburgBlock:     big.NewInt(0),
+		IstanbulBlock:       big.NewInt(0),
+		MuirGlacierBlock:    big.NewInt(0),
+		RamanujanBlock:      big.NewInt(0),
+		NielsBlock:          big.NewInt(0),
+		MirrorSyncBlock:     big.NewInt(1),
+		BrunoBlock:          big.NewInt(1),
+		EulerBlock:          big.NewInt(2),
+		NanoBlock:           big.NewInt(3),
+		MoranBlock:          big.NewInt(3),
+		GibbsBlock:          big.NewInt(4),
+		PlanckBlock:         big.NewInt(5),
+		LubanBlock:          big.NewInt(6),
+		PlatoBlock:          big.NewInt(7),
+		BerlinBlock:         big.NewInt(8),
+		LondonBlock:         big.NewInt(8),
+		HertzBlock:          big.NewInt(8),
+		HertzfixBlock:       big.NewInt(8),
+		CopperBlock:         big.NewInt(12207633),
+		ShanghaiTime:        newUint64(1725500000),
+		KeplerTime:          newUint64(1725500000),
+		FeynmanTime:         newUint64(1725500000),
+		FeynmanFixTime:      newUint64(1725500000),
+		CancunTime:          newUint64(1725500000),
+		HaberTime:           newUint64(1725500000),
+		HaberFixTime:        newUint64(1725500000),
+		BohrTime:            newUint64(1725500000),
+		PascalTime:          newUint64(1725500000),
+		PragueTime:          newUint64(1725500000),
+		LorentzTime:         newUint64(1725500000),
+		MaxwellTime:         newUint64(1725500000),
+		FermiTime:           newUint64(1768370413),
+		NoBlockRewardTime:   newUint64(1769421600),
+		CopperRemixTime:     newUint64(1772008200),
+		CopperRemixFixTime:  newUint64(1772020800),
+		CopperRemix2Time:    newUint64(1774339200),
+
+		Parlia: &ParliaConfig{},
+		BlobScheduleConfig: &BlobScheduleConfig{
+			Cancun: DefaultCancunBlobConfig,
+			Prague: DefaultPragueBlobConfigBSC,
+		},
+	}
+
 	ParliaTestChainConfig = &ChainConfig{
 		ChainID:             big.NewInt(2),
 		HomesteadBlock:      big.NewInt(0),
@@ -584,6 +638,8 @@ func GetBuiltInChainConfig(ghash common.Hash) *ChainConfig {
 		return ChapelChainConfig
 	case RialtoGenesisHash:
 		return RialtoChainConfig
+	case SimplechainTestnetGenesisHash:
+		return SimplechainTestnetChainConfig
 	default:
 		return nil
 	}
@@ -621,9 +677,10 @@ var (
 // NetworkNames are user friendly names to use in the chain spec banner.
 var NetworkNames = map[string]string{
 	MainnetChainConfig.ChainID.String(): "mainnet",
-	BSCChainConfig.ChainID.String():     "bsc",
-	ChapelChainConfig.ChainID.String():  "chapel",
-	RialtoChainConfig.ChainID.String():  "rialto",
+	BSCChainConfig.ChainID.String():                "bsc",
+	ChapelChainConfig.ChainID.String():             "chapel",
+	RialtoChainConfig.ChainID.String():             "rialto",
+	SimplechainTestnetChainConfig.ChainID.String(): "simplechain-testnet",
 }
 
 // ChainConfig is the core config which determines the blockchain settings.
@@ -1471,7 +1528,7 @@ func (c *ChainConfig) CheckConfigForkOrder() error {
 		{name: "platoBlock", block: c.PlatoBlock},
 		{name: "hertzBlock", block: c.HertzBlock},
 		{name: "hertzfixBlock", block: c.HertzfixBlock},
-		{name: "copperBlock", block: c.CopperBlock},
+		{name: "copperBlock", block: c.CopperBlock, optional: true},
 		{name: "keplerTime", timestamp: c.KeplerTime},
 		{name: "feynmanTime", timestamp: c.FeynmanTime},
 		{name: "feynmanFixTime", timestamp: c.FeynmanFixTime},

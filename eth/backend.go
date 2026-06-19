@@ -274,6 +274,14 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		chainConfig.CopperRemix2Time = config.OverrideCopperRemix2
 		overrides.OverrideCopperRemix2 = config.OverrideCopperRemix2
 	}
+	// Auto-set operational parameters for simplechain testnet.
+	if chainConfig.ChainID.Uint64() == 1913 {
+		params.FullImmutabilityThreshold = 2048
+		downloader.FullMaxForkAncestry = 2048
+		params.MinBlocksForBlobRequests = 576
+		params.MinTimeDurationForBlobRequests = uint64(float64(576) * 0.75)
+		params.DefaultExtraReserveForBlobRequests = 32
+	}
 	// startup ancient freeze
 	freezeDb := chainDb
 	if err = freezeDb.SetupFreezerEnv(&ethdb.FreezerEnv{

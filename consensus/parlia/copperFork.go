@@ -1016,10 +1016,10 @@ func (p *Parlia) getInflationRate(blockNr rpc.BlockNumberOrHash) (*big.Int, erro
 	return unpacked[0].(*big.Int), nil
 }
 
-func (p *Parlia) updateInflationRecord(year int, totalSupply *big.Int, additionalIssuanceAmount *big.Int, additionalBasicIssuanceAmount *big.Int, additionalContributionIssuanceAmount *big.Int, newInflationRate *big.Int, chain core.ChainContext, state vm.StateDB, header *types.Header,
+func (p *Parlia) updateInflationRecord(year int, totalSupply *big.Int, totalIssuanceAmount *big.Int, totalBasicIssuanceAmount *big.Int, totalContributionIssuanceAmount *big.Int, newInflationRate *big.Int, chain core.ChainContext, state vm.StateDB, header *types.Header,
 	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mining bool, tracer *tracing.Hooks) error {
 	method := "updateInflationRecord"
-	data, err := p.validatorSetABI.Pack(method, new(big.Int).SetInt64(int64(year)), additionalIssuanceAmount, additionalBasicIssuanceAmount, additionalContributionIssuanceAmount, totalSupply, newInflationRate)
+	data, err := p.validatorSetABI.Pack(method, new(big.Int).SetInt64(int64(year)), totalIssuanceAmount, totalBasicIssuanceAmount, totalContributionIssuanceAmount, totalSupply, newInflationRate)
 	if err != nil {
 		log.Error("Unable to pack tx for updateInflationInfo", "error", err)
 		return err
@@ -1060,16 +1060,16 @@ func (p *Parlia) updateInflationRecordForNewYear(parentYear int, currentYear int
 	if err != nil {
 		return err
 	}
-	lastYearTotalSupply, _, lastYearAdditionalBasicRewardAmount, lastYearAdditionalContributionRewardAmount, _, err := p.getInflationRecord(parentYear, blockNr)
+	lastYearTotalSupply, _, lastYearTotalBasicRewardAmount, lastYearTotalContributionRewardAmount, _, err := p.getInflationRecord(parentYear, blockNr)
 	if err != nil {
 		return err
 	}
 	additionalIssuanceAmount, newInflationRate := calculateNewYearInflation(currentTotalSupply, lastYearTotalSupply)
-	additionalBasicIssuanceAmount := new(big.Int).Sub(totalIssuanceAmountOfBasicReward, lastYearAdditionalBasicRewardAmount)
-	additionalContributionIssuanceAmount := new(big.Int).Sub(totalIssuanceAmountOfContributionReward, lastYearAdditionalContributionRewardAmount)
+	additionalBasicIssuanceAmount := new(big.Int).Sub(totalIssuanceAmountOfBasicReward, lastYearTotalBasicRewardAmount)
+	additionalContributionIssuanceAmount := new(big.Int).Sub(totalIssuanceAmountOfContributionReward, lastYearTotalContributionRewardAmount)
 	log.Info("updateInflationRecordForNewYear", "blockNumber", header.Number, "blockTime", header.Time, "additionalIssuanceAmount", additionalIssuanceAmount, "inflationRate", newInflationRate, "additionalBasicIssuanceAmount", additionalBasicIssuanceAmount, "additionalContributionIssuanceAmount", additionalContributionIssuanceAmount)
 	// Update total supply information for the new year
-	err = p.updateInflationRecord(currentYear, currentTotalSupply, additionalIssuanceAmount, additionalBasicIssuanceAmount, additionalContributionIssuanceAmount, newInflationRate, cx, state, header, txs, receipts, receivedTxs, usedGas, mining, tracer)
+	err = p.updateInflationRecord(currentYear, currentTotalSupply, additionalIssuanceAmount, totalIssuanceAmountOfBasicReward, totalIssuanceAmountOfContributionReward, newInflationRate, cx, state, header, txs, receipts, receivedTxs, usedGas, mining, tracer)
 	if err != nil {
 		return err
 	}
