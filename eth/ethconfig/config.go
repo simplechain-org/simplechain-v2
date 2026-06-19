@@ -19,6 +19,7 @@ package ethconfig
 
 import (
 	"fmt"
+	"math/big"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -37,7 +38,6 @@ import (
 	"github.com/ethereum/go-ethereum/internal/ethapi"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/miner/minerconfig"
-	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/params"
@@ -233,11 +233,27 @@ type Config struct {
 	BlobExtraReserve uint64
 }
 
+type hotstuffNodeConfig interface {
+	HotStuffConfig() *params.HotStuffConfig
+}
+
 // CreateConsensusEngine creates a consensus engine for the given chain config.
 // Clique is allowed for now to live standalone, but ethash is forbidden and can
 // only exist on already merged networks.
 func CreateConsensusEngine(config *params.ChainConfig, db ethdb.Database, ee *ethapi.BlockChainAPI, genesisHash common.Hash, net *p2p.Server, nodeCfg interface{}) (consensus.Engine, error) {
-	if config.Parlia != nil {
+	var hotstuffCfg *params.HotStuffConfig
+	if nodeCfg != nil {
+		if nc, ok := nodeCfg.(hotstuffNodeConfig); ok && nc != nil {
+			hotstuffCfg = nc.HotStuffConfig()
+		}
+	}
+	if config.Parlia != nil && config.Hotstuff != nil && config.HotstuffBlock != nil && !config.IsHotstuff(big.NewInt(0)) {
+		return hotstuff.NewTransition(
+			parlia.New(config, db, ee, genesisHash),
+			hotstuff.New(config, db, ee, genesisHash, net, hotstuffCfg),
+		), nil
+	}
+	if config.Parlia != nil && !config.IsHotstuff(big.NewInt(0)) {
 		return parlia.New(config, db, ee, genesisHash), nil
 	}
 	if config.TerminalTotalDifficulty == nil {
@@ -249,12 +265,6 @@ func CreateConsensusEngine(config *params.ChainConfig, db ethdb.Database, ee *et
 		return clique.New(config.Clique, db), nil
 	}
 	if config.Hotstuff != nil {
-		var hotstuffCfg *params.HotStuffConfig
-		if nodeCfg != nil {
-			if nc, ok := nodeCfg.(*node.Config); ok && nc != nil {
-				hotstuffCfg = &nc.HotStuff
-			}
-		}
 		return hotstuff.New(config, db, ee, genesisHash, net, hotstuffCfg), nil
 	}
 	return beacon.New(ethash.NewFaker()), nil

@@ -25,7 +25,6 @@ import (
 	"time"
 
 	mapset "github.com/deckarep/golang-set/v2"
-	"github.com/ethereum/go-ethereum/consensus/hotstuff"
 	"github.com/holiman/uint256"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -424,7 +423,7 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 	// Get notifyMinerCh from Hotstuff engine if available
 	// This allows Hotstuff to immediately trigger block production when view changes
 	var notifyMinerCh <-chan struct{}
-	if hsEngine, ok := w.engine.(*hotstuff.Hotstuff); ok {
+	if hsEngine, ok := w.engine.(interface{ GetNotifyMinerCh() <-chan struct{} }); ok {
 		notifyMinerCh = hsEngine.GetNotifyMinerCh()
 		log.Info("Worker: registered Hotstuff miner notification channel")
 	}
@@ -1060,7 +1059,9 @@ func (w *worker) prepareWork(genParams *generateParams, witness bool) (*environm
 		if block == nil {
 			// In Chained HotStuff, we build on highQC block which may only be prewritten (not committed)
 			// Try to get the block from HotStuff engine's state or rawdb
-			if hs, ok := w.engine.(*hotstuff.Hotstuff); ok {
+			if hs, ok := w.engine.(interface {
+				GetBlockFromState(common.Hash) *types.Block
+			}); ok {
 				block = hs.GetBlockFromState(genParams.parentHash)
 				if block != nil {
 					log.Debug("Worker: got parent block from HotStuff state",
@@ -1120,7 +1121,7 @@ func (w *worker) prepareWork(genParams *generateParams, witness bool) (*environm
 	// Set baseFee and GasLimit if we are on an EIP-1559 chain
 	if w.chainConfig.IsLondon(header.Number) {
 		header.BaseFee = eip1559.CalcBaseFee(w.chainConfig, parent)
-		if w.chainConfig.Parlia == nil && w.chainConfig.Hotstuff == nil && !w.chainConfig.IsLondon(parent.Number) {
+		if w.chainConfig.Parlia == nil && !w.chainConfig.IsHotstuff(header.Number) && !w.chainConfig.IsLondon(parent.Number) {
 			parentGasLimit := parent.GasLimit * w.chainConfig.ElasticityMultiplier()
 			header.GasLimit = core.CalcGasLimit(parentGasLimit, w.config.GasCeil)
 		}
@@ -1139,7 +1140,7 @@ func (w *worker) prepareWork(genParams *generateParams, witness bool) (*environm
 		}
 		header.BlobGasUsed = new(uint64)
 		header.ExcessBlobGas = &excessBlobGas
-		if w.chainConfig.Parlia == nil && w.chainConfig.Hotstuff == nil {
+		if w.chainConfig.Parlia == nil && !w.chainConfig.IsHotstuff(header.Number) {
 			header.ParentBeaconRoot = genParams.beaconRoot
 		} else {
 			header.WithdrawalsHash = &types.EmptyWithdrawalsHash
@@ -1371,7 +1372,11 @@ func (w *worker) commitWork(interruptCh chan int32, timestamp int64) {
 	// For HotStuff, use highQC block as parent (not committed chain head)
 	// This enables chained pipelining: Block1 <- QC <- Block2 <- QC <- Block3
 	parentHash := w.chain.CurrentBlock().Hash()
-	if hs, ok := w.engine.(*hotstuff.Hotstuff); ok {
+	if hs, ok := w.engine.(interface {
+		GetCurrentView() uint64
+		HasProposalForView(uint64) bool
+		GetProposalParent(consensus.ChainHeaderReader) common.Hash
+	}); ok {
 		// CRITICAL CHECK: Don't create duplicate proposals for the same view
 		// HotStuff requires exactly one proposal per view
 		currentView := hs.GetCurrentView()

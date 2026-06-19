@@ -509,7 +509,11 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	}
 
 	// If engine is HotStuff, inject chain reader and hs network adapter, and BLS signer
-	if hsEng, ok := eth.engine.(*hotstuff.Hotstuff); ok {
+	if hsEng, ok := eth.engine.(interface {
+		SetChainReader(consensus.ChainHeaderReader)
+		SetHsNetwork(interface{})
+		SetBLSVoteSigner(interface{})
+	}); ok {
 		// chain reader
 		if cr, ok2 := any(eth).(interface{ BlockChain() *core.BlockChain }); ok2 {
 			hsEng.SetChainReader(cr.BlockChain())
@@ -566,7 +570,9 @@ func (s *Ethereum) APIs() []rpc.API {
 	apis := ethapi.GetAPIs(s.APIBackend)
 
 	// Append any APIs exposed explicitly by the consensus engine
-	if p, ok := s.engine.(*parlia.Parlia); ok {
+	if p, ok := s.engine.(interface {
+		APIs(consensus.ChainHeaderReader) []rpc.API
+	}); ok {
 		apis = append(apis, p.APIs(s.BlockChain())...)
 	}
 
@@ -944,7 +950,17 @@ func (s *Ethereum) StartMining() error {
 			log.Error("Cannot start mining without etherbase", "err", err)
 			return fmt.Errorf("etherbase missing: %v", err)
 		}
-		if parlia, ok := s.engine.(*parlia.Parlia); ok {
+		if transition, ok := s.engine.(*hotstuff.Transition); ok {
+			wallet, err := s.accountManager.Find(accounts.Account{Address: eb})
+			if wallet == nil || err != nil {
+				log.Error("Etherbase account unavailable locally", "err", err)
+				return fmt.Errorf("signer missing: %v", err)
+			}
+			transition.Authorize(eb, wallet.SignData, wallet.SignTx)
+			go func() {
+				s.waitForSyncAndMaxwellHotstuff(transition.Hotstuff())
+			}()
+		} else if parlia, ok := s.engine.(*parlia.Parlia); ok {
 			wallet, err := s.accountManager.Find(accounts.Account{Address: eb})
 			if wallet == nil || err != nil {
 				log.Error("Etherbase account unavailable locally", "err", err)

@@ -2723,7 +2723,7 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockCh
 	if err != nil {
 		Fatalf("%v", err)
 	}
-	engine, err := ethconfig.CreateConsensusEngine(config, chainDb, nil, genesisHash)
+	engine, err := ethconfig.CreateConsensusEngine(config, chainDb, nil, genesisHash, nil, nil)
 	if err != nil {
 		Fatalf("%v", err)
 	}

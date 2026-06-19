@@ -1715,7 +1715,7 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 		ptd := bc.GetTd(first.ParentHash(), first.NumberU64()-1)
 		if ptd == nil {
 			// In HotStuff mode, TD is not used for fork choice, so we provide a default value
-			if bc.chainConfig.Hotstuff != nil {
+			if bc.chainConfig.IsHotstuff(first.Number()) {
 				log.Debug("writeLive: using default TD for HotStuff mode", "block", first.NumberU64(), "hash", first.Hash().Hex()[:8])
 				ptd = big.NewInt(int64(first.NumberU64() - 1))
 			} else {
@@ -1853,7 +1853,7 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	ptd := bc.GetTd(block.ParentHash(), block.NumberU64()-1)
 	if ptd == nil {
 		// In HotStuff mode, TD is not used for fork choice, so we provide a default value
-		if bc.chainConfig.Hotstuff != nil {
+		if bc.chainConfig.IsHotstuff(block.Number()) {
 			log.Debug("writeBlockWithState: using default TD for HotStuff mode", "block", block.NumberU64(), "hash", block.Hash().Hex()[:8])
 			ptd = big.NewInt(int64(block.NumberU64() - 1))
 		} else {

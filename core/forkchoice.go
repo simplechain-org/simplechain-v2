@@ -77,7 +77,7 @@ func (f *ForkChoice) ReorgNeeded(current *types.Header, extern *types.Header) (b
 	// CRITICAL FIX: For HotStuff consensus, skip TD comparison
 	// HotStuff uses QC-based finality, not total difficulty
 	// Blocks are already validated by QC before reaching here
-	if f.chain.Config().Hotstuff != nil {
+	if f.chain.Config().IsHotstuff(extern.Number) {
 		// In HotStuff, always accept blocks from canonical chain commits
 		// The 3-chain rule ensures safety
 		log.Debug("ReorgNeeded: HotStuff mode, accepting block without TD check",

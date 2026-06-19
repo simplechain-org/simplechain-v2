@@ -259,6 +259,15 @@ type Config struct {
 	Instance int `toml:",omitempty"`
 }
 
+// HotStuffConfig exposes node-local HotStuff settings without forcing ethconfig
+// to import the node package.
+func (c *Config) HotStuffConfig() *params.HotStuffConfig {
+	if c == nil {
+		return nil
+	}
+	return &c.HotStuff
+}
+
 // IPCEndpoint resolves an IPC endpoint based on a configured value, taking into
 // account the set data folders as well as the designated platform we're currently
 // running on.

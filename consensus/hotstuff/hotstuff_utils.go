@@ -9,6 +9,20 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 )
 
+func syncInfoSize(header *types.Header) int {
+	if header.Number == nil || header.Number.Uint64() == 0 {
+		return 0
+	}
+	syncInfoStart := len(header.Extra) - extraSeal - (1 + syncInfoTotalSize)
+	if syncInfoStart <= extraVanity || syncInfoStart >= len(header.Extra) {
+		return 0
+	}
+	if header.Extra[syncInfoStart] != hsFlag {
+		return 0
+	}
+	return 1 + syncInfoTotalSize
+}
+
 // parseSyncInfo decodes minimal SyncInfo from header.Extra
 func parseSyncInfo(header *types.Header) (has bool, hqcView uint64, hqcHash common.Hash, htcView uint64) {
 	// CRITICAL FIX: Don't scan for hsFlag! It can appear in validator BLS pubkeys!
@@ -23,19 +37,12 @@ func parseSyncInfo(header *types.Header) (has bool, hqcView uint64, hqcHash comm
 		return false, 0, common.Hash{}, 0
 	}
 
-	// Calculate where syncInfo should start (right before extraSeal)
-	// syncInfo is always the last thing before extraSeal if present
+	if syncInfoSize(header) == 0 {
+		return false, 0, common.Hash{}, 0
+	}
+
+	// Calculate where syncInfo should start (right before extraSeal).
 	syncInfoStart := len(payload) - extraSeal - (1 + syncInfoTotalSize)
-
-	// Bounds check: ensure syncInfo position is after validators section
-	if syncInfoStart <= extraVanity {
-		return false, 0, common.Hash{}, 0
-	}
-
-	// Check if hsFlag is present at the calculated position
-	if payload[syncInfoStart] != hsFlag {
-		return false, 0, common.Hash{}, 0
-	}
 
 	// Parse syncInfo from the exact position
 	hqcView = binary.LittleEndian.Uint64(payload[syncInfoStart+1 : syncInfoStart+1+viewSize])

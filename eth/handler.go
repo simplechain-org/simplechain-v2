@@ -30,7 +30,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/beacon"
-	"github.com/ethereum/go-ethereum/consensus/hotstuff"
 	"github.com/ethereum/go-ethereum/consensus/parlia"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/monitor"
@@ -935,7 +934,9 @@ func (h *handler) queryValidatorNodeIDsMap() map[common.Address][]enode.ID {
 	}
 
 	// Try HotStuff engine
-	if hotstuff, ok := h.chain.Engine().(*hotstuff.Hotstuff); ok {
+	if hotstuff, ok := h.chain.Engine().(interface {
+		GetNodeIDsMap() (map[common.Address][]enode.ID, error)
+	}); ok {
 		nodeIDsMap, err := hotstuff.GetNodeIDsMap()
 		if err != nil {
 			log.Debug("Failed to get node IDs map from HotStuff", "err", err)

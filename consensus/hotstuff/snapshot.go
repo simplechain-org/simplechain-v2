@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/big"
 	"sort"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -391,19 +390,10 @@ func (s *Snapshot) apply(headers []*types.Header, chain consensus.ChainHeaderRea
 			snap.EpochLength = maxwellEpochLength
 		}
 		// change validator set
-		// For Luban fork activation block, also update validator set to get BLS addresses
-		// even if it's not at epoch boundary
-		var parentBlockNumber *big.Int
-		if header.Number.Uint64() == 0 {
-			parentBlockNumber = header.Number
-		} else {
-			parentBlockNumber = new(big.Int).Sub(header.Number, big.NewInt(1))
-		}
-		isLubanForkBlock := chainConfig.IsOnLuban(parentBlockNumber)
 		isEpochBoundary := number > 0 && number%epochLength == snap.minerHistoryCheckLen()
 
-		if isEpochBoundary || isLubanForkBlock {
-			log.Debug("snapshot apply enter epoch boundary or luban fork block", "number", number, "epochLength", epochLength, "isEpochBoundary", isEpochBoundary, "isLubanForkBlock", isLubanForkBlock)
+		if isEpochBoundary {
+			log.Debug("snapshot apply enter epoch boundary", "number", number, "epochLength", epochLength, "isEpochBoundary", isEpochBoundary)
 			epochKey := math.MaxUint64 - header.Number.Uint64()/epochLength // impossible used as a block number
 			if chainConfig.IsBohr(header.Number, header.Time) {
 				// after switching the validator set, snap.Validators may become larger,
@@ -413,13 +403,10 @@ func (s *Snapshot) apply(headers []*types.Header, chain consensus.ChainHeaderRea
 				}
 			}
 
-			checkpointHeader := header
-			if isEpochBoundary {
-				checkpointHeader = FindAncientHeader(header, snap.minerHistoryCheckLen(), chain, parents, getBlockFromState)
-				if checkpointHeader == nil {
-					log.Error("snapshot apply find checkpoint header failed", "number", number, "epochLength", epochLength, "isEpochBoundary", isEpochBoundary, "isLubanForkBlock", isLubanForkBlock)
-					return nil, consensus.ErrUnknownAncestor
-				}
+			checkpointHeader := FindAncientHeader(header, snap.minerHistoryCheckLen(), chain, parents, getBlockFromState)
+			if checkpointHeader == nil {
+				log.Error("snapshot apply find checkpoint header failed", "number", number, "epochLength", epochLength, "isEpochBoundary", isEpochBoundary)
+				return nil, consensus.ErrUnknownAncestor
 			}
 
 			oldVersionsLen := snap.versionHistoryCheckLen()
@@ -623,22 +610,7 @@ func parseTurnLength(header *types.Header, chainConfig *params.ChainConfig, epoc
 		return nil, errInvalidSpanValidators
 	}
 
-	// Calculate the size of SyncInfo by checking if it actually exists
-	// CRITICAL FIX: Don't scan for hsFlag! It can appear in validator BLS pubkeys!
-	// Instead, check the exact position where syncInfo should be.
-	var hsExtraSize int
-	if header.Number.Uint64() == 0 {
-		hsExtraSize = 0
-	} else {
-		// syncInfo is always at: len - extraSeal - (1 + syncInfoTotalSize)
-		syncInfoStart := len(header.Extra) - extraSeal - (1 + syncInfoTotalSize)
-		// Check if hsFlag is present at the calculated position
-		if syncInfoStart > extraVanity && header.Extra[syncInfoStart] == hsFlag {
-			hsExtraSize = 1 + syncInfoTotalSize // 1 byte flag + 48 bytes syncInfo (8+32+8)
-		} else {
-			hsExtraSize = 0
-		}
-	}
+	hsExtraSize := syncInfoSize(header)
 
 	num := int(header.Extra[extraVanity])
 	pos := extraVanity + validatorNumberSize + num*validatorBytesLength

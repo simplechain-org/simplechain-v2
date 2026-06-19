@@ -3,7 +3,6 @@ package eth
 import (
 	"fmt"
 
-	"github.com/ethereum/go-ethereum/consensus/hotstuff"
 	"github.com/ethereum/go-ethereum/eth/protocols/hs"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
@@ -27,9 +26,15 @@ func (h *hsHandler) PeerInfo(id enode.ID) interface{} {
 
 // Handle routes decoded packets to the HotStuff engine.
 func (h *hsHandler) Handle(peer *hs.Peer, packet hs.Packet) error {
-	eng, ok := h.chain.Engine().(*hotstuff.Hotstuff)
+	eng, ok := h.chain.Engine().(interface {
+		OnHsProposal(string, *hs.ProposalPacket) error
+		OnHsVote(string, *hs.VotePacket) error
+		OnHsNewView(string, *hs.NewViewPacket) error
+		OnHsTimeout(string, *hs.TimeoutPacket) error
+		OnHsQuorumCert(string, *hs.QuorumCertPacket) error
+	})
 	if !ok {
-		return fmt.Errorf("hotstuff engine not enabled")
+		return fmt.Errorf("hotstuff protocol not enabled")
 	}
 	switch pkt := packet.(type) {
 	case *hs.ProposalPacket:

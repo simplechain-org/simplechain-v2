@@ -49,6 +49,7 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/ethereum/go-ethereum/trie"
+	"github.com/prysmaticlabs/prysm/v5/crypto/bls"
 )
 
 const (
@@ -492,26 +493,14 @@ func getValidatorBytesFromHeader(header *types.Header, chainConfig *params.Chain
 	if len(header.Extra) <= extraVanity+extraSeal {
 		return nil
 	}
-	var hsExtraSize int
-	if header.Number.Uint64() == 0 {
-		hsExtraSize = 0
-	} else {
-		hsExtraSize = 1 + syncInfoTotalSize
-	}
+	hsExtraSize := syncInfoSize(header)
 	if !chainConfig.IsLuban(header.Number) {
 		if header.Number.Uint64()%epochLength == 0 && (len(header.Extra)-extraSeal-extraVanity-hsExtraSize)%validatorBytesLengthBeforeLuban != 0 {
 			return nil
 		}
 		return header.Extra[extraVanity : len(header.Extra)-extraSeal-hsExtraSize]
 	}
-	var parentBlockNumber *big.Int
-	if header.Number.Uint64() == 0 {
-		parentBlockNumber = header.Number
-	} else {
-		parentBlockNumber = new(big.Int).Sub(header.Number, big.NewInt(1))
-	}
-	isLubanForkBlock := chainConfig.IsOnLuban(parentBlockNumber)
-	if header.Number.Uint64()%epochLength != 0 && !isLubanForkBlock {
+	if header.Number.Uint64()%epochLength != 0 {
 		return nil
 	}
 	num := int(header.Extra[extraVanity])
@@ -582,19 +571,14 @@ func (h *Hotstuff) verifyHeader(chain consensus.ChainHeaderReader, header *types
 	if err != nil {
 		return err
 	}
-	// Ensure that the extra-data contains a signer list on checkpoint, but none otherwise
+	// Ensure that the extra-data contains a signer list on checkpoint, but none otherwise.
+	// Luban changed the checkpoint validator encoding to include vote addresses,
+	// but it did not make non-checkpoint blocks carry validator lists.
 	signersBytes := getValidatorBytesFromHeader(header, h.chainConfig, epochLength)
 	isEpoch := number%epochLength == 0
-	// Allow validator list on fork activation blocks (Luban, Plato, etc.) even if not at epoch boundary
-	var parentBlockNumber *big.Int
-	if number == 0 {
-		parentBlockNumber = header.Number
-	} else {
-		parentBlockNumber = new(big.Int).Sub(header.Number, big.NewInt(1))
-	}
-	isLubanForkBlock := h.chainConfig.IsOnLuban(parentBlockNumber)
+	// Allow validator list on Plato fork activation block even if not at epoch boundary.
 	isPlatoForkBlock := h.chainConfig.IsOnPlato(header.Number)
-	if !isEpoch && len(signersBytes) != 0 && !isLubanForkBlock && !isPlatoForkBlock {
+	if !isEpoch && len(signersBytes) != 0 && !isPlatoForkBlock {
 		return errExtraValidators
 	}
 	if isEpoch && len(signersBytes) == 0 {
@@ -772,6 +756,16 @@ func (h *Hotstuff) verifyCascadingFields(chain consensus.ChainHeaderReader, head
 
 	if uint64(diff) >= limit || header.GasLimit < params.MinGasLimit {
 		return fmt.Errorf("invalid gas limit: have %d, want %d += %d", header.GasLimit, parent.GasLimit, limit-1)
+	}
+
+	// Verify vote attestation for fast finality.
+	if err := h.verifyVoteAttestation(chain, header, parents); err != nil {
+		log.Warn("Verify vote attestation failed", "error", err, "hash", header.Hash(), "number", header.Number,
+			"parent", header.ParentHash, "coinbase", header.Coinbase, "extra", common.Bytes2Hex(header.Extra))
+		verifyVoteAttestationErrorCounter.Inc(1)
+		if chain.Config().IsPlato(header.Number) {
+			return err
+		}
 	}
 
 	// HotStuff: if TimeoutCert is embedded, verify its aggregate signature
@@ -1126,18 +1120,9 @@ func (h *Hotstuff) prepareValidators(chain consensus.ChainHeaderReader, header *
 		return err
 	}
 
-	// For Luban fork activation block, always call getCurrentValidators to get BLS addresses
-	// even if it's not at epoch boundary
-	var parentBlockNumber *big.Int
-	if header.Number.Uint64() == 0 {
-		parentBlockNumber = header.Number
-	} else {
-		parentBlockNumber = new(big.Int).Sub(header.Number, big.NewInt(1))
-	}
-	isLubanForkBlock := h.chainConfig.IsOnLuban(parentBlockNumber)
 	isEpochBoundary := header.Number.Uint64()%epochLength == 0
 
-	if !isEpochBoundary && !isLubanForkBlock {
+	if !isEpochBoundary {
 		return nil
 	}
 
@@ -1192,16 +1177,9 @@ func (h *Hotstuff) prepareValidatorsWithSnapshot(chain consensus.ChainHeaderRead
 	}
 
 	epochLength := snap.EpochLength
-	var parentBlockNumber *big.Int
-	if header.Number.Uint64() == 0 {
-		parentBlockNumber = header.Number
-	} else {
-		parentBlockNumber = new(big.Int).Sub(header.Number, big.NewInt(1))
-	}
-	isLubanForkBlock := h.chainConfig.IsOnLuban(parentBlockNumber)
 	isEpochBoundary := header.Number.Uint64()%epochLength == 0
 
-	if !isEpochBoundary && !isLubanForkBlock {
+	if !isEpochBoundary {
 		return nil
 	}
 
@@ -1411,18 +1389,9 @@ func (h *Hotstuff) verifyValidators(chain consensus.ChainHeaderReader, header *t
 		return err
 	}
 
-	// For Luban fork activation block, always verify validators to ensure BLS addresses
-	// even if it's not at epoch boundary
-	var parentBlockNumber *big.Int
-	if header.Number.Uint64() == 0 {
-		parentBlockNumber = header.Number
-	} else {
-		parentBlockNumber = new(big.Int).Sub(header.Number, big.NewInt(1))
-	}
-	isLubanForkBlock := h.chainConfig.IsOnLuban(parentBlockNumber)
 	isEpochBoundary := header.Number.Uint64()%epochLength == 0
 
-	if !isEpochBoundary && !isLubanForkBlock {
+	if !isEpochBoundary {
 		return nil
 	}
 
@@ -1493,16 +1462,9 @@ func (h *Hotstuff) verifyValidatorsWithSnapshot(chain consensus.ChainHeaderReade
 	}
 
 	epochLength := snap.EpochLength
-	var parentBlockNumber *big.Int
-	if header.Number.Uint64() == 0 {
-		parentBlockNumber = header.Number
-	} else {
-		parentBlockNumber = new(big.Int).Sub(header.Number, big.NewInt(1))
-	}
-	isLubanForkBlock := h.chainConfig.IsOnLuban(parentBlockNumber)
 	isEpochBoundary := header.Number.Uint64()%epochLength == 0
 
-	if !isEpochBoundary && !isLubanForkBlock {
+	if !isEpochBoundary {
 		return nil
 	}
 
@@ -3168,6 +3130,28 @@ func (h *Hotstuff) GetFinalizedHeader(chain consensus.ChainHeaderReader, header 
 	return chain.GetHeader(snap.Attestation.SourceHash, snap.Attestation.SourceNumber)
 }
 
+// GetJustifiedNumberAndHash retrieves the number and hash of the highest justified block
+// within the branch including `headers` and utilizing the latest element as the head.
+func (h *Hotstuff) GetJustifiedNumberAndHash(chain consensus.ChainHeaderReader, headers []*types.Header) (uint64, common.Hash, error) {
+	if chain == nil || len(headers) == 0 || headers[len(headers)-1] == nil {
+		return 0, common.Hash{}, errors.New("illegal chain or header")
+	}
+	head := headers[len(headers)-1]
+	snap, err := h.snapshot(chain, head.Number.Uint64(), head.Hash(), headers)
+	if err != nil {
+		log.Error("Unexpected error when getting snapshot",
+			"error", err, "blockNumber", head.Number.Uint64(), "blockHash", head.Hash())
+		return 0, common.Hash{}, err
+	}
+	if snap.Attestation == nil {
+		if h.chainConfig.IsLuban(head.Number) {
+			log.Debug("once one attestation generated, attestation of snap would not be nil forever basically")
+		}
+		return 0, chain.GetHeaderByNumber(0).Hash(), nil
+	}
+	return snap.Attestation.TargetNumber, snap.Attestation.TargetHash, nil
+}
+
 // BlockInterval returns number of blocks in one epoch for the given header
 func (h *Hotstuff) epochLength(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) (uint64, error) {
 	if header == nil {
@@ -3968,7 +3952,123 @@ func (cca *chainContextAdapter) Config() *params.ChainConfig {
 
 // getVoteAttestationFromHeader extracts vote attestation from header extra data
 func getVoteAttestationFromHeader(header *types.Header, chainConfig *params.ChainConfig, epochLength uint64) (*types.VoteAttestation, error) {
-	return nil, nil
+	if len(header.Extra) <= extraVanity+extraSeal {
+		return nil, nil
+	}
+	if !chainConfig.IsLuban(header.Number) {
+		return nil, nil
+	}
+
+	hsExtraSize := syncInfoSize(header)
+	end := len(header.Extra) - extraSeal - hsExtraSize
+	if end <= extraVanity {
+		return nil, nil
+	}
+
+	var start int
+	if header.Number.Uint64()%epochLength != 0 {
+		start = extraVanity
+	} else {
+		num := int(header.Extra[extraVanity])
+		start = extraVanity + validatorNumberSize + num*validatorBytesLength
+		if chainConfig.IsBohr(header.Number, header.Time) {
+			start += turnLengthSize
+		}
+	}
+	if end <= start {
+		return nil, nil
+	}
+
+	var attestation types.VoteAttestation
+	if err := rlp.Decode(bytes.NewReader(header.Extra[start:end]), &attestation); err != nil {
+		return nil, fmt.Errorf("block %d has vote attestation info, decode err: %s", header.Number.Uint64(), err)
+	}
+	return &attestation, nil
+}
+
+func (h *Hotstuff) verifyVoteAttestation(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
+	epochLength, err := h.epochLength(chain, header, parents)
+	if err != nil {
+		return err
+	}
+	attestation, err := getVoteAttestationFromHeader(header, chain.Config(), epochLength)
+	if err != nil {
+		return err
+	}
+	if attestation == nil {
+		return nil
+	}
+	if attestation.Data == nil {
+		return errors.New("invalid attestation, vote data is nil")
+	}
+	if len(attestation.Extra) > types.MaxAttestationExtraLength {
+		return fmt.Errorf("invalid attestation, too large extra length: %d", len(attestation.Extra))
+	}
+
+	parent, err := h.getParent(chain, header, parents)
+	if err != nil {
+		return err
+	}
+	targetNumber := attestation.Data.TargetNumber
+	targetHash := attestation.Data.TargetHash
+	if targetNumber != parent.Number.Uint64() || targetHash != parent.Hash() {
+		return fmt.Errorf("invalid attestation, target mismatch, expected block: %d, hash: %s; real block: %d, hash: %s",
+			parent.Number.Uint64(), parent.Hash(), targetNumber, targetHash)
+	}
+
+	sourceNumber := attestation.Data.SourceNumber
+	sourceHash := attestation.Data.SourceHash
+	headers := []*types.Header{parent}
+	if len(parents) > 0 {
+		headers = parents
+	}
+	justifiedBlockNumber, justifiedBlockHash, err := h.GetJustifiedNumberAndHash(chain, headers)
+	if err != nil {
+		return errors.New("unexpected error when getting the highest justified number and hash")
+	}
+	if sourceNumber != justifiedBlockNumber || sourceHash != justifiedBlockHash {
+		return fmt.Errorf("invalid attestation, source mismatch, expected block: %d, hash: %s; real block: %d, hash: %s",
+			justifiedBlockNumber, justifiedBlockHash, sourceNumber, sourceHash)
+	}
+
+	if len(parents) > 1 {
+		parents = parents[:len(parents)-1]
+	} else {
+		parents = nil
+	}
+	snap, err := h.snapshot(chain, parent.Number.Uint64()-1, parent.ParentHash, parents)
+	if err != nil {
+		return err
+	}
+
+	validators := snap.validators()
+	validatorsBitSet := bitset.From([]uint64{uint64(attestation.VoteAddressSet)})
+	if validatorsBitSet.Count() > uint(len(validators)) {
+		return errors.New("invalid attestation, vote number larger than validators number")
+	}
+	votedAddrs := make([]bls.PublicKey, 0, validatorsBitSet.Count())
+	for index, val := range validators {
+		if !validatorsBitSet.Test(uint(index)) {
+			continue
+		}
+		voteAddr, err := bls.PublicKeyFromBytes(snap.Validators[val].VoteAddress[:])
+		if err != nil {
+			return fmt.Errorf("BLS public key converts failed: %v", err)
+		}
+		votedAddrs = append(votedAddrs, voteAddr)
+	}
+	if len(votedAddrs) < cmath.CeilDiv(len(snap.Validators)*2, 3) {
+		return errors.New("invalid attestation, not enough validators voted")
+	}
+
+	aggSig, err := bls.SignatureFromBytes(attestation.AggSignature[:])
+	if err != nil {
+		return fmt.Errorf("BLS signature converts failed: %v", err)
+	}
+	if !aggSig.FastAggregateVerify(votedAddrs, attestation.Data.Hash()) {
+		return errors.New("invalid attestation, signature verify failed")
+	}
+	return nil
 }
 
 // moveToView updates local view and performs leader/replica actions

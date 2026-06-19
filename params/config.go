@@ -676,7 +676,7 @@ var (
 
 // NetworkNames are user friendly names to use in the chain spec banner.
 var NetworkNames = map[string]string{
-	MainnetChainConfig.ChainID.String(): "mainnet",
+	MainnetChainConfig.ChainID.String():            "mainnet",
 	BSCChainConfig.ChainID.String():                "bsc",
 	ChapelChainConfig.ChainID.String():             "chapel",
 	RialtoChainConfig.ChainID.String():             "rialto",
@@ -772,6 +772,7 @@ type ChainConfig struct {
 	HertzBlock      *big.Int `json:"hertzBlock,omitempty"`      // hertzBlock switch block (nil = no fork, 0 = already activated)
 	HertzfixBlock   *big.Int `json:"hertzfixBlock,omitempty"`   // hertzfixBlock switch block (nil = no fork, 0 = already activated)
 	CopperBlock     *big.Int `json:"copperBlock,omitempty"`     // Copper switch block (nil = no fork, 0 = already on copper)
+	HotstuffBlock   *big.Int `json:"hotstuffBlock,omitempty"`   // HotStuff consensus switch block (nil = no fork, 0 = already on hotstuff)
 
 	// Various consensus engines
 	Ethash             *EthashConfig       `json:"ethash,omitempty"`
@@ -828,7 +829,11 @@ func (c *ChainConfig) Description() string {
 	banner += fmt.Sprintf("Chain ID:  %v (%s)\n", c.ChainID, network)
 	switch {
 	case c.Parlia != nil:
-		banner += "Consensus: Parlia (proof-of-staked--authority)\n"
+		if c.Hotstuff != nil && c.HotstuffBlock != nil {
+			banner += fmt.Sprintf("Consensus: Parlia -> HotStuff at block %v\n", c.HotstuffBlock)
+		} else {
+			banner += "Consensus: Parlia (proof-of-staked--authority)\n"
+		}
 	case c.Ethash != nil:
 		banner += "Consensus: Beacon (proof-of-stake), merged from Ethash (proof-of-work)\n"
 	case c.Clique != nil:
@@ -850,7 +855,13 @@ func (c *ChainConfig) String() string {
 	case c.Clique != nil:
 		engine = c.Clique
 	case c.Parlia != nil:
-		engine = c.Parlia
+		if c.Hotstuff != nil && c.HotstuffBlock != nil {
+			engine = fmt.Sprintf("%v->%v@%v", c.Parlia, c.Hotstuff, c.HotstuffBlock)
+		} else {
+			engine = c.Parlia
+		}
+	case c.Hotstuff != nil:
+		engine = c.Hotstuff
 	default:
 		engine = "unknown"
 	}
@@ -1427,6 +1438,16 @@ func (c *ChainConfig) IsOnCopper(num *big.Int) bool {
 	return configBlockEqual(c.CopperBlock, num)
 }
 
+// IsHotstuff returns whether HotStuff consensus has been activated at num.
+func (c *ChainConfig) IsHotstuff(num *big.Int) bool {
+	return c.Hotstuff != nil && isBlockForked(c.HotstuffBlock, num)
+}
+
+// IsOnHotstuff returns whether num is the HotStuff consensus activation block.
+func (c *ChainConfig) IsOnHotstuff(num *big.Int) bool {
+	return c.Hotstuff != nil && configBlockEqual(c.HotstuffBlock, num)
+}
+
 // IsNoBlockReward returns whether time is either equal to the NoBlockReward fork time or greater.
 func (c *ChainConfig) IsNoBlockReward(num *big.Int, time uint64) bool {
 	return c.IsCopper(num) && isTimestampForked(c.NoBlockRewardTime, time)
@@ -1529,6 +1550,7 @@ func (c *ChainConfig) CheckConfigForkOrder() error {
 		{name: "hertzBlock", block: c.HertzBlock},
 		{name: "hertzfixBlock", block: c.HertzfixBlock},
 		{name: "copperBlock", block: c.CopperBlock, optional: true},
+		{name: "hotstuffBlock", block: c.HotstuffBlock, optional: true},
 		{name: "keplerTime", timestamp: c.KeplerTime},
 		{name: "feynmanTime", timestamp: c.FeynmanTime},
 		{name: "feynmanFixTime", timestamp: c.FeynmanFixTime},
@@ -1719,6 +1741,9 @@ func (c *ChainConfig) checkCompatible(newcfg *ChainConfig, headNumber *big.Int, 
 	}
 	if isForkBlockIncompatible(c.CopperBlock, newcfg.CopperBlock, headNumber) {
 		return newBlockCompatError("copper fork block", c.CopperBlock, newcfg.CopperBlock)
+	}
+	if isForkBlockIncompatible(c.HotstuffBlock, newcfg.HotstuffBlock, headNumber) {
+		return newBlockCompatError("hotstuff fork block", c.HotstuffBlock, newcfg.HotstuffBlock)
 	}
 	if isForkTimestampIncompatible(c.ShanghaiTime, newcfg.ShanghaiTime, headTimestamp) {
 		return newTimestampCompatError("Shanghai fork timestamp", c.ShanghaiTime, newcfg.ShanghaiTime)
