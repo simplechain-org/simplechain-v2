@@ -260,6 +260,9 @@ func (h *Hotstuff) parseTimeoutCert(header *types.Header) (*hsTimeoutCert, error
 		if i+5+int(l) > end {
 			break
 		}
+		if i+5+int(l) != end {
+			continue
+		}
 		type encTC struct {
 			View       uint64
 			HighQCView uint64
@@ -269,21 +272,19 @@ func (h *Hotstuff) parseTimeoutCert(header *types.Header) (*hsTimeoutCert, error
 		}
 		var e encTC
 		if err := rlp.DecodeBytes(payload[i+5:i+5+int(l)], &e); err != nil {
-			// CRITICAL FIX: If TC data is corrupted (EOF, invalid format), return nil instead of error
-			// This allows the block to be accepted (TC is optional)
-			log.Debug("parseTimeoutCert: failed to decode TC data (treating as no TC)",
+			log.Debug("parseTimeoutCert: failed to decode TC data",
 				"error", err,
 				"tcDataLength", l,
 				"availableLength", end-i-5)
-			return nil, nil // Return nil, nil to indicate "no TC" rather than error
+			return nil, fmt.Errorf("invalid TimeoutCert encoding: %w", err)
 		}
 
 		// Validate AggSig length
 		if len(e.AggSig) != types.BLSSignatureLength {
-			log.Debug("parseTimeoutCert: invalid AggSig length (treating as no TC)",
+			log.Debug("parseTimeoutCert: invalid AggSig length",
 				"expected", types.BLSSignatureLength,
 				"got", len(e.AggSig))
-			return nil, nil
+			return nil, fmt.Errorf("invalid TimeoutCert aggregate signature length: have %d want %d", len(e.AggSig), types.BLSSignatureLength)
 		}
 
 		tc := &hsTimeoutCert{View: e.View, HighQC: &HsQC{View: e.HighQCView, BlockHash: e.HighQCHash}, SignerSet: types.ValidatorsBitSet(e.SignerSet)}
@@ -297,6 +298,12 @@ func (h *Hotstuff) parseTimeoutCert(header *types.Header) (*hsTimeoutCert, error
 func (h *Hotstuff) verifyTimeoutCert(tc *hsTimeoutCert) bool {
 	if tc == nil {
 		return true
+	}
+	if tc.HighQC == nil || tc.HighQC.BlockHash == (common.Hash{}) {
+		return false
+	}
+	if tc.SignerSet == 0 {
+		return false
 	}
 
 	// Before Luban fork, BLS timeout cert is not supported, skip verification but allow TC
@@ -338,10 +345,10 @@ func (h *Hotstuff) verifyTimeoutCert(tc *hsTimeoutCert) bool {
 		}
 	}
 
-	// If BLS addresses not initialized, skip verification but allow TC
+	// After Luban, TC verification requires initialized BLS vote addresses.
 	if !hasBlsAddresses {
-		log.Debug("Skip timeout cert verification (BLS addresses not initialized)", "view", tc.View)
-		return true
+		log.Warn("verifyTimeoutCert: BLS addresses not initialized", "view", tc.View)
+		return false
 	}
 
 	log.Debug("verifyTimeoutCert: checking TC",
@@ -398,4 +405,20 @@ func (h *Hotstuff) verifyTimeoutCert(tc *hsTimeoutCert) bool {
 	}
 
 	return result
+}
+
+func (h *Hotstuff) timeoutCertFromNewView(nv *hs.NewViewPacket) *hsTimeoutCert {
+	if nv == nil || nv.HighTCView == 0 {
+		return nil
+	}
+	if nv.TimeoutSignersSet == 0 {
+		return nil
+	}
+	tc := &hsTimeoutCert{
+		View:      nv.HighTCView,
+		HighQC:    &HsQC{View: nv.HighQCView, BlockHash: nv.HighQCHash},
+		SignerSet: nv.TimeoutSignersSet,
+	}
+	tc.AggSig = nv.TimeoutAggSig
+	return tc
 }

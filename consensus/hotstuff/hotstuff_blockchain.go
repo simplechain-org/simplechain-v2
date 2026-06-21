@@ -93,7 +93,7 @@ func (h *Hotstuff) tryCommitBlocks(st *hsState, currentHash common.Hash, current
 
 	// 获取当前view的QC和对应区块
 	qcCurrent := st.qcsByView[currentView]
-	if qcCurrent == nil {
+	if qcCurrent == nil || !qcCurrent.hasAggregateProof() {
 		return nil
 	}
 
@@ -227,7 +227,7 @@ func (h *Hotstuff) tryCommitBlocks(st *hsState, currentHash common.Hash, current
 func (h *Hotstuff) findQCForBlock(st *hsState, blockHash common.Hash) *HsQC {
 	// 遍历所有QC，查找certify这个区块的QC
 	for _, qc := range st.qcsByView {
-		if qc != nil && qc.BlockHash == blockHash {
+		if qc != nil && qc.BlockHash == blockHash && qc.hasAggregateProof() {
 			return qc
 		}
 	}
@@ -241,6 +241,19 @@ func (h *Hotstuff) isBlockCommitted(st *hsState, hash common.Hash) bool {
 	}
 	_, exists := st.committedBlocks[hash]
 	return exists
+}
+
+func recordHotstuffCommitInsertResult(knownBlockFastPath bool, err error) {
+	switch {
+	case err == nil && knownBlockFastPath:
+		hotstuffCommitFastPathCounter.Inc(1)
+	case err == nil:
+		hotstuffCommitReexecuteCounter.Inc(1)
+	case errors.Is(err, core.ErrKnownBlock):
+		hotstuffCommitFastPathCounter.Inc(1)
+	default:
+		hotstuffCommitInsertErrorCounter.Inc(1)
+	}
 }
 
 // commitBlock commits a block to the chain
@@ -268,7 +281,9 @@ func (h *Hotstuff) commitBlock(block *types.Block) error {
 				"hash", block.Hash().Hex()[:8],
 				"isLocal", h.IsLocalBlock(block.Header()))
 
+			knownBlockFastPath := bc.HasBlockAndExecutionCache(block.Hash(), block.NumberU64())
 			_, err := bc.InsertChain([]*types.Block{block})
+			recordHotstuffCommitInsertResult(knownBlockFastPath, err)
 			if err != nil {
 				// 检查是否为已知区块错误
 				if errors.Is(err, core.ErrKnownBlock) {
@@ -280,7 +295,8 @@ func (h *Hotstuff) commitBlock(block *types.Block) error {
 			} else {
 				log.Info("Block successfully inserted into canonical chain",
 					"number", block.NumberU64(),
-					"hash", block.Hash().Hex()[:8])
+					"hash", block.Hash().Hex()[:8],
+					"knownBlockFastPath", knownBlockFastPath)
 			}
 		} else {
 			return fmt.Errorf("chain is not a BlockChain instance")
@@ -498,7 +514,9 @@ func (h *Hotstuff) commitBlockWithAncestors(st *hsState, block *types.Block) err
 							parentHeader.Hash().Hex()[:8])
 					}
 
+					knownBlockFastPath := bc.HasBlockAndExecutionCache(ancestor.Hash(), ancestor.NumberU64())
 					_, insertErr := bc.InsertChain(types.Blocks{ancestor})
+					recordHotstuffCommitInsertResult(knownBlockFastPath, insertErr)
 					if insertErr != nil {
 						if errors.Is(insertErr, core.ErrKnownBlock) {
 							log.Debug("Ancestor block already exists in chain",
@@ -509,7 +527,8 @@ func (h *Hotstuff) commitBlockWithAncestors(st *hsState, block *types.Block) err
 					}
 					log.Debug("Ancestor block inserted",
 						"number", ancestor.NumberU64(),
-						"progress", fmt.Sprintf("%d/%d", i+1, len(blocksToInsert)))
+						"progress", fmt.Sprintf("%d/%d", i+1, len(blocksToInsert)),
+						"knownBlockFastPath", knownBlockFastPath)
 					if i < len(blocksToInsert)-1 {
 						time.Sleep(1000 * time.Millisecond)
 					}
@@ -525,7 +544,9 @@ func (h *Hotstuff) commitBlockWithAncestors(st *hsState, block *types.Block) err
 				"count", len(blocksToInsert))
 
 			for i, ancestor := range blocksToInsert {
+				knownBlockFastPath := bc.HasBlockAndExecutionCache(ancestor.Hash(), ancestor.NumberU64())
 				_, insertErr := bc.InsertChain(types.Blocks{ancestor})
+				recordHotstuffCommitInsertResult(knownBlockFastPath, insertErr)
 				if insertErr != nil {
 					if errors.Is(insertErr, core.ErrKnownBlock) {
 						log.Debug("Ancestor block already exists in chain",
@@ -538,7 +559,8 @@ func (h *Hotstuff) commitBlockWithAncestors(st *hsState, block *types.Block) err
 				log.Info("Ancestor block inserted",
 					"number", ancestor.NumberU64(),
 					"hash", ancestor.Hash().Hex()[:8],
-					"progress", fmt.Sprintf("%d/%d", i+1, len(blocksToInsert)))
+					"progress", fmt.Sprintf("%d/%d", i+1, len(blocksToInsert)),
+					"knownBlockFastPath", knownBlockFastPath)
 
 				// Delay between inserts to allow snapshot Cap operations to complete
 				// The "parent diff layer is stale" panic occurs when multiple InsertChain calls
@@ -658,26 +680,28 @@ func (h *Hotstuff) buildBlockAndReceipts(header *types.Header, txs []*types.Tran
 	return block, receipts, nil
 }
 
-// prewriteBlock writes header/body/receipts into rawdb without touching canonical head
+// prewriteBlock writes header/body/receipts into rawdb without touching canonical head.
 // CRITICAL: This function acquires its own lock to protect map access
-func (h *Hotstuff) prewriteBlock(hash common.Hash) {
+func (h *Hotstuff) prewriteBlock(hash common.Hash) bool {
 	// Phase 1: Get block and receipts from state
 	h.lock.RLock()
 	st := h.getHsState()
 	if st == nil {
 		h.lock.RUnlock()
-		return
+		hotstuffPrewriteMissCounter.Inc(1)
+		return false
 	}
 	if _, ok := st.prewritten[hash]; ok {
 		h.lock.RUnlock()
-		return
+		return false
 	}
 	blk := st.proposalsByHashBlock[hash]
 	rcpts := st.proposalsByHashReceipts[hash]
 	h.lock.RUnlock()
 
 	if blk == nil {
-		return
+		hotstuffPrewriteMissCounter.Inc(1)
+		return false
 	}
 
 	// Phase 2: Write to database
@@ -700,6 +724,8 @@ func (h *Hotstuff) prewriteBlock(hash common.Hash) {
 	}
 	h.lock.Unlock()
 	log.Trace("prewrote block to rawdb", "number", blk.NumberU64(), "hash", blk.Hash())
+	hotstuffPrewriteBlocksCounter.Inc(1)
+	return true
 }
 
 // executeBlocks executes the transactions in a block and validates their correctness

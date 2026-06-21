@@ -339,9 +339,9 @@ func (s *Snapshot) apply(headers []*types.Header, chain consensus.ChainHeaderRea
 
 		snap.updateAttestation(header, chainConfig)
 
-		// Advance HotStuff view with fixed mapping (1 block == 1 view)
-		//todo: current view not equal to number
-		snap.CurrentView = number
+		// Advance HotStuff view from header SyncInfo. View and block height may
+		// diverge after timeouts; fall back to block number only for legacy blocks.
+		snap.CurrentView = getViewFromHeader(header)
 		hasSyncInfo, hqcView, hqcHash, htcView := parseSyncInfo(header)
 		if hasSyncInfo {
 			// Update HighQC if view increased

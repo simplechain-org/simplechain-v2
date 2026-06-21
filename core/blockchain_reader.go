@@ -448,6 +448,28 @@ func (bc *BlockChain) HasBlockAndState(hash common.Hash, number uint64) bool {
 	return bc.HasState(block.Root())
 }
 
+// HasBlockAndExecutionCache checks if a block has all persisted state needed for
+// InsertChain to take the known-block path without re-executing the block.
+func (bc *BlockChain) HasBlockAndExecutionCache(hash common.Hash, number uint64) bool {
+	block := bc.GetBlock(hash, number)
+	if block == nil || !bc.HasState(block.Root()) {
+		return false
+	}
+	if bc.snaps == nil {
+		return true
+	}
+	if bc.snaps.Snapshot(block.Root()) != nil {
+		return true
+	}
+	if number == 0 {
+		return true
+	}
+	if parent := bc.GetHeader(block.ParentHash(), number-1); parent != nil {
+		return bc.snaps.Snapshot(parent.Root) == nil
+	}
+	return false
+}
+
 // stateRecoverable checks if the specified state is recoverable.
 // Note, this function assumes the state is not present, because
 // state is not treated as recoverable if it's available, thus

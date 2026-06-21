@@ -80,6 +80,11 @@ func (h *Hotstuff) addrFromVotePubKeyAt(pk types.BLSPublicKey, baseHash common.H
 
 	if !hasBlsAddresses {
 		log.Debug("Snapshot has no BLS addresses yet", "view", view, "snapNum", snap.Number)
+		if baseHash != (common.Hash{}) {
+			if hdr := h.chain.GetHeaderByHash(baseHash); hdr != nil && h.chainConfig.IsLuban(hdr.Number) {
+				return common.Address{}, false, errors.New("BLS vote addresses not initialized after Luban fork")
+			}
+		}
 		return common.Address{}, false, nil
 	}
 
@@ -173,6 +178,10 @@ func (h *Hotstuff) aggregateHsVoteSignatures(votes map[common.Address]*hs.VotePa
 
 // verifyAggregateQC verifies an aggregated QC signature with provided signer set from qc packet
 func (h *Hotstuff) verifyAggregateQC(qc *hs.QuorumCertPacket) bool {
+	if qc == nil || qc.TargetHash == (common.Hash{}) {
+		return false
+	}
+
 	// CRITICAL: Try to get target header with fallback to HotStuff state
 	// In HotStuff pipelining, target block may not be in canonical chain yet
 	var targetHeader *types.Header
@@ -206,9 +215,15 @@ func (h *Hotstuff) verifyAggregateQC(qc *hs.QuorumCertPacket) bool {
 		log.Warn("verifyAggregateQC: target header not found (neither in chain nor HotStuff state)",
 			"targetHash", qc.TargetHash.Hex()[:8],
 			"view", qc.ViewNumber)
-		// Cannot verify without target header, but allow QC to avoid blocking consensus
-		// This might happen if we're far behind and haven't received the block yet
-		return true
+		return false
+	}
+	if qc.ViewNumber > 0 && (qc.SignersSet == 0 || len(qc.AggregateSig) != types.BLSSignatureLength) {
+		log.Warn("verifyAggregateQC: missing aggregate proof",
+			"view", qc.ViewNumber,
+			"targetHash", qc.TargetHash.Hex()[:8],
+			"signersSet", qc.SignersSet,
+			"aggSigLen", len(qc.AggregateSig))
+		return false
 	}
 
 	// Get snapshot at target block's parent (following Parlia convention)
@@ -221,8 +236,7 @@ func (h *Hotstuff) verifyAggregateQC(qc *hs.QuorumCertPacket) bool {
 			"targetHash", qc.TargetHash.Hex()[:8],
 			"parentHash", targetHeader.ParentHash.Hex()[:8],
 			"error", err)
-		// Cannot verify without snapshot, but allow QC to avoid blocking consensus
-		return true
+		return false
 	}
 
 	// Check if BLS addresses are initialized in snapshot
@@ -235,13 +249,13 @@ func (h *Hotstuff) verifyAggregateQC(qc *hs.QuorumCertPacket) bool {
 		}
 	}
 
-	// If BLS addresses not initialized, skip verification but allow QC
+	// After Luban, QC verification requires initialized BLS vote addresses.
 	if !hasBlsAddresses {
-		log.Debug("Skip aggregate QC verification (BLS addresses not initialized)",
+		log.Warn("verifyAggregateQC: BLS addresses not initialized",
 			"view", qc.ViewNumber,
 			"snapNumber", snap.Number,
 			"targetNumber", targetHeader.Number.Uint64())
-		return true
+		return false
 	}
 
 	log.Debug("verifyAggregateQC: checking QC",

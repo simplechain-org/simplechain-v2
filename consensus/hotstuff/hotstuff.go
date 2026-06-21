@@ -93,13 +93,15 @@ const (
 	validatorBytesLengthBeforeLuban        = common.AddressLength
 
 	// HotStuff SyncInfo encoding constants
-	viewSize               = 8                                          // uint64 size in bytes
-	hashSize               = 32                                         // common.Hash size in bytes
-	countSize              = 4                                          // uint32 size in bytes
-	addressSize            = 20                                         // common.Address size in bytes
-	syncInfoTotalSize      = viewSize + hashSize + viewSize             // hqcView + hqcHash + htcView
-	tcHeaderSize           = viewSize + viewSize + hashSize + countSize // view + highQC view + highQC hash + signer count
-	hsFlag            byte = 0xA5
+	viewSize                    = 8                              // uint64 size in bytes
+	hashSize                    = 32                             // common.Hash size in bytes
+	countSize                   = 4                              // uint32 size in bytes
+	addressSize                 = 20                             // common.Address size in bytes
+	syncInfoTotalSize           = viewSize + hashSize + viewSize // hqcView + hqcHash + htcView
+	syncInfoProofTotalSize      = syncInfoTotalSize + countSize + types.BLSSignatureLength
+	tcHeaderSize                = viewSize + viewSize + hashSize + countSize // view + highQC view + highQC hash + signer count
+	hsFlag                 byte = 0xA5
+	hsProofFlag            byte = 0xA6
 )
 
 var (
@@ -110,6 +112,13 @@ var (
 	validVotesfromSelfCounter         = metrics.NewRegisteredCounter("parlia/VerifyVote/self", nil)
 	doubleSignCounter                 = metrics.NewRegisteredCounter("parlia/doublesign", nil)
 	intentionalDelayMiningCounter     = metrics.NewRegisteredCounter("parlia/intentionalDelayMining", nil)
+	hotstuffProposalExecuteTimer      = metrics.NewRegisteredTimer("hotstuff/proposal/execute", nil)
+	hotstuffProposalExecuteErrors     = metrics.NewRegisteredCounter("hotstuff/proposal/execute/error", nil)
+	hotstuffPrewriteBlocksCounter     = metrics.NewRegisteredCounter("hotstuff/prewrite/blocks", nil)
+	hotstuffPrewriteMissCounter       = metrics.NewRegisteredCounter("hotstuff/prewrite/miss", nil)
+	hotstuffCommitFastPathCounter     = metrics.NewRegisteredCounter("hotstuff/commit/insert/fastpath", nil)
+	hotstuffCommitReexecuteCounter    = metrics.NewRegisteredCounter("hotstuff/commit/insert/reexecute", nil)
+	hotstuffCommitInsertErrorCounter  = metrics.NewRegisteredCounter("hotstuff/commit/insert/error", nil)
 
 	// Difficulty markers (aligned with Parlia)
 	diffInTurn = big.NewInt(2)
@@ -359,7 +368,6 @@ func (h *Hotstuff) SetChainReader(chain consensus.ChainHeaderReader) {
 					if snap.HighQCView > 0 && (snap.HighQCHash != (common.Hash{})) {
 						// Initialize from snapshot (SignersSet/Sig not stored in snapshot, will be updated from QC messages)
 						st.highQC = &HsQC{BlockHash: snap.HighQCHash, View: snap.HighQCView, SignersSet: 0, Sig: nil}
-						st.qcsByView[snap.HighQCView] = st.highQC
 						log.Debug("initHsState: initialized highQC from snapshot",
 							"view", snap.HighQCView,
 							"blockHash", snap.HighQCHash.Hex()[:8],
@@ -785,10 +793,10 @@ func (h *Hotstuff) verifyCascadingFields(chain consensus.ChainHeaderReader, head
 	// If TC data is corrupted (EOF), treat it as "no TC" rather than rejecting
 	tc, tcErr := h.parseTimeoutCert(header)
 	if tcErr != nil {
-		log.Debug("verifyCascadingFields: failed to parse TimeoutCert (treating as no TC)",
+		log.Debug("verifyCascadingFields: failed to parse TimeoutCert",
 			"block", header.Number.Uint64(),
 			"error", tcErr)
-		tc = nil // Treat as no TC
+		return tcErr
 	}
 	if tc != nil {
 		if !h.verifyTimeoutCert(tc) {
@@ -797,7 +805,7 @@ func (h *Hotstuff) verifyCascadingFields(chain consensus.ChainHeaderReader, head
 	}
 
 	// HotStuff chained-safety minimal check: HighQC must justify parent
-	if err := h.verifyHotstuffRules(chain, header, snap); err != nil {
+	if err := h.verifyHotstuffRules(chain, header, snap, tc); err != nil {
 		return err
 	}
 
@@ -846,8 +854,8 @@ func (h *Hotstuff) assembleHighQC(chain consensus.ChainHeaderReader, header *typ
 }
 
 // verifyHotstuffRules checks HighQC justifies parent (minimal chained HotStuff rule)
-func (h *Hotstuff) verifyHotstuffRules(chain consensus.ChainHeaderReader, header *types.Header, snap *Snapshot) error {
-	ok, hqcView, hqcHash, htcView := parseSyncInfo(header)
+func (h *Hotstuff) verifyHotstuffRules(chain consensus.ChainHeaderReader, header *types.Header, snap *Snapshot, tc *hsTimeoutCert) error {
+	ok, hqcView, hqcHash, htcView, signersSet, sig, hasProof := parseSyncInfoWithProof(header)
 	if !ok {
 		// 允许缺失 SyncInfo（创世或早期块），不阻断
 		return nil
@@ -856,18 +864,33 @@ func (h *Hotstuff) verifyHotstuffRules(chain consensus.ChainHeaderReader, header
 	if hqcHash != header.ParentHash {
 		return errors.New("invalid HighQC: hash mismatch")
 	}
-	// When TC is present, view can skip  ; otherwise view should extend HighQC
-	// The view number is (htcView+1) if TC present, or (hqcView+1) otherwise
+	// Header view must be exactly derived from the proof it carries.
 	currentView := getViewFromHeader(header)
+	expectedView := hqcView + 1
 	if htcView > 0 && htcView >= hqcView {
-		// TC-based view: must be htcView+1
-		if currentView <= htcView {
-			return errors.New("invalid view: must be greater than htcView")
+		if tc == nil {
+			return errors.New("missing TimeoutCert for htcView")
 		}
-	} else {
-		// Normal case: must be hqcView+1
-		if currentView <= hqcView {
-			return errors.New("invalid view: must be greater than hqcView")
+		if tc.View != htcView {
+			return errors.New("invalid TimeoutCert view: mismatch with htcView")
+		}
+		expectedView = htcView + 1
+	}
+	if currentView != expectedView {
+		return fmt.Errorf("invalid view: have %d want %d", currentView, expectedView)
+	}
+	if h.chainConfig.IsHotstuff(header.Number) && !h.chainConfig.IsOnHotstuff(header.Number) && h.chainConfig.IsLuban(header.Number) && !hasProof {
+		return errors.New("missing HighQC aggregate proof")
+	}
+	if h.chainConfig.IsLuban(header.Number) && hasProof {
+		qc := &hs.QuorumCertPacket{
+			TargetHash:   hqcHash,
+			ViewNumber:   hqcView,
+			SignersSet:   signersSet,
+			AggregateSig: sig,
+		}
+		if !h.verifyAggregateQC(qc) {
+			return errors.New("invalid HighQC aggregate signature")
 		}
 	}
 	return nil
@@ -2514,6 +2537,15 @@ func (h *Hotstuff) Seal(chain consensus.ChainHeaderReader, block *types.Block, r
 	log.Info("[Seal] We are leader! Checking parent match with highQC", "view", currentView)
 	h.lock.RLock()
 	st = h.getHsState()
+	if h.chainConfig.IsHotstuff(header.Number) && !h.chainConfig.IsOnHotstuff(header.Number) {
+		if st == nil || st.highQC == nil || !st.highQC.hasAggregateProof() {
+			log.Warn("[Seal] EXIT - missing verified highQC after HotStuff activation",
+				"blockNumber", number,
+				"view", currentView)
+			h.lock.RUnlock()
+			return nil
+		}
+	}
 	if st != nil && st.highQC != nil {
 		if header.ParentHash != st.highQC.BlockHash {
 			// Check if highQC block actually exists (in chain or HotStuff state)
@@ -2623,6 +2655,22 @@ func (h *Hotstuff) Seal(chain consensus.ChainHeaderReader, block *types.Block, r
 			log.Info("[Seal goroutine] HighTC assembled (or no TC needed)")
 		}
 
+		headerView := getViewFromHeader(header)
+		h.lock.RLock()
+		stateView := currentView
+		if st := h.getHsState(); st != nil {
+			stateView = st.currentView
+		}
+		h.lock.RUnlock()
+		if headerView != stateView {
+			log.Warn("[Seal goroutine] EXIT - header view mismatch current view",
+				"headerView", headerView,
+				"currentView", stateView,
+				"blockNumber", header.Number.Uint64(),
+				"blockHash", header.Hash().Hex()[:10])
+			return
+		}
+
 		// Sign all the things!
 		log.Info("[Seal goroutine] Signing block header")
 		sig, err := signFn(accounts.Account{Address: val}, accounts.MimetypeParlia, HotstuffRLP(header, h.chainConfig.ChainID))
@@ -2654,10 +2702,7 @@ func (h *Hotstuff) Seal(chain consensus.ChainHeaderReader, block *types.Block, r
 			}
 
 			// Use current HotStuff view as ProposalPacket.Number (view number)
-			view := header.Number.Uint64()
-			if st := h.getHsState(); st != nil {
-				view = st.currentView
-			}
+			view := headerView
 			log.Info("[Seal goroutine] Creating proposal packet", "view", view, "blockHash", header.Hash().Hex()[:10])
 
 			prop := &hs.ProposalPacket{ParentHash: header.ParentHash, BlockHash: header.Hash(), View: view, HeaderRLP: encHead, BodyRLP: encBody}
@@ -3747,6 +3792,10 @@ type HsQC struct {
 	SignersSet types.ValidatorsBitSet
 }
 
+func (qc *HsQC) hasAggregateProof() bool {
+	return qc != nil && qc.SignersSet != 0 && len(qc.Sig) == types.BLSSignatureLength
+}
+
 type hsState struct {
 	currentView     uint64
 	highQC          *HsQC
@@ -4149,6 +4198,12 @@ func (h *Hotstuff) moveToView(view uint64) {
 		if tc, err := h.createTimeoutCert(highTCView, timeoutMapCopy); err == nil && tc != nil {
 			nv.TimeoutSignersSet = tc.SignerSet
 			nv.TimeoutAggSig = tc.AggSig
+		} else {
+			log.Warn("moveToView: failed to attach timeout certificate, clearing HighTC",
+				"view", view,
+				"highTCView", highTCView,
+				"err", err)
+			nv.HighTCView = 0
 		}
 	}
 	log.Info("moveToView: broadcasting NewView", "view", view)
