@@ -26,7 +26,6 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/gopool"
 	"github.com/ethereum/go-ethereum/common/hexutil"
-	cmath "github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
@@ -539,7 +538,7 @@ func (p *Parlia) verifyVoteAttestation(chain consensus.ChainHeaderReader, header
 	}
 
 	// The valid voted validators should be no less than 2/3 validators.
-	if len(votedAddrs) < cmath.CeilDiv(len(snap.Validators)*2, 3) {
+	if len(votedAddrs) < fastFinalityQuorum(len(snap.Validators)) {
 		return errors.New("invalid attestation, not enough validators voted")
 	}
 
@@ -1048,7 +1047,7 @@ func (p *Parlia) assembleVoteAttestation(chain consensus.ChainHeaderReader, head
 		return err
 	}
 	votes := p.VotePool.FetchVoteByBlockHash(parent.Hash())
-	if len(votes) < cmath.CeilDiv(len(snap.Validators)*2, 3) {
+	if len(votes) < fastFinalityQuorum(len(snap.Validators)) {
 		return nil
 	}
 
@@ -1294,7 +1293,7 @@ func (p *Parlia) distributeFinalityReward(chain consensus.ChainHeaderReader, sta
 				validVoteCount += 1
 			}
 		}
-		quorum := cmath.CeilDiv(len(snap.Validators)*2, 3)
+		quorum := fastFinalityQuorum(len(snap.Validators))
 		if validVoteCount > quorum {
 			accumulatedWeights[head.Coinbase] += uint64((validVoteCount - quorum) * collectAdditionalVotesRewardRatio / 100)
 		}

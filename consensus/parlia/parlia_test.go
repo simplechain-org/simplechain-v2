@@ -1,17 +1,18 @@
 package parlia
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/rand"
 	"fmt"
 	"math/big"
+	"math/bits"
 	mrand "math/rand"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
-	cmath "github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/ethereum/go-ethereum/core"
@@ -34,6 +35,10 @@ import (
 const (
 	upperLimitOfVoteBlockNumber = 11
 )
+
+func bitsCount(value uint64) int {
+	return bits.OnesCount64(value)
+}
 
 func TestImpactOfValidatorOutOfService(t *testing.T) {
 	testCases := []struct {
@@ -195,20 +200,24 @@ func randomAddress() common.Address {
 type MockBlock struct {
 	parent *MockBlock
 
-	blockNumber uint64
-	blockHash   common.Hash
-	coinbase    *MockValidator
-	td          uint64 // Total difficulty from genesis block to current block
-	attestation uint64 // Vote attestation for parent block, zero means no attestation
+	blockNumber        uint64
+	blockHash          common.Hash
+	coinbase           *MockValidator
+	td                 uint64 // Total difficulty from genesis block to current block
+	attestation        uint64 // Vote attestation for parent block, zero means no attestation
+	validatorSet       int
+	optimisticFinality bool
 }
 
 var GenesisBlock = &MockBlock{
-	parent:      nil,
-	blockNumber: 0,
-	blockHash:   common.Hash{},
-	coinbase:    nil,
-	td:          diffInTurn.Uint64(),
-	attestation: 0,
+	parent:             nil,
+	blockNumber:        0,
+	blockHash:          common.Hash{},
+	coinbase:           nil,
+	td:                 diffInTurn.Uint64(),
+	attestation:        0,
+	validatorSet:       0,
+	optimisticFinality: false,
 }
 
 func (b *MockBlock) Hash() (hash common.Hash) {
@@ -219,6 +228,8 @@ func (b *MockBlock) Hash() (hash common.Hash) {
 		b.coinbase,
 		b.td,
 		b.attestation,
+		b.validatorSet,
+		b.optimisticFinality,
 	})
 	hasher.Sum(hash[:0])
 	return hash
@@ -267,6 +278,10 @@ func (b *MockBlock) GetJustifiedNumber() uint64 {
 // GetFinalizedBlock returns highest finalized block,
 // include current block's attestation.
 func (b *MockBlock) GetFinalizedBlock() *MockBlock {
+	if b.optimisticFinality && b.parent != nil && b.attestation != 0 && bitsCount(b.attestation) >= optimisticFinalityQuorum(b.validatorSet) {
+		return b.parent
+	}
+
 	if b.blockNumber < 3 {
 		return GenesisBlock
 	}
@@ -318,11 +333,13 @@ func (v *MockValidator) Produce(attestation uint64) (*MockBlock, error) {
 	}
 
 	block := &MockBlock{
-		parent:      v.head,
-		blockNumber: v.head.blockNumber + 1,
-		coinbase:    v,
-		td:          v.head.td + 1,
-		attestation: attestation,
+		parent:             v.head,
+		blockNumber:        v.head.blockNumber + 1,
+		coinbase:           v,
+		td:                 v.head.td + 1,
+		attestation:        attestation,
+		validatorSet:       v.validatorSet,
+		optimisticFinality: v.head.optimisticFinality,
 	}
 
 	if (block.blockNumber-1)%uint64(v.validatorSet) == uint64(v.index) {
@@ -419,8 +436,10 @@ func (s ChainSimulator) Valid() bool {
 }
 
 type Coordinator struct {
-	validators   []*MockValidator
-	attestations map[common.Hash]uint64
+	validators          []*MockValidator
+	attestations        map[common.Hash]uint64
+	optimisticFinality  bool
+	attestationQuorumFn func(int) int
 }
 
 func NewCoordinator(validatorsNumber int) *Coordinator {
@@ -430,9 +449,28 @@ func NewCoordinator(validatorsNumber int) *Coordinator {
 	}
 
 	return &Coordinator{
-		validators:   validators,
-		attestations: make(map[common.Hash]uint64),
+		validators:          validators,
+		attestations:        make(map[common.Hash]uint64),
+		attestationQuorumFn: fastFinalityQuorum,
 	}
+}
+
+func NewOptimisticFinalityCoordinator(validatorsNumber int) *Coordinator {
+	coordinator := NewCoordinator(validatorsNumber)
+	coordinator.optimisticFinality = true
+	for _, validator := range coordinator.validators {
+		validator.head = &MockBlock{
+			parent:             GenesisBlock.parent,
+			blockNumber:        GenesisBlock.blockNumber,
+			blockHash:          GenesisBlock.blockHash,
+			coinbase:           GenesisBlock.coinbase,
+			td:                 GenesisBlock.td,
+			attestation:        GenesisBlock.attestation,
+			validatorSet:       validatorsNumber,
+			optimisticFinality: true,
+		}
+	}
+	return coordinator
 }
 
 // SimulateP2P simulate a P2P network
@@ -473,7 +511,7 @@ func (c *Coordinator) AggregateVotes(bs *BlockSimulator, block *MockBlock) error
 		count++
 	}
 
-	if count >= cmath.CeilDiv(len(c.validators)*2, 3) {
+	if count >= c.attestationQuorumFn(len(c.validators)) {
 		c.attestations[block.blockHash] = attestation
 	}
 
@@ -630,6 +668,122 @@ func TestSimulateP2P(t *testing.T) {
 		if c.CheckChain() == false {
 			t.Fatalf("[Testcase %d] chain not works as expected", index)
 		}
+	}
+}
+
+func TestOptimisticFinalityWith13Validators(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name              string
+		voteMap           uint64
+		expectedFinalized uint64
+	}{
+		{
+			name:              "eleven votes optimistic finalize parent",
+			voteMap:           0x7ff,
+			expectedFinalized: 1,
+		},
+		{
+			name:              "ten votes only justify parent",
+			voteMap:           0x3ff,
+			expectedFinalized: 0,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			c := NewOptimisticFinalityCoordinator(13)
+			err := c.SimulateP2P(ChainSimulator{
+				{1, 0, 0x1fff, tc.voteMap},
+				{2, 1, 0x1fff, 0x1fff},
+			})
+			if err != nil {
+				t.Fatalf("simulate P2P error: %v", err)
+			}
+
+			for _, val := range c.validators {
+				if val.head.GetFinalizedBlock().blockNumber != tc.expectedFinalized {
+					t.Fatalf("validator %d finalized block mismatch, want %d got %d",
+						val.index, tc.expectedFinalized, val.head.GetFinalizedBlock().blockNumber)
+				}
+			}
+		})
+	}
+}
+
+func TestFastFinalityFallbackWith13Validators(t *testing.T) {
+	t.Parallel()
+
+	c := NewOptimisticFinalityCoordinator(13)
+	err := c.SimulateP2P(ChainSimulator{
+		{1, 0, 0x1fff, 0x1ff},
+		{2, 1, 0x1fff, 0x1ff},
+		{3, 2, 0x1fff, 0x1fff},
+	})
+	if err != nil {
+		t.Fatalf("simulate P2P error: %v", err)
+	}
+
+	for _, val := range c.validators {
+		if finalized := val.head.GetFinalizedBlock().blockNumber; finalized != 1 {
+			t.Fatalf("validator %d finalized block mismatch, want 1 got %d", val.index, finalized)
+		}
+	}
+}
+
+func TestSnapshotUpdateAttestationOptimisticFinality(t *testing.T) {
+	t.Parallel()
+
+	fermiTime := uint64(10)
+	chainConfig := *params.ParliaTestChainConfig
+	chainConfig.FermiTime = &fermiTime
+
+	parent := &types.Header{
+		Number: big.NewInt(1),
+		Time:   fermiTime,
+	}
+	parentHash := parent.Hash()
+	header := &types.Header{
+		ParentHash: parentHash,
+		Number:     big.NewInt(2),
+		Time:       fermiTime,
+		Extra:      make([]byte, extraVanity),
+	}
+	attestation := &types.VoteAttestation{
+		VoteAddressSet: types.ValidatorsBitSet(0x7ff),
+		Data: &types.VoteData{
+			SourceNumber: 0,
+			SourceHash:   GenesisBlock.blockHash,
+			TargetNumber: parent.Number.Uint64(),
+			TargetHash:   parentHash,
+		},
+	}
+	buf := new(bytes.Buffer)
+	if err := rlp.Encode(buf, attestation); err != nil {
+		t.Fatalf("encode attestation error: %v", err)
+	}
+	header.Extra = append(header.Extra, buf.Bytes()...)
+	header.Extra = append(header.Extra, make([]byte, extraSeal)...)
+
+	validators := make([]common.Address, 13)
+	for i := range validators {
+		validators[i] = common.BigToAddress(big.NewInt(int64(i + 1)))
+	}
+	snap := newSnapshot(&params.ParliaConfig{}, nil, 1, parentHash, validators, nil, nil)
+	snap.updateAttestation(header, &chainConfig)
+
+	if snap.Attestation == nil {
+		t.Fatal("expected snapshot attestation")
+	}
+	if snap.Attestation.SourceNumber != parent.Number.Uint64() || snap.Attestation.TargetNumber != parent.Number.Uint64() {
+		t.Fatalf("unexpected attestation numbers, source %d target %d", snap.Attestation.SourceNumber, snap.Attestation.TargetNumber)
+	}
+	if snap.Attestation.SourceHash != parentHash || snap.Attestation.TargetHash != parentHash {
+		t.Fatalf("unexpected attestation hashes, source %s target %s", snap.Attestation.SourceHash, snap.Attestation.TargetHash)
 	}
 }
 
