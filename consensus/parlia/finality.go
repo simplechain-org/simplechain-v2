@@ -21,6 +21,13 @@ func isOptimisticFinalityActive(chainConfig *params.ChainConfig, header *types.H
 	return chainConfig != nil && header != nil && header.Number != nil && chainConfig.IsFermi(header.Number, header.Time)
 }
 
+func finalityRewardQuorum(chainConfig *params.ChainConfig, header *types.Header, validators int) int {
+	if isOptimisticFinalityActive(chainConfig, header) {
+		return optimisticFinalityQuorum(validators)
+	}
+	return fastFinalityQuorum(validators)
+}
+
 func attestationVoteCount(attestation *types.VoteAttestation) int {
 	if attestation == nil {
 		return 0

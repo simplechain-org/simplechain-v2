@@ -1299,7 +1299,7 @@ func (p *Parlia) distributeFinalityReward(chain consensus.ChainHeaderReader, sta
 				validVoteCount += 1
 			}
 		}
-		quorum := fastFinalityQuorum(len(snap.Validators))
+		quorum := finalityRewardQuorum(chain.Config(), head, len(snap.Validators))
 		if validVoteCount > quorum {
 			accumulatedWeights[head.Coinbase] += uint64((validVoteCount - quorum) * collectAdditionalVotesRewardRatio / 100)
 		}

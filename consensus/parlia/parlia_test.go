@@ -787,6 +787,24 @@ func TestSnapshotUpdateAttestationOptimisticFinality(t *testing.T) {
 	}
 }
 
+func TestFinalityRewardQuorumUsesOptimisticFinalityAfterFermi(t *testing.T) {
+	t.Parallel()
+
+	fermiTime := uint64(10)
+	chainConfig := *params.ParliaTestChainConfig
+	chainConfig.FermiTime = &fermiTime
+	header := &types.Header{Number: big.NewInt(1), Time: fermiTime - 1}
+
+	if quorum := finalityRewardQuorum(&chainConfig, header, 13); quorum != fastFinalityQuorum(13) {
+		t.Fatalf("unexpected pre-Fermi finality reward quorum, want %d got %d", fastFinalityQuorum(13), quorum)
+	}
+
+	header.Time = fermiTime
+	if quorum := finalityRewardQuorum(&chainConfig, header, 13); quorum != optimisticFinalityQuorum(13) {
+		t.Fatalf("unexpected post-Fermi finality reward quorum, want %d got %d", optimisticFinalityQuorum(13), quorum)
+	}
+}
+
 var (
 	// testKey is a private key to use for funding a tester account.
 	testKey, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
