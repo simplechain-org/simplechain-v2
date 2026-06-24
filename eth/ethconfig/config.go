@@ -115,6 +115,14 @@ type Config struct {
 	DisableSnapProtocol bool // Whether disable snap protocol
 	RangeLimit          bool
 
+	// BlockChunkConfig enables the Bsc3 block chunk propagation path for large
+	// blocks.  When the RLP-encoded block body exceeds BlockChunkThreshold
+	// bytes, the leader distributes the block in chunks via a deterministic
+	// fanout tree among EVN peers instead of broadcasting the full block to
+	// everyone.
+	BlockChunkEnable    bool
+	BlockChunkThreshold int // minimum serialized block body size in bytes; 0 = use bsc default
+
 	// Deprecated: use 'TransactionHistory' instead.
 	TxLookupLimit uint64 `toml:",omitempty"` // The maximum number of blocks from head whose tx indices are reserved.
 

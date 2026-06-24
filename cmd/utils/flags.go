@@ -108,6 +108,16 @@ var (
 		Usage:    "Enable directly broadcast mined block to all peers",
 		Category: flags.EthCategory,
 	}
+	BlockChunkEnableFlag = &cli.BoolFlag{
+		Name:     "blockchunk",
+		Usage:    "Enable Bsc3 block chunk propagation for large blocks (distributes big blocks as chunks via a fanout tree among EVN peers)",
+		Category: flags.EthCategory,
+	}
+	BlockChunkThresholdFlag = &cli.IntFlag{
+		Name:     "blockchunk.threshold",
+		Usage:    "Minimum RLP-encoded block body size in bytes to trigger chunk propagation (0 = use default 512KB)",
+		Category: flags.EthCategory,
+	}
 	DisableSnapProtocolFlag = &cli.BoolFlag{
 		Name:     "disablesnapprotocol",
 		Usage:    "Disable snap protocol",
@@ -2038,6 +2048,12 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	}
 	if ctx.IsSet(RangeLimitFlag.Name) {
 		cfg.RangeLimit = ctx.Bool(RangeLimitFlag.Name)
+	}
+	if ctx.IsSet(BlockChunkEnableFlag.Name) {
+		cfg.BlockChunkEnable = ctx.Bool(BlockChunkEnableFlag.Name)
+	}
+	if ctx.IsSet(BlockChunkThresholdFlag.Name) {
+		cfg.BlockChunkThreshold = ctx.Int(BlockChunkThresholdFlag.Name)
 	}
 	if ctx.IsSet(CacheNoPrefetchFlag.Name) {
 		cfg.NoPrefetch = ctx.Bool(CacheNoPrefetchFlag.Name)

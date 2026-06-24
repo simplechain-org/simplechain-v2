@@ -143,6 +143,7 @@ type handlerConfig struct {
 	EnableEVNFeatures         bool
 	EVNNodeIdsWhitelist       []enode.ID
 	ProxyedValidatorAddresses []common.Address
+	ChunkConfig               bsc.ChunkConfig // Block chunk propagation config (Bsc3)
 }
 
 type handler struct {
@@ -185,6 +186,11 @@ type handler struct {
 	voteMonitorSub event.Subscription
 
 	requiredBlocks map[uint64]common.Hash
+
+	// chunkPool holds the Bsc3 block chunk reassembly state.  May be nil when
+	// chunk propagation is disabled.
+	chunkPool   *bsc.ChunkPool
+	chunkConfig bsc.ChunkConfig
 
 	// channels for fetcher, syncer, txsyncLoop
 	quitSync chan struct{}
@@ -387,6 +393,22 @@ func newHandler(config *handlerConfig) (*handler, error) {
 		return errors
 	}
 	h.txFetcher = fetcher.NewTxFetcher(h.txpool.Has, addTxs, fetchTx, h.removePeer)
+	// Bsc3 block chunk propagation: set up the chunk pool if enabled.  The
+	// pool delivers reassembled blocks to the same broadcast-with-check path
+	// used by the fetcher, so reconstructed blocks are imported and re-broadcast
+	// to non-EVN peers through the normal sqrt(peers) full-block path.
+	h.chunkConfig = config.ChunkConfig
+	if h.chunkConfig.Enable {
+		h.chunkPool = bsc.NewChunkPool(h.chunkConfig,
+			func(block *types.Block) {
+				broadcastBlockWithCheck(block, true)
+			},
+			func(hash common.Hash, number uint64) bool {
+				return h.chain.HasBlock(hash, number)
+			})
+		log.Info("Bsc3 block chunk propagation enabled", "threshold", h.chunkConfig.Threshold)
+	}
+
 	h.chainSync = newChainSyncer(h)
 	return h, nil
 }
@@ -827,6 +849,18 @@ func (h *handler) BroadcastBlock(block *types.Block, propagate bool) {
 		// check if the block should be broadcast to more peers in EVN
 		var morePeers []*ethPeer
 		if h.needFullBroadcastInEVN(block) {
+			// Try the Bsc3 chunk propagation path for large blocks.  If the
+			// block is big enough and chunking is enabled, distribute chunks
+			// via a deterministic fanout tree among EVN peers instead of
+			// sending full blocks to everyone.
+			if h.chunkPool != nil {
+				if pkts, err := bsc.SplitBlock(block, h.chunkConfig); err == nil && pkts != nil {
+					h.distributeBlockChunks(peers, pkts)
+					log.Debug("Propagated block via chunk path", "hash", hash, "chunks", len(pkts), "recipients", len(transfer), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
+					return
+				}
+			}
+			// Fallback: full-block broadcast to all EVN peers.
 			for i := len(transfer); i < len(peers); i++ {
 				if peers[i].EVNPeerFlag.Load() {
 					morePeers = append(morePeers, peers[i])
