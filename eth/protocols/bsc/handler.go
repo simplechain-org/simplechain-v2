@@ -38,12 +38,18 @@ type Backend interface {
 	// the remote peer. Only packets not consumed by the protocol handler will
 	// be forwarded to the backend.
 	Handle(peer *Peer, packet Packet) error
+
+	// ChunkPool returns the block chunk pool used by the Bsc3 block chunk
+	// propagation path.  Implementations that do not support Bsc3 may return
+	// nil; callers must guard against that.
+	ChunkPool() *ChunkPool
 }
 
 // MakeProtocols constructs the P2P protocol definitions for `bsc`.
 func MakeProtocols(backend Backend) []p2p.Protocol {
 	protocols := make([]p2p.Protocol, len(ProtocolVersions))
 	for i, version := range ProtocolVersions {
+		version := version // capture for the closure below
 		protocols[i] = p2p.Protocol{
 			Name:    ProtocolName,
 			Version: version,
@@ -94,6 +100,24 @@ var bsc2 = map[uint64]msgHandler{
 	BlocksByRangeMsg:    handleBlocksByRange,
 }
 
+var bsc3 = mergeHandlers(bsc2, map[uint64]msgHandler{
+	BlockChunkMsg:     handleBlockChunk,
+	GetBlockChunksMsg: handleGetBlockChunks,
+})
+
+// mergeHandlers returns a new map combining base with extra.  It is used to
+// build the cumulative handler tables for successive protocol versions.
+func mergeHandlers(base, extra map[uint64]msgHandler) map[uint64]msgHandler {
+	out := make(map[uint64]msgHandler, len(base)+len(extra))
+	for code, h := range base {
+		out[code] = h
+	}
+	for code, h := range extra {
+		out[code] = h
+	}
+	return out
+}
+
 // handleMessage is invoked whenever an inbound message is received from a
 // remote peer on the `bsc` protocol. The remote connection is torn down upon
 // returning any error.
@@ -108,9 +132,14 @@ func handleMessage(backend Backend, peer *Peer) error {
 	}
 	defer msg.Discard()
 
-	var handlers = bsc1
-	if peer.Version() >= Bsc2 {
+	var handlers map[uint64]msgHandler
+	switch {
+	case peer.Version() >= Bsc3:
+		handlers = bsc3
+	case peer.Version() >= Bsc2:
 		handlers = bsc2
+	default:
+		handlers = bsc1
 	}
 
 	// Track the amount of time it takes to serve the request and run the handler

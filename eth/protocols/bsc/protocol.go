@@ -12,6 +12,7 @@ import (
 const (
 	Bsc1 = 1
 	Bsc2 = 2
+	Bsc3 = 3 // adds block chunk propagation for large blocks
 )
 
 // ProtocolName is the official short name of the `bsc` protocol used during
@@ -20,11 +21,11 @@ const ProtocolName = "bsc"
 
 // ProtocolVersions are the supported versions of the `bsc` protocol (first
 // is primary).
-var ProtocolVersions = []uint{Bsc1, Bsc2}
+var ProtocolVersions = []uint{Bsc1, Bsc2, Bsc3}
 
-// protocolLengths are the number of implemented message corresponding to
+// protocolLengths are the number of implemented messages corresponding to
 // different protocol versions.
-var protocolLengths = map[uint]uint64{Bsc1: 2, Bsc2: 4}
+var protocolLengths = map[uint]uint64{Bsc1: 2, Bsc2: 4, Bsc3: 6}
 
 // maxMessageSize is the maximum cap on the size of a protocol message.
 const maxMessageSize = 10 * 1024 * 1024
@@ -34,6 +35,8 @@ const (
 	VotesMsg            = 0x01
 	GetBlocksByRangeMsg = 0x02 // it can request (StartBlockHeight-Count, StartBlockHeight] range blocks from remote peer
 	BlocksByRangeMsg    = 0x03 // the replied blocks from remote peer
+	BlockChunkMsg       = 0x04 // a single chunk of a sharded block (Bsc3)
+	GetBlockChunksMsg   = 0x05 // request missing chunks of a sharded block (Bsc3)
 )
 
 var defaultExtra = []byte{0x00}
@@ -106,3 +109,34 @@ type BlocksByRangePacket struct {
 
 func (*BlocksByRangePacket) Name() string { return "BlocksByRange" }
 func (*BlocksByRangePacket) Kind() byte   { return BlocksByRangeMsg }
+
+// BlockChunkPacket is a single chunk of a sharded large block in the Bsc3
+// block chunk propagation protocol.  The leader splits the RLP-encoded block
+// body into `ChunkCount` fixed-size chunks and distributes them (optionally
+// through a deterministic fanout tree) among the EVN peers.  Receivers collect
+// chunks until they have all of them, then reassemble the block.
+//
+// MVP note: the first phase does NOT use erasure coding.  A later phase can
+// replace this packet with a shard-based packet carrying K/M parameters.
+type BlockChunkPacket struct {
+	BlockHash   common.Hash // hash of the full block this chunk belongs to
+	Number      uint64      // block number, used for quick filtering
+	Header      *types.Header
+	ChunkIndex  uint   // 0-based index of this chunk
+	ChunkCount  uint   // total number of chunks the block was split into
+	Payload     []byte // raw chunk payload (a slice of the serialized block body)
+	PayloadHash common.Hash
+}
+
+func (*BlockChunkPacket) Name() string { return "BlockChunk" }
+func (*BlockChunkPacket) Kind() byte   { return BlockChunkMsg }
+
+// GetBlockChunksPacket requests the missing chunks of a sharded block from a
+// peer that is known to have (or is expected to have) them.
+type GetBlockChunksPacket struct {
+	BlockHash      common.Hash
+	MissingIndexes []uint // 0-based indexes of the chunks the sender still needs
+}
+
+func (*GetBlockChunksPacket) Name() string { return "GetBlockChunks" }
+func (*GetBlockChunksPacket) Kind() byte   { return GetBlockChunksMsg }

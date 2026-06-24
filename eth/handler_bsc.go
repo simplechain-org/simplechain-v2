@@ -53,9 +53,21 @@ func (h *bscHandler) Handle(peer *bsc.Peer, packet bsc.Packet) error {
 	case *bsc.VotesPacket:
 		return h.handleVotesBroadcast(peer, packet.Votes)
 
+	case *bsc.BlockChunkPacket:
+		// The chunk has already been fed to the ChunkPool by the protocol
+		// handler.  Here we just relay it further down the fanout tree.
+		(*handler)(h).relayBlockChunk(peer, packet)
+		return nil
+
 	default:
 		return fmt.Errorf("unexpected bsc packet type: %T", packet)
 	}
+}
+
+// ChunkPool implements the bsc.Backend interface, exposing the shared chunk
+// pool to the protocol handler.
+func (h *bscHandler) ChunkPool() *bsc.ChunkPool {
+	return h.chunkPool
 }
 
 // handleVotesBroadcast is invoked from a peer's message handler when it transmits a
