@@ -32,6 +32,10 @@ func (b *mockBackend) Handle(peer *Peer, packet Packet) error {
 	return nil
 }
 
+func (b *mockBackend) ChunkPool() *ChunkPool {
+	return nil
+}
+
 // mockMsg implements the Decoder interface for testing
 type mockMsg struct {
 	code uint64
@@ -45,6 +49,10 @@ func (m *mockMsg) Decode(val interface{}) error {
 		*v = *m.data.(*GetBlocksByRangePacket)
 	case *BlocksByRangePacket:
 		*v = *m.data.(*BlocksByRangePacket)
+	case *BlockChunkPacket:
+		*v = *m.data.(*BlockChunkPacket)
+	case *GetBlockChunksPacket:
+		*v = *m.data.(*GetBlockChunksPacket)
 	}
 	return nil
 }

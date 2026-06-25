@@ -11,6 +11,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/klauspost/reedsolomon"
 )
 
 // chunkSize is the target size (in bytes) of each block chunk payload.  When a
@@ -31,6 +32,12 @@ const maxReassemblyAge = 2 * time.Minute
 // the pool (a safety valve against memory blowup under attack).
 const maxReassemblies = 64
 
+const (
+	defaultParityShards = 4
+	maxShardCount       = 256
+	maxBlockShardBytes  = 32 * 1024 * 1024
+)
+
 // ChunkConfig carries the tunable parameters for the block chunk propagation.
 // It is plumbed in from the eth layer so that tests and the node config can
 // override the defaults.
@@ -41,6 +48,9 @@ type ChunkConfig struct {
 	// path.  Blocks smaller than this are broadcast via the legacy full-block
 	// path.  If zero, BlockChunkThreshold is used.
 	Threshold int
+	// ParityShards is the number of Reed-Solomon parity shards produced for a
+	// chunked block. If zero, a conservative default is used.
+	ParityShards int
 }
 
 // DefaultChunkConfig returns a conservative default chunk config (disabled).
@@ -51,12 +61,15 @@ func DefaultChunkConfig() ChunkConfig {
 // Reassembly holds the collected chunks for a single block together with the
 // metadata needed to reconstruct it once all chunks arrive.
 type Reassembly struct {
-	blockHash  common.Hash
-	number     uint64
-	header     *types.Header
-	chunkCount uint
-	chunks     map[uint][]byte
-	createdAt  time.Time
+	blockHash        common.Hash
+	number           uint64
+	headerHash       common.Hash
+	chunkCount       uint
+	dataShardCount   uint
+	parityShardCount uint
+	originalSize     uint64
+	chunks           map[uint][]byte
+	createdAt        time.Time
 }
 
 // ChunkPool collects incoming block chunks and, once a full set is available,
@@ -96,21 +109,43 @@ func (p *ChunkPool) AddChunk(pkt *BlockChunkPacket) bool {
 	if p == nil || !p.config.Enable {
 		return false
 	}
+	BlockChunkShardInMeter.Mark(1)
 	// Defensive validation.
 	if pkt == nil || pkt.Header == nil || pkt.ChunkCount == 0 {
+		BlockChunkShardDropMeter.Mark(1)
 		return false
 	}
-	if pkt.ChunkIndex >= pkt.ChunkCount {
+	if pkt.ChunkIndex >= pkt.ChunkCount || pkt.DataShardCount == 0 || pkt.ParityShardCount == 0 {
+		BlockChunkShardDropMeter.Mark(1)
+		return false
+	}
+	if pkt.ChunkCount != pkt.DataShardCount+pkt.ParityShardCount {
+		BlockChunkShardDropMeter.Mark(1)
+		return false
+	}
+	if pkt.ChunkCount > maxShardCount || len(pkt.Payload) == 0 || len(pkt.Payload) > chunkSize {
+		BlockChunkShardDropMeter.Mark(1)
+		return false
+	}
+	if pkt.OriginalSize == 0 || pkt.OriginalSize > maxBlockShardBytes {
+		BlockChunkShardDropMeter.Mark(1)
 		return false
 	}
 	// Hash sanity: the advertised block hash must match the header hash.
 	if pkt.BlockHash == (common.Hash{}) || pkt.BlockHash != pkt.Header.Hash() {
 		log.Debug("Drop chunk with mismatched block hash", "hash", pkt.BlockHash, "headerHash", pkt.Header.Hash())
+		BlockChunkShardDropMeter.Mark(1)
+		return false
+	}
+	if pkt.Number != pkt.Header.Number.Uint64() {
+		log.Debug("Drop chunk with mismatched block number", "hash", pkt.BlockHash, "number", pkt.Number, "headerNumber", pkt.Header.Number)
+		BlockChunkShardDropMeter.Mark(1)
 		return false
 	}
 	// Payload hash sanity.
 	if crypto.Keccak256Hash(pkt.Payload) != pkt.PayloadHash {
 		log.Debug("Drop chunk with bad payload hash", "hash", pkt.BlockHash, "index", pkt.ChunkIndex)
+		BlockChunkShardDropMeter.Mark(1)
 		return false
 	}
 	// Already-known block: skip silently.
@@ -129,33 +164,37 @@ func (p *ChunkPool) AddChunk(pkt *BlockChunkPacket) bool {
 		if len(p.pending) >= maxReassemblies {
 			p.mu.Unlock()
 			log.Debug("Chunk pool full, dropping chunk", "hash", pkt.BlockHash, "index", pkt.ChunkIndex)
+			BlockChunkShardDropMeter.Mark(1)
 			return false
 		}
 		r = &Reassembly{
-			blockHash:  pkt.BlockHash,
-			number:     pkt.Number,
-			header:     pkt.Header,
-			chunkCount: pkt.ChunkCount,
-			chunks:     make(map[uint][]byte),
-			createdAt:  time.Now(),
+			blockHash:        pkt.BlockHash,
+			number:           pkt.Number,
+			headerHash:       pkt.Header.Hash(),
+			chunkCount:       pkt.ChunkCount,
+			dataShardCount:   pkt.DataShardCount,
+			parityShardCount: pkt.ParityShardCount,
+			originalSize:     pkt.OriginalSize,
+			chunks:           make(map[uint][]byte),
+			createdAt:        time.Now(),
 		}
 		p.pending[pkt.BlockHash] = r
+	}
+	if !r.matches(pkt) {
+		p.mu.Unlock()
+		log.Debug("Drop chunk with inconsistent metadata", "hash", pkt.BlockHash, "index", pkt.ChunkIndex)
+		BlockChunkShardDropMeter.Mark(1)
+		return false
 	}
 	// If we already have all chunks, ignore.
 	if _, exists := r.chunks[pkt.ChunkIndex]; exists {
 		p.mu.Unlock()
 		return false
 	}
-	// If the total/chunkCount changed mid-stream (shouldn't happen for a valid
-	// producer), reset the collection.
-	if r.chunkCount != pkt.ChunkCount {
-		r.chunkCount = pkt.ChunkCount
-		r.chunks = make(map[uint][]byte)
-	}
 	// Copy the payload to avoid aliasing the caller's buffer.
 	r.chunks[pkt.ChunkIndex] = append([]byte(nil), pkt.Payload...)
 
-	complete := len(r.chunks) == int(r.chunkCount)
+	complete := len(r.chunks) >= int(r.dataShardCount)
 	if !complete {
 		p.mu.Unlock()
 		return true
@@ -167,13 +206,45 @@ func (p *ChunkPool) AddChunk(pkt *BlockChunkPacket) bool {
 	block, err := reassemble(r)
 	if err != nil {
 		log.Warn("Failed to reassemble block from chunks", "hash", pkt.BlockHash, "err", err)
+		BlockChunkReassembleErrors.Mark(1)
 		return false
 	}
+	BlockChunkReassembleTimer.UpdateSince(r.createdAt)
+	BlockChunkReassembleMeter.Mark(1)
 	log.Debug("Reassembled block from chunks", "hash", pkt.BlockHash, "number", pkt.Number, "chunks", r.chunkCount)
 	if p.deliver != nil {
 		p.deliver(block)
 	}
 	return true
+}
+
+func (r *Reassembly) matches(pkt *BlockChunkPacket) bool {
+	return r.number == pkt.Number &&
+		r.headerHash == pkt.Header.Hash() &&
+		r.chunkCount == pkt.ChunkCount &&
+		r.dataShardCount == pkt.DataShardCount &&
+		r.parityShardCount == pkt.ParityShardCount &&
+		r.originalSize == pkt.OriginalSize
+}
+
+// MissingChunks returns missing shard indexes for a partially reassembled block.
+func (p *ChunkPool) MissingChunks(hash common.Hash) []uint {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	r := p.pending[hash]
+	if r == nil {
+		return nil
+	}
+	missing := make([]uint, 0, r.chunkCount-uint(len(r.chunks)))
+	for i := uint(0); i < r.chunkCount; i++ {
+		if _, ok := r.chunks[i]; !ok {
+			missing = append(missing, i)
+		}
+	}
+	return missing
 }
 
 // gcLocked removes stale reassemblies.  Caller must hold p.mu.
@@ -186,10 +257,10 @@ func (p *ChunkPool) gcLocked() {
 	}
 }
 
-// SplitBlock serializes `block` into a slice of BlockChunkPacket suitable for
-// fanout distribution.  Only the body (transactions, uncles, withdrawals,
-// sidecars) is chunked; the header is replicated in every packet so that
-// receivers can validate the seal immediately and reconstruct the block hash.
+// SplitBlock serializes `block` into Reed-Solomon shards suitable for fanout
+// distribution. Only the body (transactions, uncles, withdrawals, sidecars) is
+// encoded; the header is replicated in every packet so receivers can validate
+// the block hash early.
 //
 // If the serialized body is smaller than the configured threshold, nil is
 // returned to signal the caller that the legacy full-block path should be
@@ -217,48 +288,75 @@ func SplitBlock(block *types.Block, cfg ChunkConfig) ([]*BlockChunkPacket, error
 		return nil, nil
 	}
 
-	count := uint(math.Ceil(float64(len(enc)) / float64(chunkSize)))
-	if count == 0 {
-		count = 1
+	dataShards := uint(math.Ceil(float64(len(enc)) / float64(chunkSize)))
+	if dataShards == 0 {
+		dataShards = 1
+	}
+	parityShards := cfg.ParityShards
+	if parityShards == 0 {
+		parityShards = defaultParityShards
+	}
+	if parityShards < 0 {
+		return nil, errors.New("negative parity shard count")
+	}
+	count := dataShards + uint(parityShards)
+	if count > maxShardCount || uint64(dataShards)*chunkSize > maxBlockShardBytes {
+		return nil, errors.New("block shard count exceeds limit")
+	}
+	encShards, err := reedsolomon.New(int(dataShards), parityShards)
+	if err != nil {
+		return nil, err
+	}
+	shards, err := encShards.Split(enc)
+	if err != nil {
+		return nil, err
+	}
+	if err := encShards.Encode(shards); err != nil {
+		return nil, err
 	}
 	hash := block.Hash()
 	number := block.NumberU64()
 	pkts := make([]*BlockChunkPacket, count)
 	for i := uint(0); i < count; i++ {
-		start := int(i) * chunkSize
-		end := start + chunkSize
-		if end > len(enc) {
-			end = len(enc)
-		}
-		payload := enc[start:end]
+		payload := shards[i]
 		pkts[i] = &BlockChunkPacket{
-			BlockHash:   hash,
-			Number:      number,
-			Header:      block.Header(),
-			ChunkIndex:  i,
-			ChunkCount:  count,
-			Payload:     payload,
-			PayloadHash: crypto.Keccak256Hash(payload),
+			BlockHash:        hash,
+			Number:           number,
+			Header:           block.Header(),
+			ChunkIndex:       i,
+			ChunkCount:       count,
+			DataShardCount:   dataShards,
+			ParityShardCount: uint(parityShards),
+			OriginalSize:     uint64(len(enc)),
+			Payload:          payload,
+			PayloadHash:      crypto.Keccak256Hash(payload),
 		}
 	}
 	return pkts, nil
 }
 
-// reassemble stitches the chunks back together and decodes the block.
+// reassemble reconstructs the encoded data from any dataShardCount shards and
+// decodes the block.
 func reassemble(r *Reassembly) (*types.Block, error) {
-	// Concatenate chunks in order.
-	var total int
-	for _, c := range r.chunks {
-		total += len(c)
-	}
-	enc := make([]byte, 0, total)
+	shards := make([][]byte, r.chunkCount)
 	for i := uint(0); i < r.chunkCount; i++ {
-		c, ok := r.chunks[i]
-		if !ok {
-			return nil, errors.New("missing chunk during reassembly")
-		}
-		enc = append(enc, c...)
+		shards[i] = r.chunks[i]
 	}
+	encShards, err := reedsolomon.New(int(r.dataShardCount), int(r.parityShardCount))
+	if err != nil {
+		return nil, err
+	}
+	if err := encShards.Reconstruct(shards); err != nil {
+		return nil, err
+	}
+	var enc []byte
+	for i := uint(0); i < r.dataShardCount; i++ {
+		enc = append(enc, shards[i]...)
+	}
+	if uint64(len(enc)) < r.originalSize {
+		return nil, errors.New("reconstructed data shorter than original size")
+	}
+	enc = enc[:r.originalSize]
 	var body BlockData
 	if err := rlp.DecodeBytes(enc, &body); err != nil {
 		return nil, err

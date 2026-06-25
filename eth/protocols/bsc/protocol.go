@@ -110,22 +110,21 @@ type BlocksByRangePacket struct {
 func (*BlocksByRangePacket) Name() string { return "BlocksByRange" }
 func (*BlocksByRangePacket) Kind() byte   { return BlocksByRangeMsg }
 
-// BlockChunkPacket is a single chunk of a sharded large block in the Bsc3
-// block chunk propagation protocol.  The leader splits the RLP-encoded block
-// body into `ChunkCount` fixed-size chunks and distributes them (optionally
-// through a deterministic fanout tree) among the EVN peers.  Receivers collect
-// chunks until they have all of them, then reassemble the block.
-//
-// MVP note: the first phase does NOT use erasure coding.  A later phase can
-// replace this packet with a shard-based packet carrying K/M parameters.
+// BlockChunkPacket is a single Reed-Solomon shard of a large block in the Bsc3
+// block propagation protocol. The leader encodes the RLP-encoded block body
+// into DataShardCount data shards and ParityShardCount parity shards. Receivers
+// can reconstruct the block after collecting any DataShardCount valid shards.
 type BlockChunkPacket struct {
-	BlockHash   common.Hash // hash of the full block this chunk belongs to
-	Number      uint64      // block number, used for quick filtering
-	Header      *types.Header
-	ChunkIndex  uint   // 0-based index of this chunk
-	ChunkCount  uint   // total number of chunks the block was split into
-	Payload     []byte // raw chunk payload (a slice of the serialized block body)
-	PayloadHash common.Hash
+	BlockHash        common.Hash // hash of the full block this shard belongs to
+	Number           uint64      // block number, used for quick filtering
+	Header           *types.Header
+	ChunkIndex       uint   // 0-based shard index
+	ChunkCount       uint   // total shard count, data + parity
+	DataShardCount   uint   // number of shards required to reconstruct
+	ParityShardCount uint   // number of parity shards
+	OriginalSize     uint64 // original RLP-encoded block data size
+	Payload          []byte // Reed-Solomon shard payload
+	PayloadHash      common.Hash
 }
 
 func (*BlockChunkPacket) Name() string { return "BlockChunk" }

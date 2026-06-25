@@ -42,10 +42,9 @@ func handleGetBlockChunks(backend Backend, msg Decoder, peer *Peer) error {
 	if block == nil {
 		return nil
 	}
-	// Re-split the block to recover the original chunks.  Use a config that
-	// always splits (threshold=0 means "always chunk") so that the indexes
-	// line up with what the requester expects.
-	pkts, err := SplitBlock(block, ChunkConfig{Enable: true, Threshold: 0})
+	// Re-split the block to recover the original shards. Use threshold=1 so
+	// even small blocks can serve explicit shard requests.
+	pkts, err := SplitBlock(block, ChunkConfig{Enable: true, Threshold: 1})
 	if err != nil {
 		return err
 	}

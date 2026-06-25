@@ -849,26 +849,31 @@ func (h *handler) BroadcastBlock(block *types.Block, propagate bool) {
 		// check if the block should be broadcast to more peers in EVN
 		var morePeers []*ethPeer
 		if h.needFullBroadcastInEVN(block) {
+			chunkPropagated := false
 			// Try the Bsc3 chunk propagation path for large blocks.  If the
 			// block is big enough and chunking is enabled, distribute chunks
 			// via a deterministic fanout tree among EVN peers instead of
 			// sending full blocks to everyone.
 			if h.chunkPool != nil {
 				if pkts, err := bsc.SplitBlock(block, h.chunkConfig); err == nil && pkts != nil {
-					h.distributeBlockChunks(peers, pkts)
-					log.Debug("Propagated block via chunk path", "hash", hash, "chunks", len(pkts), "recipients", len(transfer), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
-					return
+					chunkPropagated = h.distributeBlockChunks(peers, pkts)
+					log.Debug("Propagated block via chunk path", "hash", hash, "shards", len(pkts), "recipients", len(transfer), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
+				} else if err != nil {
+					log.Debug("Failed to split block for chunk propagation", "hash", hash, "err", err)
 				}
 			}
-			// Fallback: full-block broadcast to all EVN peers.
-			for i := len(transfer); i < len(peers); i++ {
-				if peers[i].EVNPeerFlag.Load() {
-					morePeers = append(morePeers, peers[i])
+			if !chunkPropagated {
+				bsc.BlockChunkFallbackMeter.Mark(1)
+				// Fallback: full-block broadcast to all EVN peers.
+				for i := len(transfer); i < len(peers); i++ {
+					if peers[i].EVNPeerFlag.Load() {
+						morePeers = append(morePeers, peers[i])
+					}
 				}
-			}
-			for _, peer := range morePeers {
-				log.Debug("broadcast block to extra peer", "hash", hash, "peer", peer.ID(), "EVNPeerFlag", peer.EVNPeerFlag.Load())
-				peer.AsyncSendNewBlock(block, td)
+				for _, peer := range morePeers {
+					log.Debug("broadcast block to extra peer", "hash", hash, "peer", peer.ID(), "EVNPeerFlag", peer.EVNPeerFlag.Load())
+					peer.AsyncSendNewBlock(block, td)
+				}
 			}
 		}
 

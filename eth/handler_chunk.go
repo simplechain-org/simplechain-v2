@@ -51,17 +51,11 @@ func hashSeed(id string, seed uint64) uint64 {
 	return binary.BigEndian.Uint64(h[:8])
 }
 
-// distributeBlockChunks fans out block chunks to EVN peers using a two-level
-// tree.  The leader sends different chunk subsets to `ceil(sqrt(N))` first-
-// level peers; each first-level peer is responsible for relaying to a small
-// subset of second-level peers.  In the MVP, each chunk is sent redundantly to
-// enough first-level peers so that any single peer failure still allows
-// reconstruction via the missing-chunk request mechanism.
-//
-// The redundancy factor defaults to 2: each chunk is sent to `fanout` peers
-// picked round-robin from the sorted peer list.  When there are fewer peers
-// than chunks, every peer receives the full set.
-func (h *handler) distributeBlockChunks(peers []*ethPeer, pkts []*bsc.BlockChunkPacket) {
+// distributeBlockChunks fans out block shards to EVN peers using a deterministic
+// two-level tree. The leader sends every shard to the first-level peers in a
+// round-robin pattern with redundancy. Each first-level peer is then responsible
+// for relaying shards to its deterministic child group.
+func (h *handler) distributeBlockChunks(peers []*ethPeer, pkts []*bsc.BlockChunkPacket) bool {
 	evnPeers := h.evnChunkPeers(peers, pkts[0].BlockHash)
 	if len(evnPeers) == 0 {
 		// No EVN peers supporting Bsc3: the caller should fall back to the
@@ -74,7 +68,7 @@ func (h *handler) distributeBlockChunks(peers []*ethPeer, pkts []*bsc.BlockChunk
 		}
 		if len(evnPeers) == 0 {
 			log.Warn("chunk path enabled but no Bsc3 peers available", "hash", pkts[0].BlockHash)
-			return
+			return false
 		}
 	}
 
@@ -90,18 +84,22 @@ func (h *handler) distributeBlockChunks(peers []*ethPeer, pkts []*bsc.BlockChunk
 	if redundancy > n {
 		redundancy = n
 	}
+	firstLevel := evnPeers[:fanout]
 
-	log.Debug("Distributing block chunks", "hash", pkts[0].BlockHash, "chunks", len(pkts), "evnPeers", n, "fanout", fanout, "redundancy", redundancy)
+	bsc.BlockChunkFanoutGauge.Update(int64(fanout))
+	bsc.BlockChunkPeerGauge.Update(int64(n))
+	log.Debug("Distributing block chunks", "hash", pkts[0].BlockHash, "shards", len(pkts), "evnPeers", n, "fanout", fanout, "redundancy", redundancy)
 
 	for i, pkt := range pkts {
-		// Send each chunk to `redundancy` peers chosen round-robin from the
-		// fanout subset.  Starting offset is based on chunk index so that
-		// different chunks go to different first-level peers.
+		// Send each shard to first-level peers. Redundancy over RS parity keeps
+		// the leader path robust without full-block EVN broadcast.
 		for r := 0; r < redundancy; r++ {
 			peerIdx := (i*redundancy + r) % fanout
-			evnPeers[peerIdx].bscExt.AsyncSendBlockChunk(pkt)
+			firstLevel[peerIdx].bscExt.AsyncSendBlockChunk(pkt)
 		}
 	}
+	bsc.BlockChunkPathMeter.Mark(1)
+	return true
 }
 
 // relayBlockChunk is called from the bsc backend Handle path when a chunk is
@@ -112,13 +110,78 @@ func (h *handler) relayBlockChunk(fromPeer *bsc.Peer, pkt *bsc.BlockChunkPacket)
 	if h.chunkPool == nil {
 		return
 	}
-	// Collect EVN peers (excluding the sender) that support Bsc3.
+	tree := h.chunkFanoutTree(pkt.BlockHash)
+	if len(tree.peers) == 0 {
+		return
+	}
+	children := tree.childrenOf(fromPeer.ID())
+	if len(children) == 0 {
+		return
+	}
+	for _, child := range children {
+		child.bscExt.AsyncSendBlockChunk(pkt)
+	}
+}
+
+type chunkFanoutTree struct {
+	peers  []*ethPeer
+	fanout int
+}
+
+func (h *handler) chunkFanoutTree(blockHash common.Hash) chunkFanoutTree {
+	h.peers.lock.RLock()
+	allPeers := make([]*ethPeer, 0, len(h.peers.peers))
+	for _, p := range h.peers.peers {
+		allPeers = append(allPeers, p)
+	}
+	h.peers.lock.RUnlock()
+
+	peers := h.evnChunkPeers(allPeers, blockHash)
+	fanout := int(math.Ceil(math.Sqrt(float64(len(peers)))))
+	if fanout < 1 {
+		fanout = 1
+	}
+	if fanout > len(peers) {
+		fanout = len(peers)
+	}
+	return chunkFanoutTree{peers: peers, fanout: fanout}
+}
+
+func (t chunkFanoutTree) childrenOf(peerID string) []*ethPeer {
+	if len(t.peers) == 0 || t.fanout == 0 {
+		return nil
+	}
+	parent := -1
+	for i := 0; i < t.fanout; i++ {
+		if t.peers[i].ID() == peerID {
+			parent = i
+			break
+		}
+	}
+	if parent < 0 {
+		return nil
+	}
+	children := make([]*ethPeer, 0)
+	for i := t.fanout + parent; i < len(t.peers); i += t.fanout {
+		children = append(children, t.peers[i])
+	}
+	return children
+}
+
+// requestMissingChunks asks a small set of Bsc3 EVN peers for shards still
+// missing from the local reassembly. This closes the reliability loop for the
+// best-effort fanout path while the legacy full-block path remains as fallback.
+func (h *handler) requestMissingChunks(fromPeer *bsc.Peer, pkt *bsc.BlockChunkPacket) {
+	if h.chunkPool == nil {
+		return
+	}
+	missing := h.chunkPool.MissingChunks(pkt.BlockHash)
+	if len(missing) == 0 {
+		return
+	}
 	var candidates []*ethPeer
 	for _, p := range h.peers.peersWithoutBlock(pkt.BlockHash) {
-		if !p.EVNPeerFlag.Load() {
-			continue
-		}
-		if p.bscExt == nil || p.bscExt.Version() < bsc.Bsc3 {
+		if !p.EVNPeerFlag.Load() || p.bscExt == nil || p.bscExt.Version() < bsc.Bsc3 {
 			continue
 		}
 		if p.bscExt.ID() == fromPeer.ID() {
@@ -129,15 +192,14 @@ func (h *handler) relayBlockChunk(fromPeer *bsc.Peer, pkt *bsc.BlockChunkPacket)
 	if len(candidates) == 0 {
 		return
 	}
-	// Forward to a small subset (sqrt of candidates) to limit amplification.
 	count := int(math.Ceil(math.Sqrt(float64(len(candidates)))))
 	if count > len(candidates) {
 		count = len(candidates)
 	}
-	// Use a deterministic selection based on the chunk index so that
-	// different chunks are relayed to different peers.
 	start := int(pkt.ChunkIndex) % len(candidates)
 	for i := 0; i < count; i++ {
-		candidates[(start+i)%len(candidates)].bscExt.AsyncSendBlockChunk(pkt)
+		if err := candidates[(start+i)%len(candidates)].bscExt.RequestMissingChunks(pkt.BlockHash, missing); err != nil {
+			log.Debug("Failed to request missing block shards", "hash", pkt.BlockHash, "peer", candidates[(start+i)%len(candidates)].ID(), "err", err)
+		}
 	}
 }

@@ -24,6 +24,7 @@ func (h *testBscHandler) RunPeer(peer *bsc.Peer, handler bsc.Handler) error {
 	panic("not used in tests")
 }
 func (h *testBscHandler) PeerInfo(enode.ID) interface{} { panic("not used in tests") }
+func (h *testBscHandler) ChunkPool() *bsc.ChunkPool     { return nil }
 func (h *testBscHandler) Handle(peer *bsc.Peer, packet bsc.Packet) error {
 	switch packet := packet.(type) {
 	case *bsc.VotesPacket:

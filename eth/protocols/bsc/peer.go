@@ -189,19 +189,25 @@ func (p *Peer) AsyncSendBlockChunk(pkt *BlockChunkPacket) {
 	if p.knownChunks.contains(chunkKey{hash: pkt.BlockHash, index: pkt.ChunkIndex}) {
 		return
 	}
-	p.knownChunks.add(chunkKey{hash: pkt.BlockHash, index: pkt.ChunkIndex})
 	select {
 	case p.chunkBroadcast <- pkt:
+		p.knownChunks.add(chunkKey{hash: pkt.BlockHash, index: pkt.ChunkIndex})
 	case <-p.term:
 		p.Log().Debug("Dropping chunk propagation for closed peer", "hash", pkt.BlockHash, "index", pkt.ChunkIndex)
+		BlockChunkShardDropMeter.Mark(1)
 	default:
 		p.Log().Debug("Dropping chunk propagation for abnormal peer", "hash", pkt.BlockHash, "index", pkt.ChunkIndex)
+		BlockChunkShardDropMeter.Mark(1)
 	}
 }
 
 // sendBlockChunk writes a single block chunk packet to the remote peer.
 func (p *Peer) sendBlockChunk(pkt *BlockChunkPacket) error {
-	return p2p.Send(p.rw, BlockChunkMsg, pkt)
+	if err := p2p.Send(p.rw, BlockChunkMsg, pkt); err != nil {
+		return err
+	}
+	BlockChunkShardOutMeter.Mark(1)
+	return nil
 }
 
 // broadcastChunks is a write loop that schedules block chunk broadcasts to the
@@ -229,6 +235,7 @@ func (p *Peer) RequestMissingChunks(blockHash common.Hash, indexes []uint) error
 	if p.version < Bsc3 {
 		return errors.New("peer does not support Bsc3 chunk protocol")
 	}
+	BlockChunkMissingReqMeter.Mark(int64(len(indexes)))
 	return p2p.Send(p.rw, GetBlockChunksMsg, &GetBlockChunksPacket{
 		BlockHash:      blockHash,
 		MissingIndexes: indexes,

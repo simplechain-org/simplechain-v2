@@ -56,7 +56,9 @@ func (h *bscHandler) Handle(peer *bsc.Peer, packet bsc.Packet) error {
 	case *bsc.BlockChunkPacket:
 		// The chunk has already been fed to the ChunkPool by the protocol
 		// handler.  Here we just relay it further down the fanout tree.
-		(*handler)(h).relayBlockChunk(peer, packet)
+		handler := (*handler)(h)
+		handler.relayBlockChunk(peer, packet)
+		handler.requestMissingChunks(peer, packet)
 		return nil
 
 	default:

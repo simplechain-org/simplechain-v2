@@ -26,4 +26,16 @@ var (
 
 	IngressRegistrationErrorMeter = metrics.NewRegisteredMeter(ingressRegistrationErrorName, nil)
 	EgressRegistrationErrorMeter  = metrics.NewRegisteredMeter(egressRegistrationErrorName, nil)
+
+	BlockChunkPathMeter        = metrics.NewRegisteredMeter("eth/protocols/bsc/chunk/path", nil)
+	BlockChunkFallbackMeter    = metrics.NewRegisteredMeter("eth/protocols/bsc/chunk/fallback", nil)
+	BlockChunkShardInMeter     = metrics.NewRegisteredMeter("eth/protocols/bsc/chunk/shard/in", nil)
+	BlockChunkShardOutMeter    = metrics.NewRegisteredMeter("eth/protocols/bsc/chunk/shard/out", nil)
+	BlockChunkShardDropMeter   = metrics.NewRegisteredMeter("eth/protocols/bsc/chunk/shard/drop", nil)
+	BlockChunkReassembleTimer  = metrics.NewRegisteredTimer("eth/protocols/bsc/chunk/reassemble/time", nil)
+	BlockChunkReassembleMeter  = metrics.NewRegisteredMeter("eth/protocols/bsc/chunk/reassemble/success", nil)
+	BlockChunkReassembleErrors = metrics.NewRegisteredMeter("eth/protocols/bsc/chunk/reassemble/error", nil)
+	BlockChunkMissingReqMeter  = metrics.NewRegisteredMeter("eth/protocols/bsc/chunk/missing/request", nil)
+	BlockChunkFanoutGauge      = metrics.NewRegisteredGauge("eth/protocols/bsc/chunk/fanout", nil)
+	BlockChunkPeerGauge        = metrics.NewRegisteredGauge("eth/protocols/bsc/chunk/peers", nil)
 )

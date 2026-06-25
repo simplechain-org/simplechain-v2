@@ -67,6 +67,8 @@ var (
 		utils.ExternalSignerFlag,
 		utils.NoUSBFlag, // deprecated
 		utils.DirectBroadcastFlag,
+		utils.BlockChunkEnableFlag,
+		utils.BlockChunkThresholdFlag,
 		utils.DisableSnapProtocolFlag,
 		utils.RangeLimitFlag,
 		utils.USBFlag,
