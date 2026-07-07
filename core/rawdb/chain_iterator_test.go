@@ -218,6 +218,24 @@ func TestIndexTransactions(t *testing.T) {
 	verify(0, 8, false, 8)
 }
 
+func TestUnindexTransactionsMissingBody(t *testing.T) {
+	chainDB := NewMemoryDatabase()
+	blocks, _ := initDatabaseWithTransactions(chainDB)
+
+	IndexTransactions(chainDB, 0, 4, nil, false)
+	if tail := ReadTxIndexTail(chainDB); tail == nil || *tail != 0 {
+		t.Fatalf("Transaction tail mismatch after indexing, got %v", tail)
+	}
+
+	missing := blocks[2]
+	DeleteBody(chainDB, missing.Hash(), missing.NumberU64())
+
+	UnindexTransactions(chainDB, 0, 3, nil, false)
+	if tail := ReadTxIndexTail(chainDB); tail == nil || *tail != 3 {
+		t.Fatalf("Transaction tail mismatch after unindexing missing body, got %v", tail)
+	}
+}
+
 func TestPruneTransactionIndex(t *testing.T) {
 	chainDB := NewMemoryDatabase()
 	blocks, _ := initDatabaseWithTransactions(chainDB)
