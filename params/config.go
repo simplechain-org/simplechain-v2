@@ -735,6 +735,7 @@ type ChainConfig struct {
 	CopperRemixTime    *uint64 `json:"copperRemixTime,omitempty"`    // CopperRemix switch time (nil = no fork, 0 = already on copperRemix)
 	CopperRemixFixTime *uint64 `json:"copperRemixFixTime,omitempty"` // CopperRemixFix switch time (nil = no fork, 0 = already on copperRemixFix)
 	CopperRemix2Time   *uint64 `json:"copperRemix2Time,omitempty"`   // CopperRemix2 switch time (nil = no fork, 0 = already on copperRemix2)
+	CopperAuditFixTime *uint64 `json:"copperAuditFixTime,omitempty"` // CopperAuditFix switch time (nil = no fork, 0 = already on copperAuditFix)
 
 	// TerminalTotalDifficulty is the amount of total difficulty reached by
 	// the network that triggers the consensus upgrade.
@@ -931,10 +932,14 @@ func (c *ChainConfig) String() string {
 	if c.CopperRemix2Time != nil {
 		CopperRemix2Time = big.NewInt(0).SetUint64(*c.CopperRemix2Time)
 	}
+	var CopperAuditFixTime *big.Int
+	if c.CopperAuditFixTime != nil {
+		CopperAuditFixTime = big.NewInt(0).SetUint64(*c.CopperAuditFixTime)
+	}
 
 	return fmt.Sprintf("{ChainID: %v, Engine: %v, Homestead: %v DAO: %v DAOSupport: %v EIP150: %v EIP155: %v EIP158: %v Byzantium: %v Constantinople: %v Petersburg: %v Istanbul: %v, Muir Glacier: %v, Ramanujan: %v, Niels: %v, "+
 		"MirrorSync: %v, Bruno: %v, Berlin: %v, YOLO v3: %v, CatalystBlock: %v, London: %v, ArrowGlacier: %v, MergeFork:%v, Euler: %v, Gibbs: %v, Nano: %v, Moran: %v, Planck: %v,Luban: %v, Plato: %v, Hertz: %v, Hertzfix: %v, Copper: %v, "+
-		"ShanghaiTime: %v, KeplerTime: %v, FeynmanTime: %v, FeynmanFixTime: %v, CancunTime: %v, HaberTime: %v, HaberFixTime: %v, BohrTime: %v, PascalTime: %v, PragueTime: %v, LorentzTime: %v, MaxwellTime: %v, FermiTime: %v, NoBlockRewardTime: %v, CopperRemixTime: %v, CopperRemixFixTime: %v, CopperRemix2Time: %v}",
+		"ShanghaiTime: %v, KeplerTime: %v, FeynmanTime: %v, FeynmanFixTime: %v, CancunTime: %v, HaberTime: %v, HaberFixTime: %v, BohrTime: %v, PascalTime: %v, PragueTime: %v, LorentzTime: %v, MaxwellTime: %v, FermiTime: %v, NoBlockRewardTime: %v, CopperRemixTime: %v, CopperRemixFixTime: %v, CopperRemix2Time: %v, CopperAuditFixTime: %v}",
 		c.ChainID,
 		engine,
 		c.HomesteadBlock,
@@ -985,6 +990,7 @@ func (c *ChainConfig) String() string {
 		CopperRemixTime,
 		CopperRemixFixTime,
 		CopperRemix2Time,
+		CopperAuditFixTime,
 	)
 }
 
@@ -1457,6 +1463,11 @@ func (c *ChainConfig) IsCopperRemix2(num *big.Int, time uint64) bool {
 	return c.IsCopper(num) && isTimestampForked(c.CopperRemix2Time, time)
 }
 
+// IsCopperAuditFix returns whether the Copper audit fixes are active.
+func (c *ChainConfig) IsCopperAuditFix(num *big.Int, time uint64) bool {
+	return c.IsCopper(num) && isTimestampForked(c.CopperAuditFixTime, time)
+}
+
 // IsOnCopperRemix2 returns whether currentBlockTime is either equal to the CopperRemix2 fork time or greater firstly.
 func (c *ChainConfig) IsOnCopperRemix2(currentBlockNumber *big.Int, lastBlockTime uint64, currentBlockTime uint64) bool {
 	lastBlockNumber := new(big.Int)
@@ -1539,6 +1550,7 @@ func (c *ChainConfig) CheckConfigForkOrder() error {
 		{name: "copperRemixTime", timestamp: c.CopperRemixTime, optional: true},
 		{name: "copperRemixFixTime", timestamp: c.CopperRemixFixTime, optional: true},
 		{name: "copperRemix2Time", timestamp: c.CopperRemix2Time, optional: true},
+		{name: "copperAuditFixTime", timestamp: c.CopperAuditFixTime, optional: true},
 	} {
 		if lastFork.name != "" {
 			switch {
@@ -1769,6 +1781,9 @@ func (c *ChainConfig) checkCompatible(newcfg *ChainConfig, headNumber *big.Int, 
 	if isForkTimestampIncompatible(c.CopperRemix2Time, newcfg.CopperRemix2Time, headTimestamp) {
 		return newTimestampCompatError("CopperRemix2 fork timestamp", c.CopperRemix2Time, newcfg.CopperRemix2Time)
 	}
+	if isForkTimestampIncompatible(c.CopperAuditFixTime, newcfg.CopperAuditFixTime, headTimestamp) {
+		return newTimestampCompatError("CopperAuditFix fork timestamp", c.CopperAuditFixTime, newcfg.CopperAuditFixTime)
+	}
 	return nil
 }
 
@@ -1983,6 +1998,7 @@ type Rules struct {
 	IsBohr, IsPascal, IsPrague, IsLorentz, IsMaxwell                           bool
 	IsFermi, IsOsaka, IsVerkle                                                 bool
 	IsCopper, IsNoBlockReward, IsCopperRemix, IsCopperRemixFix, IsCopperRemix2 bool
+	IsCopperAuditFix                                                           bool
 }
 
 // Rules ensures c's ChainID is not nil.
@@ -2033,6 +2049,7 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 		IsCopperRemix:    c.IsCopperRemix(num, timestamp),
 		IsCopperRemixFix: c.IsCopperRemixFix(num, timestamp),
 		IsCopperRemix2:   c.IsCopperRemix2(num, timestamp),
+		IsCopperAuditFix: c.IsCopperAuditFix(num, timestamp),
 		IsEIP4762:        isVerkle,
 	}
 }
