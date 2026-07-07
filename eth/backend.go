@@ -252,7 +252,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		overrides.OverrideVerkle = config.OverrideVerkle
 	}
 	if config.OverrideCopper != nil {
-		chainConfig.CopperBlock = big.NewInt(int64(*config.OverrideCopper))
+		chainConfig.CopperBlock = new(big.Int).SetUint64(*config.OverrideCopper)
 		overrides.OverrideCopper = config.OverrideCopper
 	}
 	if config.OverrideNoBlockReward != nil {
@@ -270,6 +270,10 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	if config.OverrideCopperRemix2 != nil {
 		chainConfig.CopperRemix2Time = config.OverrideCopperRemix2
 		overrides.OverrideCopperRemix2 = config.OverrideCopperRemix2
+	}
+	if config.OverrideCopperAuditFix != nil {
+		chainConfig.CopperAuditFixTime = config.OverrideCopperAuditFix
+		overrides.OverrideCopperAuditFix = config.OverrideCopperAuditFix
 	}
 	// Auto-set operational parameters for simplechain testnet.
 	if chainConfig.ChainID.Uint64() == 1913 {

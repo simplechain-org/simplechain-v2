@@ -575,6 +575,20 @@ func CalculateContributionRewardRate(
 	validatorsTotalPooled *big.Int,
 	totalSupply *big.Int,
 ) *big.Int {
+	return calculateContributionRewardRate(inflationRate, inTurnCounts, totalTurnCounts, commissionRate, totalDelegated, totalPooled, validatorsTotalPooled, totalSupply, true)
+}
+
+func calculateContributionRewardRate(
+	inflationRate *big.Int,
+	inTurnCounts *big.Int,
+	totalTurnCounts *big.Int,
+	commissionRate *big.Int,
+	totalDelegated *big.Int,
+	totalPooled *big.Int,
+	validatorsTotalPooled *big.Int,
+	totalSupply *big.Int,
+	auditFix bool,
+) *big.Int {
 	// Scale factor: 10^18 for high precision
 	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
 	scaleSqrt := new(big.Int).Exp(big.NewInt(10), big.NewInt(9), nil)
@@ -604,7 +618,10 @@ func CalculateContributionRewardRate(
 
 	// 4. Calculate sqrt(contributionStakingRatio)
 	// Since ratio is scaled by 10^18, sqrt will be scaled by 10^9
-	sqrtContribRatio := sqrtBigInt(contributionStakingRatioScaled)
+	sqrtContribRatio := sqrtBigIntLegacy(contributionStakingRatioScaled)
+	if auditFix {
+		sqrtContribRatio = sqrtBigInt(contributionStakingRatioScaled)
+	}
 
 	// 5. Calculate totalNetworkStakingRatio = validatorsTotalPooled / totalSupply (scaled)
 	networkStakingRatioScaled := new(big.Int).Mul(validatorsTotalPooled, scale)
@@ -614,7 +631,7 @@ func CalculateContributionRewardRate(
 		return big.NewInt(0)
 	}
 
-	if networkStakingRatioScaled.Cmp(big.NewInt(0)) == 0 {
+	if auditFix && networkStakingRatioScaled.Cmp(big.NewInt(0)) == 0 {
 		return big.NewInt(0)
 	}
 
@@ -649,6 +666,29 @@ func sqrtBigInt(n *big.Int) *big.Int {
 		return big.NewInt(0)
 	}
 	return new(big.Int).Sqrt(n)
+}
+
+func sqrtBigIntLegacy(n *big.Int) *big.Int {
+	if n.Cmp(big.NewInt(0)) <= 0 {
+		return big.NewInt(0)
+	}
+
+	x := new(big.Int).Div(n, big.NewInt(2))
+	if x.Cmp(big.NewInt(0)) == 0 {
+		return big.NewInt(1)
+	}
+
+	for {
+		nDivX := new(big.Int).Div(n, x)
+		xNew := new(big.Int).Add(x, nDivX)
+		xNew.Div(xNew, big.NewInt(2))
+
+		diff := new(big.Int).Sub(x, xNew)
+		if diff.Abs(diff).Cmp(big.NewInt(1)) <= 0 {
+			return xNew
+		}
+		x = xNew
+	}
 }
 
 func (p *Parlia) distributeBasicAndContributionReward(chain consensus.ChainHeaderReader, state vm.StateDB, header *types.Header,
@@ -758,7 +798,8 @@ func (p *Parlia) distributeBasicAndContributionRewardWithInterfaces(chain consen
 		}
 
 		// Calculate rewards using pure function
-		rewardResult := calculateValidatorRewards(p, rewardInput, maxContributionRewardRate, scale)
+		auditFix := p.chainConfig.IsCopperAuditFix(header.Number, header.Time)
+		rewardResult := calculateValidatorRewards(p, rewardInput, maxContributionRewardRate, scale, auditFix)
 
 		// Update state and accumulate rewards
 		additionalBasicReward.Add(additionalBasicReward, rewardResult.BasicReward)
@@ -843,7 +884,7 @@ func fetchValidatorRewardData(reader ethAPIReader, blockNr rpc.BlockNumberOrHash
 
 // calculateValidatorRewards is a pure function that calculates validator rewards based on input data.
 // This function has no dependencies on blockchain state, making it easy to test.
-func calculateValidatorRewards(p *Parlia, input *ValidatorRewardInput, maxContributionRewardRate *big.Int, scale *big.Int) *ValidatorRewardResult {
+func calculateValidatorRewards(p *Parlia, input *ValidatorRewardInput, maxContributionRewardRate *big.Int, scale *big.Int, auditFix bool) *ValidatorRewardResult {
 	result := &ValidatorRewardResult{}
 
 	// Calculate basic reward: (1 + nominalInterestRate/annualBlockCountEveryYear)^annualBlockCountEveryEpoch - 1
@@ -855,7 +896,7 @@ func calculateValidatorRewards(p *Parlia, input *ValidatorRewardInput, maxContri
 	)
 
 	// Calculate contribution reward rate
-	contributionRewardRateScaled := CalculateContributionRewardRate(
+	contributionRewardRateScaled := calculateContributionRewardRate(
 		input.InflationRate,
 		input.InTurnCounts,
 		input.TotalTurnCounts,
@@ -864,6 +905,7 @@ func calculateValidatorRewards(p *Parlia, input *ValidatorRewardInput, maxContri
 		input.TotalPooled,
 		input.ValidatorsTotalPooled,
 		input.TotalSupply,
+		auditFix,
 	)
 
 	// Cap contribution reward rate at maximum
@@ -1068,7 +1110,13 @@ func (p *Parlia) updateInflationRecordForNewYear(parentYear int, currentYear int
 	additionalContributionIssuanceAmount := new(big.Int).Sub(totalIssuanceAmountOfContributionReward, lastYearTotalContributionRewardAmount)
 	log.Info("updateInflationRecordForNewYear", "blockNumber", header.Number, "blockTime", header.Time, "additionalIssuanceAmount", additionalIssuanceAmount, "inflationRate", newInflationRate, "additionalBasicIssuanceAmount", additionalBasicIssuanceAmount, "additionalContributionIssuanceAmount", additionalContributionIssuanceAmount)
 	// Update total supply information for the new year
-	err = p.updateInflationRecord(currentYear, currentTotalSupply, additionalIssuanceAmount, totalIssuanceAmountOfBasicReward, totalIssuanceAmountOfContributionReward, newInflationRate, cx, state, header, txs, receipts, receivedTxs, usedGas, mining, tracer)
+	basicIssuanceRecord := additionalBasicIssuanceAmount
+	contributionIssuanceRecord := additionalContributionIssuanceAmount
+	if p.chainConfig.IsCopperAuditFix(header.Number, header.Time) {
+		basicIssuanceRecord = totalIssuanceAmountOfBasicReward
+		contributionIssuanceRecord = totalIssuanceAmountOfContributionReward
+	}
+	err = p.updateInflationRecord(currentYear, currentTotalSupply, additionalIssuanceAmount, basicIssuanceRecord, contributionIssuanceRecord, newInflationRate, cx, state, header, txs, receipts, receivedTxs, usedGas, mining, tracer)
 	if err != nil {
 		return err
 	}
