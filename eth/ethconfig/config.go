@@ -18,6 +18,7 @@
 package ethconfig
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
 	"time"
@@ -241,6 +242,16 @@ type hotstuffNodeConfig interface {
 // Clique is allowed for now to live standalone, but ethash is forbidden and can
 // only exist on already merged networks.
 func CreateConsensusEngine(config *params.ChainConfig, db ethdb.Database, ee *ethapi.BlockChainAPI, genesisHash common.Hash, net *p2p.Server, nodeCfg interface{}) (consensus.Engine, error) {
+	if config.Hotstuff != nil {
+		switch {
+		case config.Parlia == nil:
+			return nil, errors.New("HotStuff requires Parlia chain parameters")
+		case config.HotstuffBlock == nil:
+			return nil, errors.New("HotStuff requires hotstuffBlock")
+		case config.HotstuffBlock.Sign() < 0:
+			return nil, errors.New("hotstuffBlock cannot be negative")
+		}
+	}
 	var hotstuffCfg *params.HotStuffConfig
 	if nodeCfg != nil {
 		if nc, ok := nodeCfg.(hotstuffNodeConfig); ok && nc != nil {
@@ -256,6 +267,9 @@ func CreateConsensusEngine(config *params.ChainConfig, db ethdb.Database, ee *et
 	if config.Parlia != nil && !config.IsHotstuff(big.NewInt(0)) {
 		return parlia.New(config, db, ee, genesisHash), nil
 	}
+	if config.Hotstuff != nil {
+		return hotstuff.New(config, db, ee, genesisHash, net, hotstuffCfg), nil
+	}
 	if config.TerminalTotalDifficulty == nil {
 		log.Error("Geth only supports PoS networks. Please transition legacy networks using Geth v1.13.x.")
 		return nil, fmt.Errorf("'terminalTotalDifficulty' is not set in genesis block")
@@ -263,9 +277,6 @@ func CreateConsensusEngine(config *params.ChainConfig, db ethdb.Database, ee *et
 	// If proof-of-authority is requested, set it up
 	if config.Clique != nil {
 		return clique.New(config.Clique, db), nil
-	}
-	if config.Hotstuff != nil {
-		return hotstuff.New(config, db, ee, genesisHash, net, hotstuffCfg), nil
 	}
 	return beacon.New(ethash.NewFaker()), nil
 }

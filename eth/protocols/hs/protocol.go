@@ -84,7 +84,7 @@ type VotePacket struct {
 	BlockHash  common.Hash
 	ViewNumber uint64
 	VotePubKey types.BLSPublicKey
-	Signature  types.BLSSignature // BLS signature over rlpHash(BlockHash, ViewNumber)
+	Signature  types.BLSSignature // BLS signature over the domain-separated vote digest
 }
 
 func (*VotePacket) Name() string { return "VotePacket" }
@@ -94,6 +94,8 @@ func (*VotePacket) Kind() byte   { return VoteMsg }
 type NewViewPacket struct {
 	HighQCView        uint64
 	HighQCHash        common.Hash
+	HighQCSignersSet  types.ValidatorsBitSet
+	HighQCAggSig      []byte
 	HighTCView        uint64
 	TimeoutSignersSet types.ValidatorsBitSet
 	TimeoutAggSig     types.BLSSignature
@@ -104,11 +106,13 @@ func (*NewViewPacket) Kind() byte   { return NewViewMsg }
 
 // TimeoutPacket carries timeout proof for a view.
 type TimeoutPacket struct {
-	ViewNumber uint64
-	HighQCView uint64
-	HighQCHash common.Hash
-	VotePubKey types.BLSPublicKey
-	Signature  types.BLSSignature
+	ViewNumber       uint64
+	HighQCView       uint64
+	HighQCHash       common.Hash
+	HighQCSignersSet types.ValidatorsBitSet
+	HighQCAggSig     []byte
+	VotePubKey       types.BLSPublicKey
+	Signature        types.BLSSignature
 }
 
 func (*TimeoutPacket) Name() string { return "TimeoutPacket" }

@@ -8,7 +8,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
-	"github.com/ethereum/go-ethereum/consensus/parlia"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/downloader"
@@ -36,6 +35,10 @@ var notContinuousJustified = metrics.NewRegisteredCounter("votesManager/notConti
 type Backend interface {
 	IsMining() bool
 	EventMux() *event.TypeMux
+}
+
+type blockIntervalReader interface {
+	BlockInterval(consensus.ChainHeaderReader, *types.Header) (uint64, error)
 }
 
 // VoteManager will handle the vote produced by self.
@@ -152,7 +155,7 @@ func (voteManager *VoteManager) loop() {
 			}
 
 			curHead := cHead.Header
-			if p, ok := voteManager.engine.(*parlia.Parlia); ok {
+			if p, ok := voteManager.engine.(blockIntervalReader); ok {
 				// Approximately equal to the block interval of next block, except for the switch block.
 				blockInterval, err := p.BlockInterval(voteManager.chain, curHead)
 				if err != nil {

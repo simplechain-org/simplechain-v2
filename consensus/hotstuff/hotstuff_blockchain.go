@@ -1,12 +1,9 @@
 package hotstuff
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"runtime"
-	"strconv"
-	"time"
+	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/misc"
@@ -17,27 +14,12 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/triedb"
 )
 
-// getGoroutineID returns the ID of the current goroutine for debugging
-func getGoroutineID() uint64 {
-	defer func() {
-		recover() // Recover from any panic in goroutine ID extraction
-	}()
-	b := make([]byte, 64)
-	b = b[:runtime.Stack(b, false)]
-	// Stack trace format: "goroutine 123 [running]:"
-	b = bytes.TrimPrefix(b, []byte("goroutine "))
-	idx := bytes.IndexByte(b, ' ')
-	if idx == -1 {
-		return 0 // Failed to parse, return 0
-	}
-	b = b[:idx]
-	id, _ := strconv.ParseUint(string(b), 10, 64)
-	return id
-}
+const maxSpeculativeTailDepth = 4096
 
 // storeBlock stores a validated block to the chain
 func (h *Hotstuff) storeBlock(header *types.Header, txs []*types.Transaction) (*types.Block, error) {
@@ -95,6 +77,9 @@ func (h *Hotstuff) tryCommitBlocks(st *hsState, currentHash common.Hash, current
 	qcCurrent := st.qcsByView[currentView]
 	if qcCurrent == nil || !qcCurrent.hasAggregateProof() {
 		return nil
+	}
+	if qcCurrent.BlockHash != currentHash {
+		return fmt.Errorf("QC at view %d certifies %s, not requested block %s", currentView, qcCurrent.BlockHash, currentHash)
 	}
 
 	blockCurrent := st.proposalsByHashBlock[qcCurrent.BlockHash]
@@ -211,11 +196,22 @@ func (h *Hotstuff) tryCommitBlocks(st *hsState, currentHash common.Hash, current
 		"current", blockCurrent.Number(),
 		"viewCurrent", viewCurrent)
 
-	if err := h.commitBlockWithAncestors(st, blockGrandparent); err != nil {
+	// tryCommitBlocks is called with h.lock held. InsertChain can execute and
+	// persist several blocks, so it must not run while the consensus mutex is
+	// held. commitBlockWithAncestors uses short lock sections for its snapshots
+	// and cleanup, and stateLock serializes concurrent commit attempts.
+	err := func() error {
+		h.lock.Unlock()
+		defer h.lock.Lock()
+		return h.commitBlockWithAncestors(st, blockGrandparent)
+	}()
+	if err != nil {
 		return err
 	}
 
-	st.lockedQC = qcParent
+	if current := h.getHsState(); current != nil && (current.lockedQC == nil || qcParent.View > current.lockedQC.View) {
+		current.lockedQC = qcParent
+	}
 	log.Info("HotStuff 3-chain commit completed",
 		"committed", blockGrandparent.Number(),
 		"hash", blockGrandparent.Hash().Hex()[:8],
@@ -264,9 +260,11 @@ func (h *Hotstuff) commitBlock(block *types.Block) error {
 		log.Warn("Attempted to commit genesis block, skipping InsertChain",
 			"hash", block.Hash().Hex()[:8])
 		// Still mark as committed in HotStuff state
+		h.lock.Lock()
 		if st := h.getHsState(); st != nil {
 			st.committedBlocks[block.Hash()] = block.NumberU64()
 		}
+		h.lock.Unlock()
 		return nil
 	}
 
@@ -304,23 +302,16 @@ func (h *Hotstuff) commitBlock(block *types.Block) error {
 	}
 
 	// 2. Record commit in HotStuff state
+	h.lock.Lock()
 	if st := h.getHsState(); st != nil {
 		st.committedBlocks[block.Hash()] = block.NumberU64()
 	}
+	h.lock.Unlock()
 
 	// 3. Notify local sealer only if we authored this block
-	// Leaders (local author) wait on commitCh in Seal; replicas do not.
+	// Leaders (local author) wait on a hash-scoped waiter in Seal; replicas do not.
 	if h.IsLocalBlock(block.Header()) {
-		select {
-		case h.commitCh <- block:
-			log.Debug("Committed block sent to commit channel",
-				"hash", block.Hash().Hex(),
-				"number", block.NumberU64())
-		default:
-			log.Warn("Commit channel is full, cannot send committed block",
-				"hash", block.Hash().Hex(),
-				"number", block.NumberU64())
-		}
+		h.notifyCommittedBlock(block)
 	}
 
 	log.Debug("Block committed to chain",
@@ -330,321 +321,430 @@ func (h *Hotstuff) commitBlock(block *types.Block) error {
 	return nil
 }
 
-// commitBlockWithAncestors commits a block and all its uncommitted ancestors
-// This fixes the "unknown ancestor" error when view timeouts cause blocks to be skipped
-func (h *Hotstuff) commitBlockWithAncestors(st *hsState, block *types.Block) error {
+// collectUncommittedAncestors walks only the speculative HotStuff tail. It
+// stops as soon as either the current block or its parent is canonical, so a
+// restart with an empty committedBlocks map can never trigger a history replay.
+func collectUncommittedAncestors(
+	target *types.Block,
+	isCanonical func(common.Hash, uint64) bool,
+	getProposal func(common.Hash) *types.Block,
+) (types.Blocks, error) {
+	var blocks types.Blocks
+	for current := target; current != nil; {
+		number := current.NumberU64()
+		if isCanonical(current.Hash(), number) {
+			break
+		}
+		if number == 0 {
+			return nil, fmt.Errorf("non-canonical genesis in HotStuff proposal chain: %s", current.Hash())
+		}
+		blocks = append(blocks, current)
+		if len(blocks) > maxSpeculativeTailDepth {
+			return nil, fmt.Errorf("HotStuff speculative tail exceeds recovery limit %d", maxSpeculativeTailDepth)
+		}
+		if isCanonical(current.ParentHash(), number-1) {
+			break
+		}
+		parent := getProposal(current.ParentHash())
+		if parent == nil {
+			return nil, fmt.Errorf("speculative parent %s not found for block %d", current.ParentHash(), number)
+		}
+		if parent.NumberU64()+1 != number {
+			return nil, fmt.Errorf("non-contiguous speculative parent %d for block %d", parent.NumberU64(), number)
+		}
+		current = parent
+	}
+	for i, j := 0, len(blocks)-1; i < j; i, j = i+1, j-1 {
+		blocks[i], blocks[j] = blocks[j], blocks[i]
+	}
+	return blocks, nil
+}
+
+// commitBlockWithAncestors commits the short speculative tail ending at block.
+// It is called without h.lock held; stateLock serializes concurrent commit
+// attempts while all consensus-map access remains in short h.lock sections.
+func (h *Hotstuff) commitBlockWithAncestors(_ *hsState, block *types.Block) error {
 	if block == nil {
-		return fmt.Errorf("cannot commit nil block")
+		return errors.New("cannot commit nil block")
+	}
+	bc, ok := h.chain.(*core.BlockChain)
+	if !ok {
+		return errors.New("chain is not a BlockChain instance")
 	}
 
-	log.Info("commitBlockWithAncestors: acquiring stateLock",
-		"block", block.NumberU64(),
-		"hash", block.Hash().Hex()[:8],
-		"goroutine", getGoroutineID())
-
-	// CRITICAL FIX: Acquire state lock at the start to prevent concurrent state operations
-	// This prevents both:
-	// 1. Concurrent InsertChain calls causing "parent diff layer is stale" panics
-	// 2. Conflicts with executeBlocks (OnHsProposal) which also modifies state
 	h.stateLock.Lock()
-	log.Info("commitBlockWithAncestors: acquired stateLock",
-		"block", block.NumberU64(),
-		"hash", block.Hash().Hex()[:8],
-		"goroutine", getGoroutineID())
-	defer func() {
-		h.stateLock.Unlock()
-		log.Info("commitBlockWithAncestors: released stateLock",
-			"block", block.NumberU64(),
-			"hash", block.Hash().Hex()[:8],
-			"goroutine", getGoroutineID())
-	}()
+	defer h.stateLock.Unlock()
 
-	// 收集所有未提交的祖先区块
-	var uncommittedAncestors []*types.Block
-
-	// 从当前区块向上追溯，直到找到已提交的区块或genesis
-	currentBlock := block
-	for currentBlock != nil {
-		// 检查当前区块是否已提交（在 HotStuff state 中）
-		if h.isBlockCommitted(st, currentBlock.Hash()) {
-			break
-		}
-
-		// ✅ CRITICAL: 如果是 genesis 区块，停止追溯
-		// Genesis 区块不需要提交（已经在链中），也不应该调用 InsertChain
-		if currentBlock.NumberU64() == 0 {
-			log.Debug("Reached genesis block, stopping ancestor search",
-				"hash", currentBlock.Hash().Hex()[:8])
-			break
-		}
-
-		// ✅ CRITICAL FIX: 不再检查 GetHeaderByHash，因为它只能判断 rawdb，不能判断 canonical chain
-		// prewriteBlock 会将区块写入 rawdb，但不会更新 canonical chain
-		// 导致 GetHeaderByHash 返回非 nil，但 RPC 查询不到区块
-		// 解决方案：直接添加到未提交列表，让 commitBlock 去调用 InsertChain 更新 canonical chain
-		// commitBlock 内部已处理 ErrKnownBlock，不会重复插入
-
-		// 添加到未提交列表
-		uncommittedAncestors = append(uncommittedAncestors, currentBlock)
-
-		// 查找父区块
-		parentHash := currentBlock.ParentHash()
-
-		// 首先尝试从HotStuff state中获取父区块
-		parentBlock := st.proposalsByHashBlock[parentHash]
-
-		// 如果HotStuff state中没有，尝试从链中获取
-		if parentBlock == nil && h.chain != nil {
-			if bc, ok := h.chain.(*core.BlockChain); ok {
-				parentHeader := h.chain.GetHeaderByHash(parentHash)
-				if parentHeader != nil {
-					parentBlock = bc.GetBlock(parentHash, parentHeader.Number.Uint64())
-				}
-			}
-		}
-
-		// 如果找不到父区块，说明父区块已经在链中或不存在
-		if parentBlock == nil {
-			// 检查父区块是否在链中
-			if h.chain != nil {
-				if parentHeader := h.chain.GetHeaderByHash(parentHash); parentHeader != nil {
-					log.Debug("Parent block found in chain, stopping ancestor search",
-						"parentNumber", parentHeader.Number.Uint64(),
-						"parentHash", parentHash.Hex()[:8])
-					break
-				}
-			}
-			// 如果父区块既不在HotStuff state也不在链中，这是一个错误
-			return fmt.Errorf("parent block not found: %s (for block %d)",
-				parentHash.Hex()[:8], currentBlock.NumberU64())
-		}
-
-		currentBlock = parentBlock
+	h.lock.RLock()
+	st := h.getHsState()
+	if st == nil {
+		h.lock.RUnlock()
+		return errors.New("HotStuff state is not initialized")
+	}
+	blocks, err := collectUncommittedAncestors(
+		block,
+		func(hash common.Hash, number uint64) bool {
+			header := bc.GetHeaderByNumber(number)
+			return header != nil && header.Hash() == hash
+		},
+		func(hash common.Hash) *types.Block { return st.proposalsByHashBlock[hash] },
+	)
+	h.lock.RUnlock()
+	if err != nil {
+		return err
 	}
 
-	// 如果没有未提交的祖先，直接返回
-	if len(uncommittedAncestors) == 0 {
-		log.Debug("No uncommitted ancestors found, block already committed",
-			"number", block.NumberU64(),
-			"hash", block.Hash().Hex()[:8])
+	if len(blocks) > 0 {
+		first := blocks[0]
+		parent := bc.GetHeaderByNumber(first.NumberU64() - 1)
+		if parent == nil || parent.Hash() != first.ParentHash() {
+			return fmt.Errorf("canonical parent %s not found for first speculative block %d", first.ParentHash(), first.NumberU64())
+		}
+		knownFastPath := true
+		for _, candidate := range blocks {
+			knownFastPath = knownFastPath && bc.HasBlockAndExecutionCache(candidate.Hash(), candidate.NumberU64())
+		}
+		log.Info("Batch inserting HotStuff commit tail",
+			"count", len(blocks),
+			"oldest", blocks[0].NumberU64(),
+			"newest", blocks[len(blocks)-1].NumberU64())
+		_, insertErr := bc.InsertChain(blocks)
+		recordHotstuffCommitInsertResult(knownFastPath, insertErr)
+		if insertErr != nil && !errors.Is(insertErr, core.ErrKnownBlock) {
+			return fmt.Errorf("failed to insert HotStuff commit tail ending at block %d: %w", block.NumberU64(), insertErr)
+		}
+	}
+
+	canonical := bc.GetHeaderByNumber(block.NumberU64())
+	if canonical == nil || canonical.Hash() != block.Hash() {
+		return fmt.Errorf("HotStuff commit target %d is not canonical after insertion", block.NumberU64())
+	}
+
+	committed := blocks
+	if len(committed) == 0 {
+		committed = types.Blocks{block}
+	}
+	finalized := bc.CurrentFinalBlock()
+	if finalized != nil && finalized.Number.Uint64() == block.NumberU64() && finalized.Hash() != block.Hash() {
+		return fmt.Errorf("conflicting finalized block at height %d: have %s want %s", block.NumberU64(), finalized.Hash(), block.Hash())
+	}
+	h.cleanupCommittedProposalState(committed, block.NumberU64())
+	if finalized == nil || finalized.Number.Uint64() < block.NumberU64() {
+		bc.SetFinalized(block.Header())
+	}
+
+	if h.IsLocalBlock(block.Header()) {
+		h.notifyCommittedBlock(block)
+	}
+	log.Info("HotStuff 3-chain target committed and finalized",
+		"number", block.NumberU64(), "hash", block.Hash(), "inserted", len(blocks))
+	return nil
+}
+
+func (h *Hotstuff) cleanupCommittedProposalState(committed types.Blocks, finalizedNumber uint64) {
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	st := h.getHsState()
+	if st == nil {
+		return
+	}
+	for _, block := range committed {
+		hash := block.Hash()
+		st.committedBlocks[hash] = block.NumberU64()
+		delete(st.proposalsByHashBlock, hash)
+		delete(st.proposalsByHashReceipts, hash)
+		delete(st.proposalStates, hash)
+		delete(st.prewritten, hash)
+		h.proposalBlocksCache.Delete(hash)
+	}
+	// States at or below a finalized height belong either to the committed
+	// path or to a branch that can no longer become canonical.
+	for hash := range st.proposalStates {
+		if proposal := st.proposalsByHashBlock[hash]; proposal != nil && proposal.NumberU64() <= finalizedNumber {
+			delete(st.proposalStates, hash)
+		}
+	}
+}
+
+// recoveryQCFromHeader validates the structural link between a recovered
+// proposal and the QC carried in its SyncInfo. Signature and TC verification
+// are performed by recoverSpeculativeTail after all referenced blocks are
+// available through proposalBlocksCache.
+func recoveryQCFromHeader(header, parent *types.Header, chainConfig *params.ChainConfig, allowProofless bool) (*HsQC, uint64, error) {
+	if header == nil || parent == nil || header.Number == nil || parent.Number == nil {
+		return nil, 0, errors.New("nil header in HotStuff recovery tail")
+	}
+	if parent.Number.Uint64()+1 != header.Number.Uint64() || header.ParentHash != parent.Hash() {
+		return nil, 0, fmt.Errorf("non-contiguous recovered block %d", header.Number.Uint64())
+	}
+	has, qcView, qcHash, tcView, signersSet, sig, hasProof := parseSyncInfoWithProof(header, chainConfig)
+	if !has {
+		return nil, 0, fmt.Errorf("recovered block %d has no SyncInfo", header.Number.Uint64())
+	}
+	if qcHash != parent.Hash() {
+		return nil, 0, fmt.Errorf("recovered block %d HighQC target mismatch", header.Number.Uint64())
+	}
+	parentView := getViewFromHeader(parent, chainConfig)
+	if qcView != parentView {
+		return nil, 0, fmt.Errorf("recovered block %d HighQC view %d does not match parent view %d", header.Number.Uint64(), qcView, parentView)
+	}
+	if !hasProof && !allowProofless {
+		return nil, 0, fmt.Errorf("recovered block %d has proofless HighQC", header.Number.Uint64())
+	}
+	expectedView := qcView + 1
+	if tcView > 0 && tcView >= qcView {
+		expectedView = tcView + 1
+	}
+	if view := getViewFromHeader(header, chainConfig); view != expectedView || view <= parentView {
+		return nil, 0, fmt.Errorf("recovered block %d has non-increasing view %d after parent view %d", header.Number.Uint64(), view, parentView)
+	}
+	return &HsQC{
+		BlockHash: qcHash, View: qcView, SignersSet: signersSet, Sig: common.CopyBytes(sig),
+	}, tcView, nil
+}
+
+func addRecoveredQC(qcs map[uint64]*HsQC, qc *HsQC) error {
+	if qc == nil {
+		return errors.New("cannot recover nil QC")
+	}
+	if existing := qcs[qc.View]; existing != nil && existing.BlockHash != qc.BlockHash {
+		return fmt.Errorf("conflicting recovered QCs for view %d: %s and %s", qc.View, existing.BlockHash, qc.BlockHash)
+	}
+	if existing := qcs[qc.View]; existing == nil || (!existing.hasAggregateProof() && qc.hasAggregateProof()) {
+		qcs[qc.View] = qc
+	}
+	return nil
+}
+
+// recoverSpeculativeTail rebuilds the non-canonical state overlay referenced
+// by the proof-bearing HighQC restored from the safety WAL. It must be called
+// after SetChainReader has installed h.chain and merged snapshot metadata, but
+// before restartViewTimeout starts protocol activity.
+func (h *Hotstuff) recoverSpeculativeTail() (err error) {
+	defer func() {
+		if err == nil {
+			return
+		}
+		h.lock.Lock()
+		if h.hsWALError == nil {
+			h.hsWALError = fmt.Errorf("HotStuff speculative-tail recovery failed: %w", err)
+		}
+		h.lock.Unlock()
+	}()
+	if h.chain == nil || h.db == nil || h.chainConfig == nil {
+		return errors.New("HotStuff recovery dependencies are not initialized")
+	}
+	head := h.chain.CurrentHeader()
+	if head == nil || head.Number == nil {
+		return errors.New("HotStuff recovery has no canonical head")
+	}
+	active := h.chainConfig.IsHotstuff(head.Number)
+	if !active {
+		next := new(big.Int).Add(head.Number, common.Big1)
+		if !h.chainConfig.IsOnHotstuff(next) {
+			return nil
+		}
+	}
+
+	h.lock.RLock()
+	st := h.getHsState()
+	if st == nil {
+		h.lock.RUnlock()
+		return errors.New("HotStuff state is not initialized")
+	}
+	if h.hsWALError != nil {
+		walErr := h.hsWALError
+		h.lock.RUnlock()
+		return walErr
+	}
+	highQC := &HsQC{}
+	if st.highQC != nil {
+		*highQC = *st.highQC
+		highQC.Sig = common.CopyBytes(st.highQC.Sig)
+	} else {
+		highQC = nil
+	}
+	h.lock.RUnlock()
+	if highQC == nil {
+		// A chain configured for HotStuff from genesis has no QC before its first
+		// proposal. This is the only active-chain startup state that needs no WAL.
+		if active && head.Number.Sign() == 0 && h.chainConfig.HotstuffBlock.Sign() == 0 {
+			return nil
+		}
+		if active {
+			return errors.New("active HotStuff chain has no WAL HighQC")
+		}
 		return nil
 	}
-
-	// 反转列表，使其从最老的祖先到最新的区块
-	for i, j := 0, len(uncommittedAncestors)-1; i < j; i, j = i+1, j-1 {
-		uncommittedAncestors[i], uncommittedAncestors[j] = uncommittedAncestors[j], uncommittedAncestors[i]
+	if highQC.BlockHash == (common.Hash{}) {
+		return errors.New("WAL HighQC has an empty target")
 	}
 
-	log.Info("Committing block with ancestors",
-		"targetBlock", block.NumberU64(),
-		"ancestorCount", len(uncommittedAncestors),
-		"oldestAncestor", uncommittedAncestors[0].NumberU64(),
-		"newestAncestor", uncommittedAncestors[len(uncommittedAncestors)-1].NumberU64())
-
-	// Batch insert all ancestors at once to avoid multiple snapshot.Cap operations
-	// Multiple sequential InsertChain calls cause "parent diff layer is stale" panics
-	// because each InsertChain triggers snapshot.Cap, which flattens diff layers
-	if h.chain != nil {
-		if bc, ok := h.chain.(*core.BlockChain); ok {
-			// Check if blocks are in CANONICAL chain (not just in rawdb)
-			var blocksToInsert []*types.Block
-			foundInChain := false
-			for i, ancestor := range uncommittedAncestors {
-				ancestorNumber := ancestor.NumberU64()
-				canonicalHeader := bc.GetHeaderByNumber(ancestorNumber)
-
-				if canonicalHeader != nil && canonicalHeader.Hash() == ancestor.Hash() {
-					log.Info("Ancestor block already in canonical chain, truncating ancestor list from here",
-						"number", ancestorNumber,
-						"hash", ancestor.Hash().Hex()[:8],
-						"remainingCount", len(uncommittedAncestors)-i-1)
-					if i+1 < len(uncommittedAncestors) {
-						blocksToInsert = uncommittedAncestors[i+1:]
-					}
-					foundInChain = true
-					break
-				}
-			}
-
-			if !foundInChain {
-				blocksToInsert = uncommittedAncestors
-			}
-
-			if len(blocksToInsert) == 0 {
-				log.Warn("All ancestor blocks already in canonical chain (double-check result)",
-					"targetBlock", block.NumberU64(),
-					"currentChainHead", bc.CurrentBlock().Number.Uint64())
-				if st := h.getHsState(); st != nil {
-					for _, ancestor := range uncommittedAncestors {
-						st.committedBlocks[ancestor.Hash()] = ancestor.NumberU64()
-					}
-				}
+	number := rawdb.ReadHeaderNumber(h.db, highQC.BlockHash)
+	if number == nil {
+		return fmt.Errorf("WAL HighQC target %s is not present in rawdb", highQC.BlockHash)
+	}
+	target := rawdb.ReadBlock(h.db, highQC.BlockHash, *number)
+	if target == nil {
+		return fmt.Errorf("WAL HighQC target block %s is incomplete in rawdb", highQC.BlockHash)
+	}
+	tail, err := collectUncommittedAncestors(
+		target,
+		func(hash common.Hash, number uint64) bool {
+			header := h.chain.GetHeaderByNumber(number)
+			return header != nil && header.Hash() == hash
+		},
+		func(hash common.Hash) *types.Block {
+			number := rawdb.ReadHeaderNumber(h.db, hash)
+			if number == nil {
 				return nil
 			}
+			return rawdb.ReadBlock(h.db, hash, *number)
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("collect WAL HighQC tail: %w", err)
+	}
 
-			log.Info("Batch inserting ancestor blocks into canonical chain",
-				"count", len(blocksToInsert),
-				"oldest", blocksToInsert[0].NumberU64(),
-				"newest", blocksToInsert[len(blocksToInsert)-1].NumberU64(),
-				"currentChainHead", bc.CurrentBlock().Number.Uint64())
-
-			// Verify first block's parent is in chain before batch insert
-			firstBlock := blocksToInsert[0]
-			firstParentHeader := bc.GetHeaderByNumber(firstBlock.NumberU64() - 1)
-			if firstParentHeader == nil || firstParentHeader.Hash() != firstBlock.ParentHash() {
-				log.Error("First block's parent not in canonical chain, cannot batch insert",
-					"firstBlock", firstBlock.NumberU64(),
-					"parentHash", firstBlock.ParentHash().Hex()[:8],
-					"expectedParentNumber", firstBlock.NumberU64()-1)
-
-				// This should not happen if our logic is correct
-				// Try sequential insert with better error handling
-				log.Warn("Attempting sequential insert despite parent chain issue")
-
-				for i, ancestor := range blocksToInsert {
-					parentHeader := bc.GetHeaderByNumber(ancestor.NumberU64() - 1)
-					if parentHeader == nil {
-						return fmt.Errorf("cannot insert block %d: parent number %d not in canonical chain",
-							ancestor.NumberU64(), ancestor.NumberU64()-1)
-					}
-					if parentHeader.Hash() != ancestor.ParentHash() {
-						return fmt.Errorf("cannot insert block %d: parent hash mismatch (expected %s, got %s)",
-							ancestor.NumberU64(),
-							ancestor.ParentHash().Hex()[:8],
-							parentHeader.Hash().Hex()[:8])
-					}
-
-					knownBlockFastPath := bc.HasBlockAndExecutionCache(ancestor.Hash(), ancestor.NumberU64())
-					_, insertErr := bc.InsertChain(types.Blocks{ancestor})
-					recordHotstuffCommitInsertResult(knownBlockFastPath, insertErr)
-					if insertErr != nil {
-						if errors.Is(insertErr, core.ErrKnownBlock) {
-							log.Debug("Ancestor block already exists in chain",
-								"number", ancestor.NumberU64())
-							continue
-						}
-						return fmt.Errorf("failed to insert ancestor block %d: %w", ancestor.NumberU64(), insertErr)
-					}
-					log.Debug("Ancestor block inserted",
-						"number", ancestor.NumberU64(),
-						"progress", fmt.Sprintf("%d/%d", i+1, len(blocksToInsert)),
-						"knownBlockFastPath", knownBlockFastPath)
-					if i < len(blocksToInsert)-1 {
-						time.Sleep(1000 * time.Millisecond)
-					}
-				}
-				log.Info("All blocks inserted sequentially after parent verification")
-				goto commitComplete
+	// QC verification needs the non-canonical target headers, but no unverified
+	// block is exposed permanently if any later validation or execution fails.
+	newCacheEntries := make(map[common.Hash]struct{}, len(tail))
+	newStateEntries := make(map[common.Hash]struct{}, len(tail))
+	success := false
+	defer func() {
+		if success {
+			return
+		}
+		h.lock.Lock()
+		if st := h.getHsState(); st != nil {
+			for hash := range newStateEntries {
+				delete(st.proposalStates, hash)
 			}
-
-			// Batch insert causes "parent diff layer is stale" panics in HotStuff mode
-			// due to fast block production and concurrent StateDB.Commit → snap.Cap calls.
-			// Sequential insertion with delays ensures snapshot operations complete before the next insert.
-			log.Info("Sequentially inserting ancestor blocks to avoid snapshot conflicts",
-				"count", len(blocksToInsert))
-
-			for i, ancestor := range blocksToInsert {
-				knownBlockFastPath := bc.HasBlockAndExecutionCache(ancestor.Hash(), ancestor.NumberU64())
-				_, insertErr := bc.InsertChain(types.Blocks{ancestor})
-				recordHotstuffCommitInsertResult(knownBlockFastPath, insertErr)
-				if insertErr != nil {
-					if errors.Is(insertErr, core.ErrKnownBlock) {
-						log.Debug("Ancestor block already exists in chain",
-							"number", ancestor.NumberU64(),
-							"hash", ancestor.Hash().Hex()[:8])
-						continue
-					}
-					return fmt.Errorf("failed to insert ancestor block %d: %w", ancestor.NumberU64(), insertErr)
-				}
-				log.Info("Ancestor block inserted",
-					"number", ancestor.NumberU64(),
-					"hash", ancestor.Hash().Hex()[:8],
-					"progress", fmt.Sprintf("%d/%d", i+1, len(blocksToInsert)),
-					"knownBlockFastPath", knownBlockFastPath)
-
-				// Delay between inserts to allow snapshot Cap operations to complete
-				// The "parent diff layer is stale" panic occurs when multiple InsertChain calls
-				// trigger concurrent StateDB.Commit → snap.Cap → flatten operations.
-				// Each flatten modifies the snapshot diff layer tree, and concurrent modifications
-				// cause the stale parent panic. This delay ensures operations are serialized.
-				if i < len(blocksToInsert)-1 {
-					time.Sleep(2000 * time.Millisecond) // Increased from 1000ms for better safety
-				}
+		}
+		h.lock.Unlock()
+		for hash := range newCacheEntries {
+			h.proposalBlocksCache.Delete(hash)
+		}
+	}()
+	for _, block := range tail {
+		if cached, loaded := h.proposalBlocksCache.Load(block.Hash()); loaded {
+			cachedBlock, ok := cached.(*types.Block)
+			if !ok || cachedBlock == nil || cachedBlock.Hash() != block.Hash() {
+				return fmt.Errorf("invalid existing proposal cache entry for %s", block.Hash())
 			}
-			log.Info("All ancestor blocks inserted sequentially",
-				"count", len(blocksToInsert))
 		} else {
-			return fmt.Errorf("chain is not a BlockChain instance")
+			h.proposalBlocksCache.Store(block.Hash(), block)
+			newCacheEntries[block.Hash()] = struct{}{}
+		}
+		if !h.hasProposalState(block.Hash()) {
+			newStateEntries[block.Hash()] = struct{}{}
 		}
 	}
 
-commitComplete:
-	// Record all ancestors as committed in HotStuff state and cleanup mappings
-	// After blocks are persisted to db, we can safely remove them from memory mappings
-	if st := h.getHsState(); st != nil {
-		for _, ancestor := range uncommittedAncestors {
-			ancestorHash := ancestor.Hash()
-			ancestorNumber := ancestor.NumberU64()
+	bootstrapTarget := h.isBootstrapHighQC(highQC.BlockHash, highQC.View)
+	if !highQC.hasAggregateProof() && !bootstrapTarget {
+		return errors.New("WAL HighQC target has no aggregate proof")
+	}
+	if getViewFromHeader(target.Header(), h.chainConfig) != highQC.View {
+		return fmt.Errorf("WAL HighQC view %d does not match target block view %d", highQC.View, getViewFromHeader(target.Header(), h.chainConfig))
+	}
+	if !h.verifyHighQCPayload(highQC.BlockHash, highQC.View, highQC.SignersSet, highQC.Sig) {
+		return errors.New("WAL HighQC aggregate proof is invalid")
+	}
 
-			// Record as committed
-			st.committedBlocks[ancestorHash] = ancestorNumber
-			log.Debug("Marked ancestor as committed in HotStuff state",
-				"number", ancestorNumber,
-				"hash", ancestorHash.Hex()[:8])
-
-			// Cleanup: remove from memory mappings since block is now persisted to db
-			// 1. Remove full block from proposalsByHashBlock
-			if _, exists := st.proposalsByHashBlock[ancestorHash]; exists {
-				delete(st.proposalsByHashBlock, ancestorHash)
-				log.Debug("Cleaned up proposalsByHashBlock for committed block",
-					"number", ancestorNumber,
-					"hash", ancestorHash.Hex()[:8])
+	recoveredQCs := make(map[uint64]*HsQC, len(tail)+1)
+	recoveredViews := make(map[uint64]common.Hash, len(tail))
+	for i, block := range tail {
+		var parent *types.Header
+		if i == 0 {
+			parent = h.chain.GetHeader(block.ParentHash(), block.NumberU64()-1)
+		} else {
+			parent = tail[i-1].Header()
+		}
+		if parent == nil {
+			return fmt.Errorf("recovered block %d has no parent at the canonical boundary", block.NumberU64())
+		}
+		allowProofless := h.chainConfig.IsOnHotstuff(block.Number()) && h.isBootstrapHighQC(block.ParentHash(), getViewFromHeader(parent, h.chainConfig))
+		qc, tcView, linkErr := recoveryQCFromHeader(block.Header(), parent, h.chainConfig, allowProofless)
+		if linkErr != nil {
+			return linkErr
+		}
+		if qc.hasAggregateProof() && !h.verifyHighQCPayload(qc.BlockHash, qc.View, qc.SignersSet, qc.Sig) {
+			return fmt.Errorf("recovered block %d carries an invalid HighQC", block.NumberU64())
+		}
+		tc, tcErr := h.parseTimeoutCert(block.Header())
+		if tcErr != nil {
+			return fmt.Errorf("parse recovered block %d TimeoutCert: %w", block.NumberU64(), tcErr)
+		}
+		if tcView > 0 && tcView >= qc.View && (tc == nil || tc.View != tcView) {
+			return fmt.Errorf("recovered block %d is missing its declared TimeoutCert", block.NumberU64())
+		}
+		if tc != nil && (tcView == 0 || tcView < qc.View || tc.View != tcView) {
+			return fmt.Errorf("recovered block %d carries an undeclared TimeoutCert", block.NumberU64())
+		}
+		if tc != nil && !h.verifyTimeoutCert(tc) {
+			return fmt.Errorf("recovered block %d carries an invalid TimeoutCert", block.NumberU64())
+		}
+		if qc.hasAggregateProof() {
+			if err := addRecoveredQC(recoveredQCs, qc); err != nil {
+				return err
 			}
-
-			// 2. Remove receipts from proposalsByHashReceipts
-			if _, exists := st.proposalsByHashReceipts[ancestorHash]; exists {
-				delete(st.proposalsByHashReceipts, ancestorHash)
-				log.Debug("Cleaned up proposalsByHashReceipts for committed block",
-					"number", ancestorNumber,
-					"hash", ancestorHash.Hex()[:8])
-			}
-
-			// 3. Also clean up prewritten marker since block is now committed
-			if _, exists := st.prewritten[ancestorHash]; exists {
-				delete(st.prewritten, ancestorHash)
-				log.Debug("Cleaned up prewritten for committed block",
-					"number", ancestorNumber,
-					"hash", ancestorHash.Hex()[:8])
-			}
+		}
+		view := getViewFromHeader(block.Header(), h.chainConfig)
+		if existing, ok := recoveredViews[view]; ok && existing != block.Hash() {
+			return fmt.Errorf("conflicting recovered proposals for view %d", view)
+		}
+		recoveredViews[view] = block.Hash()
+	}
+	if highQC.hasAggregateProof() {
+		if err := addRecoveredQC(recoveredQCs, highQC); err != nil {
+			return err
 		}
 	}
 
-	// Also clean up the lock-free proposalBlocksCache
-	// This cache is used by GetBlockFromState to avoid deadlocks
-	for _, ancestor := range uncommittedAncestors {
-		h.proposalBlocksCache.Delete(ancestor.Hash())
+	receipts := make(map[common.Hash]types.Receipts, len(tail))
+	for _, block := range tail {
+		blockReceipts, executeErr := h.executeBlocks(block.Header(), block.Transactions())
+		if executeErr != nil {
+			return fmt.Errorf("re-execute recovered block %d: %w", block.NumberU64(), executeErr)
+		}
+		receipts[block.Hash()] = blockReceipts
 	}
 
-	// Notify local sealer only for blocks we authored
-	// Only send the target block (newest), not all ancestors
-	targetBlock := uncommittedAncestors[len(uncommittedAncestors)-1]
-	if h.IsLocalBlock(targetBlock.Header()) {
-		select {
-		case h.commitCh <- targetBlock:
-			log.Debug("Committed target block sent to commit channel",
-				"hash", targetBlock.Hash().Hex()[:8],
-				"number", targetBlock.NumberU64())
-		default:
-			log.Warn("Commit channel is full, cannot send committed block",
-				"hash", targetBlock.Hash().Hex()[:8],
-				"number", targetBlock.NumberU64())
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	st = h.getHsState()
+	if st == nil || st.highQC == nil || st.highQC.BlockHash != highQC.BlockHash || st.highQC.View != highQC.View {
+		return errors.New("HotStuff HighQC changed during speculative-tail recovery")
+	}
+	for view, qc := range recoveredQCs {
+		if existing := st.qcsByView[view]; existing != nil && existing.BlockHash != qc.BlockHash {
+			return fmt.Errorf("recovered QC conflicts with runtime QC at view %d", view)
 		}
 	}
-
-	log.Info("Successfully committed block with all ancestors",
-		"targetBlock", block.NumberU64(),
-		"committedCount", len(uncommittedAncestors))
-
+	for view, hash := range recoveredViews {
+		if existing := st.proposalsByView[view]; existing != nil && existing.Hash() != hash {
+			return fmt.Errorf("recovered proposal conflicts with runtime proposal at view %d", view)
+		}
+	}
+	for view, qc := range recoveredQCs {
+		if existing := st.qcsByView[view]; existing == nil || (!existing.hasAggregateProof() && qc.hasAggregateProof()) {
+			st.qcsByView[view] = qc
+		}
+	}
+	for _, block := range tail {
+		header := block.Header()
+		hash := block.Hash()
+		view := getViewFromHeader(header, h.chainConfig)
+		st.proposalsByView[view] = header
+		st.proposalsByHash[hash] = header
+		st.proposalsByHashBlock[hash] = block
+		st.proposalsByHashReceipts[hash] = receipts[hash]
+		st.prewritten[hash] = struct{}{}
+	}
+	success = true
+	log.Info("Recovered HotStuff speculative tail from WAL HighQC",
+		"target", highQC.BlockHash, "view", highQC.View, "blocks", len(tail), "qcs", len(recoveredQCs))
 	return nil
 }
 
@@ -683,7 +783,11 @@ func (h *Hotstuff) buildBlockAndReceipts(header *types.Header, txs []*types.Tran
 // prewriteBlock writes header/body/receipts into rawdb without touching canonical head.
 // CRITICAL: This function acquires its own lock to protect map access
 func (h *Hotstuff) prewriteBlock(hash common.Hash) bool {
-	// Phase 1: Get block and receipts from state
+	// Serialize metadata prewrites with canonical insertion so a late
+	// synthetic-TD batch cannot overwrite InsertChain's canonical metadata.
+	h.stateLock.Lock()
+	defer h.stateLock.Unlock()
+
 	h.lock.RLock()
 	st := h.getHsState()
 	if st == nil {
@@ -696,30 +800,31 @@ func (h *Hotstuff) prewriteBlock(hash common.Hash) bool {
 		return false
 	}
 	blk := st.proposalsByHashBlock[hash]
-	rcpts := st.proposalsByHashReceipts[hash]
+	rcpts, receiptsKnown := st.proposalsByHashReceipts[hash]
 	h.lock.RUnlock()
 
-	if blk == nil {
+	if blk == nil || !receiptsKnown || h.db == nil {
 		hotstuffPrewriteMissCounter.Inc(1)
 		return false
 	}
 
-	// Phase 2: Write to database
-	rawdb.WriteBlock(h.db, blk)
-	withdrawalsHashStr := "nil"
-	if blk.Header().WithdrawalsHash != nil {
-		withdrawalsHashStr = blk.Header().WithdrawalsHash.Hex()
+	// Persist all metadata in one batch. The state trie deliberately remains
+	// speculative and is re-executed by InsertChain after a 3-chain commit.
+	batch := h.db.NewBatch()
+	rawdb.WriteTd(batch, blk.Hash(), blk.NumberU64(), h.prewriteTotalDifficulty(blk))
+	rawdb.WriteBlock(batch, blk)
+	rawdb.WriteReceipts(batch, blk.Hash(), blk.NumberU64(), rcpts)
+	if h.chainConfig != nil && h.chainConfig.IsCancun(blk.Number(), blk.Time()) {
+		rawdb.WriteBlobSidecars(batch, blk.Hash(), blk.NumberU64(), blk.Sidecars())
 	}
-	log.Info("prewriteBlock", "number", blk.Number().Uint64(), "with", withdrawalsHashStr)
-	if rcpts != nil {
-		rawdb.WriteReceipts(h.db, blk.Hash(), blk.NumberU64(), rcpts)
+	if err := batch.Write(); err != nil {
+		log.Error("Failed to prewrite HotStuff block", "number", blk.NumberU64(), "hash", blk.Hash(), "err", err)
+		return false
 	}
-	rawdb.WriteHeaderNumber(h.db, blk.Hash(), blk.NumberU64())
 
-	// Phase 3: Mark as prewritten (short lock)
 	h.lock.Lock()
 	st = h.getHsState()
-	if st != nil {
+	if st != nil && st.proposalsByHashBlock[hash] != nil {
 		st.prewritten[hash] = struct{}{}
 	}
 	h.lock.Unlock()
@@ -728,26 +833,125 @@ func (h *Hotstuff) prewriteBlock(hash common.Hash) bool {
 	return true
 }
 
+func (h *Hotstuff) prewriteTotalDifficulty(block *types.Block) *big.Int {
+	if block.NumberU64() == 0 {
+		return block.Difficulty()
+	}
+	var parentTD *big.Int
+	if h.chain != nil {
+		parentTD = h.chain.GetTd(block.ParentHash(), block.NumberU64()-1)
+	}
+	if parentTD == nil {
+		parentTD = rawdb.ReadTd(h.db, block.ParentHash(), block.NumberU64()-1)
+	}
+	if parentTD == nil {
+		// HotStuff does not use TD for fork choice, but freezer and known-block
+		// recovery still require a value for every persisted header.
+		parentTD = new(big.Int).SetUint64(block.NumberU64() - 1)
+		log.Warn("Synthesizing missing parent TD for HotStuff prewrite",
+			"number", block.NumberU64(), "parent", block.ParentHash())
+	}
+	return new(big.Int).Add(parentTD, block.Difficulty())
+}
+
+// GetProposalState returns an isolated copy of a speculative proposal state.
+// Callers may mutate the returned StateDB without changing the cached snapshot.
+func (h *Hotstuff) GetProposalState(hash common.Hash) *state.StateDB {
+	h.lock.RLock()
+	st := h.getHsState()
+	if st == nil || st.proposalStates == nil {
+		h.lock.RUnlock()
+		return nil
+	}
+	cached := st.proposalStates[hash]
+	h.lock.RUnlock()
+	if cached == nil {
+		return nil
+	}
+	return cached.Copy()
+}
+
+func (h *Hotstuff) hasProposalState(hash common.Hash) bool {
+	h.lock.RLock()
+	defer h.lock.RUnlock()
+	st := h.getHsState()
+	return st != nil && st.proposalStates != nil && st.proposalStates[hash] != nil
+}
+
+func (h *Hotstuff) cacheProposalState(hash common.Hash, statedb *state.StateDB) {
+	if statedb == nil {
+		return
+	}
+	cached := statedb.Copy()
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	st := h.getHsState()
+	if st == nil {
+		return
+	}
+	if st.proposalStates == nil {
+		st.proposalStates = make(map[common.Hash]*state.StateDB)
+	}
+	st.proposalStates[hash] = cached
+}
+
+// DiscardProposalState removes a failed proposal and any already-cached
+// descendants. Protocol paths that reject a proposal after execution can call
+// this method to avoid retaining an unusable branch.
+func (h *Hotstuff) DiscardProposalState(hash common.Hash) {
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	st := h.getHsState()
+	if st == nil || st.proposalStates == nil {
+		return
+	}
+	// A same-hash retransmission can fail after the original proposal was
+	// accepted. Never remove the state backing an already-recorded proposal.
+	if st.proposalsByHashBlock[hash] != nil {
+		return
+	}
+	discarded := map[common.Hash]struct{}{hash: {}}
+	for changed := true; changed; {
+		changed = false
+		for candidate := range st.proposalStates {
+			proposal := st.proposalsByHashBlock[candidate]
+			if proposal == nil {
+				continue
+			}
+			if _, ok := discarded[proposal.ParentHash()]; ok {
+				if _, seen := discarded[candidate]; !seen {
+					discarded[candidate] = struct{}{}
+					changed = true
+				}
+			}
+		}
+	}
+	for candidate := range discarded {
+		delete(st.proposalStates, candidate)
+	}
+}
+
 // executeBlocks executes the transactions in a block and validates their correctness
 // It prevents double-spending and malicious transactions by current view's leader
 // Returns only receipts; block should be constructed by caller with received header
 func (h *Hotstuff) executeBlocks(header *types.Header, txs []*types.Transaction) (types.Receipts, error) {
-	// Try to get parent from canonical chain first
-	parent := h.chain.GetHeaderByHash(header.ParentHash)
-
-	// If not in canonical chain, try HotStuff state (for pipelined proposals)
-	if parent == nil {
-		log.Debug("executeBlocks: parent not in canonical chain, trying HotStuff state",
-			"parentHash", header.ParentHash.Hex()[:10],
-			"blockNumber", header.Number.Uint64())
-
-		parentBlock := h.GetBlockFromState(header.ParentHash)
-		if parentBlock != nil {
-			parent = parentBlock.Header()
-			log.Debug("executeBlocks: got parent from HotStuff state",
-				"parentHash", header.ParentHash.Hex()[:10],
-				"parentNumber", parent.Number.Uint64())
+	headerHash := header.Hash()
+	hadCachedState := h.hasProposalState(headerHash)
+	validated := false
+	defer func() {
+		if !validated && !hadCachedState {
+			h.DiscardProposalState(headerHash)
 		}
+	}()
+
+	// Prefer the in-memory proposal because prewritten blocks are visible via
+	// GetHeaderByHash even though their state is intentionally not in pathdb.
+	var parent *types.Header
+	if parentBlock := h.GetBlockFromState(header.ParentHash); parentBlock != nil {
+		parent = parentBlock.Header()
+	}
+	if parent == nil {
+		parent = h.chain.GetHeaderByHash(header.ParentHash)
 	}
 
 	if parent == nil {
@@ -757,11 +961,14 @@ func (h *Hotstuff) executeBlocks(header *types.Header, txs []*types.Transaction)
 		return nil, errors.New("parent not found for execution")
 	}
 
-	// 尝试通过 BlockChain.StateAt 获取状态（使用正确的 triedb 配置）
-	var statedb *state.StateDB
+	// Every child mutates a Copy. The cached parent snapshot remains immutable
+	// and can safely back competing proposals in the same or later views.
+	statedb := h.GetProposalState(header.ParentHash)
 	var err error
-
-	if bc, ok := h.chain.(interface {
+	if statedb != nil {
+		log.Debug("Executing proposal from speculative parent state",
+			"parent", header.ParentHash, "number", header.Number)
+	} else if bc, ok := h.chain.(interface {
 		StateAt(root common.Hash) (*state.StateDB, error)
 	}); ok {
 		statedb, err = bc.StateAt(parent.Root)
@@ -775,15 +982,13 @@ func (h *Hotstuff) executeBlocks(header *types.Header, txs []*types.Transaction)
 			return nil, fmt.Errorf("parent state unavailable (schema mismatch?): %w", err)
 		}
 	} else {
-		// 降级方案：使用临时 triedb（可能在创世块场景下有问题）
 		if h.db == nil {
 			return nil, errors.New("state db not available")
 		}
 		tdb := state.NewDatabase(triedb.NewDatabase(h.db, triedb.HashDefaults), nil)
 		statedb, err = state.New(parent.Root, tdb)
 		if err != nil {
-			log.Debug("Parent state not available, skip full execution", "parent", header.ParentHash, "err", err)
-			return nil, h.executeBlocksLightweight(header, txs)
+			return nil, fmt.Errorf("parent state unavailable: %w", err)
 		}
 	}
 
@@ -919,68 +1124,10 @@ func (h *Hotstuff) executeBlocks(header *types.Header, txs []*types.Transaction)
 		return nil, fmt.Errorf("bloom mismatch")
 	}
 
-	// CRITICAL: Must persist state for Chained HotStuff!
-	// In Chained HotStuff, Block N+1 needs Block N's state, but Block N is not yet
-	// committed to canonical chain (waiting for 3-chain rule).
-	//
-	// Strategy: Commit state WITHOUT triggering snapshot operations
-	// - statedb.Commit(noStorageWiping=true): Skip snapshot update/cap to avoid conflicts
-	// - tdb.Commit(): Write trie nodes to database for future access
-	// - InsertChain will do the full commit (with snapshot) later
-	log.Info("executeBlocks: acquiring stateLock for Commit",
-		"block", header.Number,
-		"hash", header.Hash().Hex()[:8],
-		"goroutine", getGoroutineID())
-	h.stateLock.Lock()
-	log.Info("executeBlocks: acquired stateLock",
-		"block", header.Number,
-		"hash", header.Hash().Hex()[:8],
-		"goroutine", getGoroutineID())
-
-	// Use noStorageWiping=true to skip snapshot operations and avoid "parent disk layer is stale"
-	root, err := statedb.Commit(header.Number.Uint64(), h.chainConfig.IsEIP158(header.Number), true)
-
-	h.stateLock.Unlock()
-	log.Info("executeBlocks: released stateLock",
-		"block", header.Number,
-		"hash", header.Hash().Hex()[:8],
-		"goroutine", getGoroutineID())
-
-	if err != nil {
-		return nil, fmt.Errorf("state commit failed: %w", err)
-	}
-
-	// Double check: committed root should match header.Root
-	if root != header.Root {
-		log.Warn("Committed state root doesn't match header root",
-			"committed", root.Hex()[:8],
-			"header", header.Root.Hex()[:8])
-	}
-
-	// Write trie nodes to database so they're available for future block building
-	// This is the critical part - makes state accessible for next block
-	if tdb := statedb.Database().TrieDB(); tdb != nil {
-		if err := tdb.Commit(root, false); err != nil {
-			// Non-fatal: state changes are in memory, can still be used
-			// But future blocks might have issues loading this state
-			log.Warn("Failed to commit state trie to db (will retry on blockchain insert)",
-				"block", header.Number,
-				"root", root.Hex()[:8],
-				"err", err)
-		} else {
-			log.Debug("State trie committed to database",
-				"block", header.Number,
-				"root", root.Hex()[:8],
-				"hash", header.Hash().Hex()[:8])
-		}
-	}
-
-	// 验证通过，说明：
-	// 1. 所有交易（普通+系统）执行结果正确
-	// 2. 没有双花（state 变更正确）
-	// 3. 系统交易合法（如奖励分配、validator 更新等）
-	// 4. State已持久化到database，可供下一个block使用
-
+	// Keep the validated state in an isolated in-memory overlay. Canonical
+	// InsertChain deliberately re-executes and performs the only durable commit.
+	h.cacheProposalState(headerHash, statedb)
+	validated = true
 	return receipts, nil
 }
 

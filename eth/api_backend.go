@@ -27,7 +27,6 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
-	"github.com/ethereum/go-ethereum/consensus/parlia"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/filtermaps"
 	"github.com/ethereum/go-ethereum/core/history"
@@ -510,10 +509,21 @@ func (b *EthAPIBackend) Engine() consensus.Engine {
 }
 
 func (b *EthAPIBackend) CurrentValidators() ([]common.Address, error) {
-	if p, ok := b.eth.engine.(*parlia.Parlia); ok {
-		service := p.APIs(b.Chain())[0].Service
-		currentHead := rpc.LatestBlockNumber
-		return service.(*parlia.API).GetValidators(&currentHead)
+	type validatorAPI interface {
+		GetValidators(*rpc.BlockNumber) ([]common.Address, error)
+	}
+	provider, ok := b.eth.engine.(interface {
+		APIs(consensus.ChainHeaderReader) []rpc.API
+	})
+	if !ok {
+		return nil, errors.New("not supported")
+	}
+	apis := provider.APIs(b.Chain())
+	for i := len(apis) - 1; i >= 0; i-- {
+		if service, ok := apis[i].Service.(validatorAPI); ok {
+			currentHead := rpc.LatestBlockNumber
+			return service.GetValidators(&currentHead)
+		}
 	}
 
 	return []common.Address{}, errors.New("not supported")

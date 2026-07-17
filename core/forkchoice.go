@@ -74,16 +74,18 @@ func NewForkChoice(chainReader ChainReader) *ForkChoice {
 // total difficulty is higher. In the extern mode, the trusted
 // header is always selected as the head.
 func (f *ForkChoice) ReorgNeeded(current *types.Header, extern *types.Header) (bool, error) {
-	// CRITICAL FIX: For HotStuff consensus, skip TD comparison
-	// HotStuff uses QC-based finality, not total difficulty
-	// Blocks are already validated by QC before reaching here
-	if f.chain.Config().IsHotstuff(extern.Number) {
-		// In HotStuff, always accept blocks from canonical chain commits
-		// The 3-chain rule ensures safety
-		log.Debug("ReorgNeeded: HotStuff mode, accepting block without TD check",
-			"externNumber", extern.Number.Uint64(),
-			"externHash", extern.Hash().Hex()[:8])
-		return true, nil
+	// HotStuff fork choice must not turn header validity into permission to
+	// replace the canonical branch. Until committed-QC metadata is available to
+	// this layer, only advance by one block directly on top of the current head.
+	if f.chain.Config().IsHotstuff(current.Number) || f.chain.Config().IsHotstuff(extern.Number) {
+		next := new(big.Int).Add(current.Number, common.Big1)
+		extendsHead := extern.Number.Cmp(next) == 0 && extern.ParentHash == current.Hash()
+		if !extendsHead {
+			log.Debug("Rejected HotStuff branch change without committed proof",
+				"currentNumber", current.Number, "currentHash", current.Hash(),
+				"externNumber", extern.Number, "externHash", extern.Hash(), "externParent", extern.ParentHash)
+		}
+		return extendsHead, nil
 	}
 
 	var (
@@ -139,6 +141,9 @@ func (f *ForkChoice) ReorgNeeded(current *types.Header, extern *types.Header) (b
 
 // ReorgNeededWithFastFinality compares justified block numbers firstly, backoff to compare tds when equal
 func (f *ForkChoice) ReorgNeededWithFastFinality(current *types.Header, header *types.Header) (bool, error) {
+	if f.chain.Config().IsHotstuff(current.Number) || f.chain.Config().IsHotstuff(header.Number) {
+		return f.ReorgNeeded(current, header)
+	}
 	_, ok := f.chain.Engine().(consensus.PoSA)
 	if !ok {
 		return f.ReorgNeeded(current, header)

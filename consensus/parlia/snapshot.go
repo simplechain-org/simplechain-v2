@@ -201,8 +201,11 @@ func (s *Snapshot) updateAttestation(header *types.Header, chainConfig *params.C
 	}
 
 	// The attestation should have been checked in verify header, update directly
-	attestation, _ := getVoteAttestationFromHeader(header, chainConfig, s.EpochLength)
-	if attestation == nil {
+	attestation, err := getVoteAttestationFromHeader(header, chainConfig, s.EpochLength)
+	if err != nil || attestation == nil || attestation.Data == nil {
+		if err != nil {
+			log.Debug("Ignore malformed vote attestation while updating snapshot", "block", header.Number, "err", err)
+		}
 		return
 	}
 

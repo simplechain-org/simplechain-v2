@@ -1,20 +1,43 @@
 package hotstuff
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/protocols/hs"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 )
+
+var errHotstuffProtocolInactive = errors.New("HotStuff protocol is not active")
+
+func (h *Hotstuff) hsProtocolActive() bool {
+	if h == nil || h.chain == nil || h.chainConfig == nil {
+		return false
+	}
+	head := h.chain.CurrentHeader()
+	if head == nil || head.Number == nil {
+		return false
+	}
+	if h.chainConfig.IsHotstuff(head.Number) {
+		return true
+	}
+	next := new(big.Int).Add(head.Number, common.Big1)
+	active := h.chainConfig.IsOnHotstuff(next)
+	if active {
+		h.ensureBootstrapAtHead()
+	}
+	return active
+}
 
 // OnHsProposal handles a leader proposal: verify safety and record, then vote.
 func (h *Hotstuff) OnHsProposal(peerID string, pkt interface{}) error {
@@ -31,6 +54,9 @@ func (h *Hotstuff) OnHsProposal(peerID string, pkt interface{}) error {
 	if err := rlp.DecodeBytes(pp.HeaderRLP, &header); err != nil {
 		return fmt.Errorf("decode header: %w", err)
 	}
+	if header.Number == nil || !h.chainConfig.IsHotstuff(header.Number) || !h.hsProtocolActive() {
+		return errHotstuffProtocolInactive
+	}
 	// Optionally decode body if provided for downstream use
 	var body types.Body
 	if err := rlp.DecodeBytes(pp.BodyRLP, &body); err != nil {
@@ -42,13 +68,19 @@ func (h *Hotstuff) OnHsProposal(peerID string, pkt interface{}) error {
 	}
 	// Use view number carried by ProposalPacket.View
 	view := pp.View
-	headerView := getViewFromHeader(&header)
+	headerView := getViewFromHeader(&header, h.chainConfig)
 	if headerView != view {
 		log.Debug("Reject proposal: packet view mismatch with header view",
 			"packetView", view,
 			"headerView", headerView,
 			"block", header.Number.Uint64(),
 			"hash", header.Hash().Hex()[:10])
+		return nil
+	}
+	hasSyncInfo, headerQCView, headerQCHash, _, headerQCSigners, headerQCSig, _ := parseSyncInfoWithProof(&header, h.chainConfig)
+	if !hasSyncInfo || headerQCHash != pp.HighQC.BlockHash || headerQCView != pp.HighQC.View ||
+		headerQCSigners != pp.HighQC.SignersSet || !bytes.Equal(headerQCSig, pp.HighQC.Sig) {
+		log.Debug("Reject proposal: packet HighQC does not match header SyncInfo", "view", view, "block", header.Hash())
 		return nil
 	}
 	log.Debug("OnHsProposal", "peerID", peerID, "view", view, "block", header.Number.Uint64())
@@ -60,7 +92,41 @@ func (h *Hotstuff) OnHsProposal(peerID string, pkt interface{}) error {
 		"headerNumber", header.Number.Uint64(),
 		"headerCoinbase", header.Coinbase.Hex())
 
-	// ========== Phase 2: Verify and check state (needs lock for reading st) ==========
+	// Expensive certificate and snapshot verification must not hold h.lock. A
+	// malicious proposal can otherwise block votes, QCs and timeout processing.
+	verifiedTC, err := h.parseTimeoutCert(&header)
+	if err != nil {
+		log.Debug("Invalid proposal: failed to parse TimeoutCert", "view", view, "err", err)
+		return nil
+	}
+	if verifiedTC != nil && !h.verifyTimeoutCert(verifiedTC) {
+		log.Debug("Invalid proposal: TimeoutCert aggregate signature invalid", "view", view)
+		return nil
+	}
+	if pp.HighQC.BlockHash == (common.Hash{}) {
+		log.Debug("Invalid proposal: missing HighQC after HotStuff activation", "view", view, "block", header.Number.Uint64())
+		return nil
+	}
+	if pp.HighQC.View >= view {
+		log.Debug("Invalid proposal: HighQC view not less than proposal view", "hqcv", pp.HighQC.View, "view", view)
+		return nil
+	}
+	if header.ParentHash != pp.HighQC.BlockHash {
+		log.Warn("Invalid proposal: HighQC does not justify parent",
+			"view", view, "headerParentHash", header.ParentHash, "highQCBlockHash", pp.HighQC.BlockHash)
+		return nil
+	}
+	if !h.verifyHighQCPayload(pp.HighQC.BlockHash, pp.HighQC.View, pp.HighQC.SignersSet, pp.HighQC.Sig) {
+		log.Debug("Invalid proposal: HighQC aggregate signature invalid", "view", view)
+		return nil
+	}
+	leader, err := h.getLeaderForViewAt(h.chain, header.ParentHash, view)
+	if err != nil || leader != header.Coinbase {
+		log.Debug("Ignore proposal from non-leader", "view", view, "leader", leader, "proposer", header.Coinbase, "err", err)
+		return nil
+	}
+
+	// ========== Phase 2: Recheck safety state and reserve processing ==========
 	log.Info("[OnHsProposal] Acquiring lock for state access", "peerID", peerID)
 	h.lock.Lock()
 
@@ -71,102 +137,14 @@ func (h *Hotstuff) OnHsProposal(peerID string, pkt interface{}) error {
 		return nil
 	}
 
-	// If TimeoutCert is embedded in header, verify it
-	tc, tcErr := h.parseTimeoutCert(&header)
-	if tcErr != nil {
-		log.Debug("Invalid proposal: failed to parse TimeoutCert", "view", view, "err", tcErr)
+	if st.lockedQC != nil && (pp.HighQC.View < st.lockedQC.View ||
+		(pp.HighQC.View == st.lockedQC.View && pp.HighQC.BlockHash != st.lockedQC.BlockHash)) {
+		log.Warn("Reject proposal that violates persisted HotStuff lock",
+			"proposalQCView", pp.HighQC.View, "proposalQCHash", pp.HighQC.BlockHash,
+			"lockedView", st.lockedQC.View, "lockedHash", st.lockedQC.BlockHash)
 		h.lock.Unlock()
 		return nil
 	}
-	if tc != nil {
-		if !h.verifyTimeoutCert(tc) {
-			log.Debug("Invalid proposal: TimeoutCert aggregate signature invalid", "view", view)
-			h.lock.Unlock()
-			return nil
-		}
-	}
-	// Validate HighQC carried in proposal (if present)
-	proposalHighQCVerified := false
-	if pp.HighQC.View > 0 {
-		log.Warn("OnHsProposal: received proposal with HighQC",
-			"proposalView", view,
-			"highQCView", pp.HighQC.View,
-			"highQCBlockHash", pp.HighQC.BlockHash.Hex()[:10],
-			"headerParentHash", header.ParentHash.Hex()[:10])
-
-		// Rule: HighQC.View < view, and HighQC must be valid aggregated signature from current validator set
-		if pp.HighQC.View >= view {
-			log.Debug("Invalid proposal: HighQC view not less than proposal view", "hqcv", pp.HighQC.View, "view", view)
-			h.lock.Unlock()
-			return nil
-		}
-		// Verify QC aggregate signature using signer set embedded in HighQC
-		log.Debug("OnHsProposal: constructing QC packet for verification",
-			"view", view,
-			"highQCView", pp.HighQC.View,
-			"highQCBlockHash", pp.HighQC.BlockHash.Hex()[:8],
-			"signersSet", pp.HighQC.SignersSet,
-			"aggSigLen", len(pp.HighQC.Sig))
-		qcPkt := &hs.QuorumCertPacket{TargetHash: pp.HighQC.BlockHash, ViewNumber: pp.HighQC.View, SignersSet: pp.HighQC.SignersSet, AggregateSig: pp.HighQC.Sig}
-		if !h.verifyAggregateQC(qcPkt) {
-			log.Debug("Invalid proposal: HighQC aggregate signature invalid", "view", view)
-			h.lock.Unlock()
-			return nil
-		}
-		proposalHighQCVerified = true
-		log.Debug("OnHsProposal: HighQC verification passed", "view", view, "highQCView", pp.HighQC.View)
-		// CRITICAL: In Chained HotStuff, HighQC.BlockHash should equal header.ParentHash
-		// This ensures the proposal extends from the certified block
-		if header.ParentHash != pp.HighQC.BlockHash {
-			log.Warn("Invalid proposal: HighQC does not justify parent",
-				"view", view,
-				"headerParentHash", header.ParentHash.Hex()[:10],
-				"highQCBlockHash", pp.HighQC.BlockHash.Hex()[:10],
-				"headerNumber", header.Number.Uint64())
-			h.lock.Unlock()
-			return nil
-		}
-		// Update local HighQC if higher - this allows catch-up
-		if st.highQC == nil || pp.HighQC.View > st.highQC.View {
-			log.Info("OnHsProposal: updating highQC from proposal",
-				"oldHighQCView", func() uint64 {
-					if st.highQC != nil {
-						return st.highQC.View
-					}
-					return 0
-				}(),
-				"newHighQCView", pp.HighQC.View,
-				"newHighQCBlock", pp.HighQC.BlockHash.Hex()[:10],
-				"newSignersSet", pp.HighQC.SignersSet,
-				"newAggSigLen", len(pp.HighQC.Sig))
-			st.highQC = &HsQC{BlockHash: pp.HighQC.BlockHash, View: pp.HighQC.View, Sig: pp.HighQC.Sig, SignersSet: pp.HighQC.SignersSet}
-			st.qcsByView[pp.HighQC.View] = st.highQC
-
-			// DEBUG: Verify the stored QC immediately
-			log.Debug("OnHsProposal: stored highQC details",
-				"view", st.highQC.View,
-				"blockHash", st.highQC.BlockHash.Hex()[:8],
-				"signersSet", st.highQC.SignersSet,
-				"aggSigLen", len(st.highQC.Sig))
-		}
-	} else {
-		log.Warn("OnHsProposal: received proposal WITHOUT HighQC",
-			"proposalView", view,
-			"headerNumber", header.Number.Uint64())
-		if h.chainConfig.IsHotstuff(header.Number) && !h.chainConfig.IsOnHotstuff(header.Number) {
-			log.Debug("Invalid proposal: missing HighQC after HotStuff activation", "view", view, "block", header.Number.Uint64())
-			h.lock.Unlock()
-			return nil
-		}
-	}
-	// Verify leader using parent-hash contextual snapshot to avoid divergence
-	leader, _ := h.getLeaderForViewAt(h.chain, header.ParentHash, view)
-	if leader != header.Coinbase {
-		log.Debug("Ignore proposal from non-leader", "view", view, "leader", leader, "proposer", header.Coinbase)
-		h.lock.Unlock()
-		return nil
-	}
-
 	// Check safety condition: parent must exist or be processing
 	// Distinguish between two cases:
 	// 1. Parent is being processed (concurrent) → cache proposal and wait
@@ -178,6 +156,10 @@ func (h *Hotstuff) OnHsProposal(peerID string, pkt interface{}) error {
 
 	if !parentInChain && !parentInState {
 		if parentProcessing {
+			if _, exists := st.pendingProposalsByHash[headerHash]; exists {
+				h.lock.Unlock()
+				return nil
+			}
 			// Parent is currently being processed - cache this proposal
 			log.Info("Proposal parent is being processed, caching proposal",
 				"view", view,
@@ -195,13 +177,14 @@ func (h *Hotstuff) OnHsProposal(peerID string, pkt interface{}) error {
 			st.pendingProposals[header.ParentHash] = append(st.pendingProposals[header.ParentHash], pending)
 			// Index by proposal hash (for QC-triggered processing)
 			st.pendingProposalsByHash[headerHash] = pending
+			cachedCount := len(st.pendingProposals[header.ParentHash])
 
 			h.lock.Unlock()
 			log.Debug("Proposal cached, waiting for parent to complete or QC arrival",
 				"view", view,
 				"parentHash", header.ParentHash.Hex()[:10],
 				"proposalHash", headerHash.Hex()[:10],
-				"cachedCount", len(st.pendingProposals[header.ParentHash]))
+				"cachedCount", cachedCount)
 			return nil // Not an error, just waiting
 		} else {
 			// Parent is not processing and doesn't exist - reject as invalid
@@ -228,15 +211,14 @@ func (h *Hotstuff) OnHsProposal(peerID string, pkt interface{}) error {
 
 	// Parent exists - accept catch-up proposals only if they carry a verified higher HighQC.
 	if st.highQC != nil && header.ParentHash != st.highQC.BlockHash {
-		if !proposalHighQCVerified || pp.HighQC.View <= st.highQC.View {
+		if pp.HighQC.View <= st.highQC.View {
 			log.Warn("Reject proposal that does not extend local highQC",
 				"view", view,
 				"blockNumber", header.Number.Uint64(),
 				"proposalParent", header.ParentHash.Hex()[:10],
 				"localHighQCBlock", st.highQC.BlockHash.Hex()[:10],
 				"localHighQCView", st.highQC.View,
-				"proposalHighQCView", pp.HighQC.View,
-				"proposalHighQCVerified", proposalHighQCVerified)
+				"proposalHighQCView", pp.HighQC.View)
 			h.lock.Unlock()
 			return nil
 		}
@@ -261,19 +243,68 @@ func (h *Hotstuff) OnHsProposal(peerID string, pkt interface{}) error {
 		h.lock.Unlock()
 		return nil
 	}
+	h.lock.Unlock()
+
+	// Header verification performs signature recovery and snapshot traversal.
+	// Recheck mutable safety state after it completes.
 	if err := h.verifyHeader(h.chain, &header, parents); err != nil {
 		log.Warn("Reject proposal: header verification failed",
 			"view", view,
 			"blockNumber", header.Number.Uint64(),
 			"hash", headerHash.Hex()[:10],
 			"err", err)
+		return nil
+	}
+
+	h.lock.Lock()
+	st = h.getHsState()
+	if st == nil {
 		h.lock.Unlock()
 		return nil
+	}
+	if st.lockedQC != nil && (pp.HighQC.View < st.lockedQC.View ||
+		(pp.HighQC.View == st.lockedQC.View && pp.HighQC.BlockHash != st.lockedQC.BlockHash)) {
+		h.lock.Unlock()
+		return nil
+	}
+	if st.highQC != nil && header.ParentHash != st.highQC.BlockHash && pp.HighQC.View <= st.highQC.View {
+		h.lock.Unlock()
+		return nil
+	}
+	if existing := st.proposalsByView[view]; existing != nil {
+		h.lock.Unlock()
+		if existing.Hash() != headerHash {
+			log.Warn("Reject conflicting proposal before execution", "view", view, "existing", existing.Hash(), "proposal", headerHash)
+		}
+		return nil
+	}
+	if _, processing := st.processingBlocks[headerHash]; processing {
+		h.lock.Unlock()
+		return nil
+	}
+	parentInChain = h.chain.GetHeaderByHash(header.ParentHash) != nil
+	parentInState = h.getBlockFromStateUnsafe(header.ParentHash) != nil
+	if !parentInChain && !parentInState {
+		h.lock.Unlock()
+		return nil
+	}
+	if st.highQC == nil || pp.HighQC.View > st.highQC.View {
+		st.highQC = &HsQC{
+			BlockHash:  pp.HighQC.BlockHash,
+			View:       pp.HighQC.View,
+			Sig:        common.CopyBytes(pp.HighQC.Sig),
+			SignersSet: pp.HighQC.SignersSet,
+		}
+		st.qcsByView[pp.HighQC.View] = st.highQC
+		if err := h.checkpointHsStateLocked(); err != nil {
+			log.Error("Failed to persist proposal HighQC", "view", pp.HighQC.View, "err", err)
+		}
 	}
 
 	// Mark block as processing before releasing lock
 	st.processingBlocks[headerHash] = struct{}{}
 	log.Debug("[OnHsProposal] Marked block as processing", "hash", headerHash.Hex()[:10], "view", view)
+	executingState := st
 
 	// Release lock before executeBlocks (it may need to acquire RLock internally)
 	log.Info("[OnHsProposal] Releasing lock before executeBlocks", "peerID", peerID)
@@ -306,6 +337,7 @@ func (h *Hotstuff) OnHsProposal(peerID string, pkt interface{}) error {
 	// Re-get state after re-acquiring lock (state might have changed)
 	st = h.getHsState()
 	if st == nil {
+		delete(executingState.proposalStates, headerHash)
 		h.lock.Unlock()
 		return nil
 	}
@@ -318,11 +350,6 @@ func (h *Hotstuff) OnHsProposal(peerID string, pkt interface{}) error {
 		body.Withdrawals = make([]*types.Withdrawal, 0)
 	}
 	block := types.NewBlockWithHeader(&header).WithBody(body)
-
-	// find blocks which can be commit and commit
-	if err := h.tryCommitBlocks(st, header.Hash(), view); err != nil {
-		log.Debug("Try commit blocks failed", "view", view, "hash", header.Hash(), "err", err)
-	}
 
 	// Header SyncInfo is verified during block validation. Runtime highQC is
 	// advanced only from proposal/QC messages carrying aggregate proof.
@@ -339,6 +366,7 @@ func (h *Hotstuff) OnHsProposal(peerID string, pkt interface{}) error {
 				"newBlock", header.Hash().Hex()[:10],
 				"newNumber", header.Number.Uint64(),
 				"leader", header.Coinbase.Hex())
+			delete(st.proposalStates, headerHash)
 			h.lock.Unlock()
 			return nil // Reject the duplicate proposal
 		} else {
@@ -368,6 +396,12 @@ func (h *Hotstuff) OnHsProposal(peerID string, pkt interface{}) error {
 	// which is essential when executeBlocks (Phase 3, no lock) calls GetBlockFromState
 	// while another goroutine is waiting for h.lock.Lock().
 	h.proposalBlocksCache.Store(headerHash, block)
+
+	// A QC may arrive before its proposal body has finished execution. Retry the
+	// 3-chain commit only after the certified block is present in state.
+	if err := h.tryCommitBlocks(st, headerHash, view); err != nil {
+		log.Debug("Try commit blocks failed", "view", view, "hash", headerHash, "err", err)
+	}
 
 	// Remove from processing set and trigger pending proposals
 	delete(st.processingBlocks, headerHash)
@@ -401,28 +435,16 @@ func (h *Hotstuff) OnHsProposal(peerID string, pkt interface{}) error {
 			"blockHash", headerHash.Hex()[:10])
 	}
 
-	// Vote for the proposal with BLS (only if still relevant)
-	var vote *hs.VotePacket
-	if shouldVote && h.voteSigner != nil {
-		// sign digest(BlockHash, ViewNumber)
-		digest := h.hsVoteDigest(headerHash, view)
-		pub, sig, err := h.signHsVote(digest)
-		if err != nil {
-			log.Warn("Failed to sign hs vote", "view", view, "err", err)
+	// Persist the anti-double-vote decision under lock. The potentially slow
+	// wallet/BLS operation is performed after releasing the state lock.
+	shouldSignVote := false
+	if shouldVote && h.blsVoteSigner() != nil {
+		if err := h.prepareVoteLocked(view, headerHash); err != nil {
+			log.Error("Refusing to sign HotStuff vote without durable safety state", "view", view, "hash", headerHash, "err", err)
 			h.lock.Unlock()
 			return nil
 		}
-		vote = &hs.VotePacket{BlockHash: headerHash, ViewNumber: view, VotePubKey: pub, Signature: sig}
-
-		// Record vote in state
-		addr := h.val
-		if st.votes[view] == nil {
-			st.votes[view] = make(map[common.Hash]map[common.Address]*hs.VotePacket)
-		}
-		if st.votes[view][headerHash] == nil {
-			st.votes[view][headerHash] = make(map[common.Address]*hs.VotePacket)
-		}
-		st.votes[view][headerHash][addr] = vote
+		shouldSignVote = true
 	} else if shouldVote {
 		// No signer configured
 		log.Warn("No BLS vote signer configured; skip voting")
@@ -433,6 +455,31 @@ func (h *Hotstuff) OnHsProposal(peerID string, pkt interface{}) error {
 	h.lock.Unlock()
 
 	// ========== Phase 5: Post-processing (no lock held) ==========
+	var vote *hs.VotePacket
+	if shouldSignVote {
+		digest := h.hsVoteDigest(headerHash, view)
+		pub, sig, signErr := h.signHsVote(digest)
+		if signErr != nil {
+			log.Warn("Failed to sign hs vote", "view", view, "err", signErr)
+		} else {
+			candidate := &hs.VotePacket{BlockHash: headerHash, ViewNumber: view, VotePubKey: pub, Signature: sig}
+			h.lock.Lock()
+			st = h.getHsState()
+			if st != nil && st.hasLastVote && st.lastVotedView == view && st.lastVotedHash == headerHash && view >= st.currentView {
+				addr := h.ConsensusAddress()
+				if st.votes[view] == nil {
+					st.votes[view] = make(map[common.Hash]map[common.Address]*hs.VotePacket)
+				}
+				if st.votes[view][headerHash] == nil {
+					st.votes[view][headerHash] = make(map[common.Address]*hs.VotePacket)
+				}
+				st.votes[view][headerHash][addr] = candidate
+				vote = candidate
+			}
+			h.lock.Unlock()
+		}
+	}
+
 	// Process pending proposals asynchronously
 	for _, p := range pendingToProcess {
 		go func(pending *pendingProposal) {
@@ -472,8 +519,8 @@ func (h *Hotstuff) OnHsProposal(peerID string, pkt interface{}) error {
 		h.lock.RUnlock()
 
 		// Check if we are the leader for current view
-		leaderForCurrent, _ := h.getLeaderForView(h.chain, currentViewForMiner)
-		if leaderForCurrent == h.val {
+		leaderForCurrent, _ := h.getLeaderForViewAt(h.chain, highQCHashForMiner, currentViewForMiner)
+		if leaderForCurrent == h.ConsensusAddress() {
 			shouldNotifyMiner = true
 		}
 	} else {
@@ -591,6 +638,9 @@ func newViewTargetView(nv *hs.NewViewPacket) uint64 {
 	if nv == nil {
 		return 0
 	}
+	if nv.HighQCView == math.MaxUint64 || nv.HighTCView == math.MaxUint64 {
+		return 0
+	}
 	v := nv.HighQCView + 1
 	if nv.HighTCView > 0 && nv.HighTCView+1 > v {
 		v = nv.HighTCView + 1
@@ -598,14 +648,22 @@ func newViewTargetView(nv *hs.NewViewPacket) uint64 {
 	return v
 }
 
+func viewTooOld(view, current, tolerance uint64) bool {
+	return current > view && current-view > tolerance
+}
+
 func (h *Hotstuff) verifyNewViewTimeoutCert(nv *hs.NewViewPacket, targetView uint64) bool {
-	if nv == nil || nv.HighTCView == 0 {
-		return true
+	if nv == nil || nv.HighQCHash == (common.Hash{}) || targetView == 0 || nv.HighQCView >= targetView {
+		return false
 	}
-	if nv.HighTCView <= nv.HighQCView {
-		return true
+	if !h.verifyHighQCPayload(nv.HighQCHash, nv.HighQCView, nv.HighQCSignersSet, nv.HighQCAggSig) {
+		log.Debug("Invalid NewView: HighQC proof verification failed", "targetView", targetView, "highQCView", nv.HighQCView)
+		return false
 	}
-	if targetView != nv.HighTCView+1 {
+	if nv.HighTCView == 0 {
+		return nv.TimeoutSignersSet == 0 && nv.TimeoutAggSig == (types.BLSSignature{})
+	}
+	if nv.HighTCView >= targetView {
 		log.Debug("Invalid NewView: target view does not follow HighTC",
 			"targetView", targetView,
 			"highTCView", nv.HighTCView,
@@ -622,9 +680,31 @@ func (h *Hotstuff) verifyNewViewTimeoutCert(nv *hs.NewViewPacket, targetView uin
 	return h.verifyTimeoutCert(tc)
 }
 
+func (h *Hotstuff) resolveNewViewValidator(peerID string, nv *hs.NewViewPacket) (common.Address, error) {
+	network := h.hsNetwork()
+	if network == nil {
+		return common.Address{}, errors.New("HotStuff network is not set")
+	}
+	addr, ok := network.ResolveAddress(peerID)
+	if !ok || addr == (common.Address{}) {
+		return common.Address{}, errors.New("NewView peer does not resolve to a consensus address")
+	}
+	snap, err := h.getSnapshotAtHashOrView(h.chain, nv.HighQCHash, nv.HighQCView)
+	if err != nil || snap == nil {
+		return common.Address{}, fmt.Errorf("cannot resolve NewView validator set: %w", err)
+	}
+	if _, ok := snap.Validators[addr]; !ok {
+		return common.Address{}, errUnauthorizedValidator(addr.String())
+	}
+	return addr, nil
+}
+
 // OnHsVote tallies votes; when quorum reached, form QC and try to commit.
 // CRITICAL FIX: Refactored to avoid holding lock during blocking operations (snapshot, network IO).
 func (h *Hotstuff) OnHsVote(peerID string, pkt interface{}) error {
+	if !h.hsProtocolActive() {
+		return errHotstuffProtocolInactive
+	}
 	// Phase 1: Decode and basic validation (no lock)
 	vp, ok := pkt.(*hs.VotePacket)
 	if !ok {
@@ -647,7 +727,7 @@ func (h *Hotstuff) OnHsVote(peerID string, pkt interface{}) error {
 	// In Chained HotStuff, votes may arrive slightly late due to processing delays
 	// Allow votes from currentView-2 to handle pipelining scenarios
 	const voteViewTolerance = 2
-	if st.currentView > voteViewTolerance && vp.ViewNumber+voteViewTolerance < st.currentView {
+	if viewTooOld(vp.ViewNumber, st.currentView, voteViewTolerance) {
 		log.Warn("Rejecting stale vote from past view",
 			"voteView", vp.ViewNumber,
 			"currentView", st.currentView,
@@ -674,9 +754,11 @@ func (h *Hotstuff) OnHsVote(peerID string, pkt interface{}) error {
 	if targetHeader == nil {
 		targetHeader = h.chain.GetHeaderByHash(vp.BlockHash)
 		if targetHeader == nil && h.db != nil {
-			if header := rawdb.ReadHeader(h.db, vp.BlockHash, 0); header != nil {
-				targetHeader = header
-				log.Debug("Found header in rawdb", "blockHash", vp.BlockHash.Hex()[:8], "view", view)
+			if number := rawdb.ReadHeaderNumber(h.db, vp.BlockHash); number != nil {
+				if header := rawdb.ReadHeader(h.db, vp.BlockHash, *number); header != nil {
+					targetHeader = header
+					log.Debug("Found header in rawdb", "blockHash", vp.BlockHash.Hex()[:8], "view", view)
+				}
 			}
 		}
 	}
@@ -692,17 +774,8 @@ func (h *Hotstuff) OnHsVote(peerID string, pkt interface{}) error {
 		return nil
 	}
 	if !blsAvailable {
-		addr = common.Address{}
-		if h._hsNet != nil {
-			if a, ok := h._hsNet.ResolveAddress(peerID); ok {
-				addr = a
-				log.Debug("Resolved address from peer ID", "view", view, "addr", addr)
-			}
-		}
-		if addr == (common.Address{}) {
-			addr = common.BytesToAddress(crypto.Keccak256(vp.VotePubKey[:])[:20])
-			log.Debug("Using BLS pubkey hash for vote (fallback)", "view", view, "addr", addr)
-		}
+		log.Debug("Rejecting vote without a validator BLS mapping", "view", view, "peer", peerID)
+		return nil
 	}
 
 	// Phase 5: Update votes in state (short lock)
@@ -714,7 +787,7 @@ func (h *Hotstuff) OnHsVote(peerID string, pkt interface{}) error {
 	}
 	// Double-check view hasn't advanced too far
 	// Use same tolerance as initial check
-	if st.currentView > voteViewTolerance && vp.ViewNumber+voteViewTolerance < st.currentView {
+	if viewTooOld(vp.ViewNumber, st.currentView, voteViewTolerance) {
 		h.lock.Unlock()
 		return nil
 	}
@@ -760,12 +833,12 @@ func (h *Hotstuff) OnHsVote(peerID string, pkt interface{}) error {
 	// Phase 7: Quorum reached - check leader and prepare QC (no lock for snapshot/leader)
 	log.Info("Quorum vote collected", "view", view, "block", targetHeader.Number.Uint64(), "cnt", voteCount, "qsize", qsize)
 
-	leader, err := h.getLeaderForView(h.chain, view)
+	leader, err := h.getLeaderForViewAt(h.chain, targetHeader.ParentHash, view)
 	if err != nil {
 		log.Warn("Failed to get leader for view in OnHsVote", "view", view, "err", err)
 		return nil
 	}
-	isLeader := (leader == h.val)
+	isLeader := (leader == h.ConsensusAddress())
 
 	// Aggregate signatures (no lock needed)
 	agg := h.aggregateHsVoteSignatures(votersCopy)
@@ -783,7 +856,9 @@ func (h *Hotstuff) OnHsVote(peerID string, pkt interface{}) error {
 		}
 	}
 	qc.Sig = agg
-	if !qc.hasAggregateProof() {
+	if matchedCount < qsize || !qc.hasAggregateProof() || !h.verifyAggregateQC(&hs.QuorumCertPacket{
+		TargetHash: qc.BlockHash, ViewNumber: qc.View, SignersSet: qc.SignersSet, AggregateSig: qc.Sig,
+	}) {
 		log.Warn("Formed QC without aggregate proof, ignoring",
 			"view", view,
 			"blockHash", vp.BlockHash.Hex()[:8],
@@ -807,8 +882,20 @@ func (h *Hotstuff) OnHsVote(peerID string, pkt interface{}) error {
 		h.lock.Unlock()
 		return nil
 	}
-	st.highQC = qc
+	if existing := st.qcsByView[view]; existing != nil && existing.BlockHash != qc.BlockHash {
+		h.lock.Unlock()
+		log.Warn("Rejecting conflicting QC for an already certified view", "view", view, "existing", existing.BlockHash, "received", qc.BlockHash)
+		return nil
+	}
+	if st.highQC != nil && view == st.highQC.View && st.highQC.BlockHash != qc.BlockHash {
+		h.lock.Unlock()
+		log.Warn("Rejecting QC conflicting with local highQC", "view", view, "local", st.highQC.BlockHash, "received", qc.BlockHash)
+		return nil
+	}
 	st.qcsByView[view] = qc
+	if st.highQC == nil || view > st.highQC.View {
+		st.highQC = qc
+	}
 
 	// Try 3-chain commit
 	if err := h.tryCommitBlocks(st, vp.BlockHash, view); err != nil {
@@ -816,9 +903,19 @@ func (h *Hotstuff) OnHsVote(peerID string, pkt interface{}) error {
 	}
 
 	// Advance view
+	if view == math.MaxUint64 {
+		h.lock.Unlock()
+		return nil
+	}
 	newView := view + 1
-	st.currentView = newView
-	log.Info("View advanced after QC", "oldView", view, "newView", newView)
+	shouldAdvanceView := newView > st.currentView
+	if shouldAdvanceView {
+		st.currentView = newView
+		log.Info("View advanced after QC", "oldView", view, "newView", newView)
+	}
+	if err := h.checkpointHsStateLocked(); err != nil {
+		log.Error("Failed to persist formed QC", "view", view, "err", err)
+	}
 	h.lock.Unlock()
 
 	// Phase 9: Post-QC operations (no lock - may block)
@@ -828,7 +925,7 @@ func (h *Hotstuff) OnHsVote(peerID string, pkt interface{}) error {
 	// Only leader broadcasts QC
 	if isLeader {
 		// Use the unlocked version for broadcast
-		if err := h.broadcastHsQCWithAgg(vp.BlockHash, view, agg); err != nil {
+		if err := h.broadcastHsQCWithAgg(vp.BlockHash, view, agg, qc.SignersSet); err != nil {
 			log.Warn("OnHsVote broadcastHsQCWithAgg failed", "err", err)
 		} else {
 			log.Info("Leader broadcasted QC", "view", view, "block", vp.BlockHash.Hex()[:8])
@@ -836,8 +933,8 @@ func (h *Hotstuff) OnHsVote(peerID string, pkt interface{}) error {
 	}
 
 	// Check if we are the leader for the new view
-	newLeader, _ := h.getLeaderForView(h.chain, newView)
-	if newLeader == h.val {
+	newLeader, _ := h.getLeaderForViewAt(h.chain, vp.BlockHash, newView)
+	if shouldAdvanceView && newLeader == h.ConsensusAddress() {
 		log.Info("We are the leader for new view after forming QC, triggering proposal", "view", newView)
 		// CRITICAL FIX: Notify miner to start block production immediately!
 		h.proposeFromHighQC(newView, vp.BlockHash)
@@ -852,6 +949,9 @@ func (h *Hotstuff) OnHsVote(peerID string, pkt interface{}) error {
 // OnHsNewView collects NewView; leader proposes when quorum of NewView received.
 // CRITICAL FIX: Refactored to avoid holding lock during blocking operations.
 func (h *Hotstuff) OnHsNewView(peerID string, pkt interface{}) error {
+	if !h.hsProtocolActive() {
+		return errHotstuffProtocolInactive
+	}
 	// Phase 1: Decode (no lock)
 	nv, ok := pkt.(*hs.NewViewPacket)
 	if !ok {
@@ -864,12 +964,10 @@ func (h *Hotstuff) OnHsNewView(peerID string, pkt interface{}) error {
 		return nil
 	}
 
-	// Resolve sender address (no lock needed)
-	addr := common.Address{}
-	if h._hsNet != nil {
-		if a, ok := h._hsNet.ResolveAddress(peerID); ok {
-			addr = a
-		}
+	addr, err := h.resolveNewViewValidator(peerID, nv)
+	if err != nil {
+		log.Debug("Invalid NewView sender", "peer", peerID, "err", err)
+		return nil
 	}
 
 	// Phase 2: Update state (short lock)
@@ -899,27 +997,26 @@ func (h *Hotstuff) OnHsNewView(peerID string, pkt interface{}) error {
 			newViewsCopy[k] = val
 		}
 	}
-	currentHighTCView := st.highTCView
 	h.lock.Unlock()
 
-	leader, _ := h.getLeaderForView(h.chain, v)
-
-	// Phase 4: If we are leader and have quorum, find best QC and propose
-	if leader == h.val {
+	// Phase 4: Select the highest QC first, then determine its contextual leader.
+	{
 		// Pick highest QC and highest TC among new-views
 		var maxQCView uint64
 		var base common.Hash
 		var maxTCView uint64
+		var selected *hs.NewViewPacket
 		for _, m := range newViewsCopy {
-			if m.HighQCView >= maxQCView {
+			if m.HighQCView > maxQCView || (m.HighQCView == maxQCView && bytes.Compare(m.HighQCHash[:], base[:]) > 0) {
 				maxQCView = m.HighQCView
 				base = m.HighQCHash
+				selected = m
 			}
 			if m.HighTCView > maxTCView {
 				maxTCView = m.HighTCView
 			}
 		}
-		if base == (common.Hash{}) {
+		if base == (common.Hash{}) || selected == nil {
 			log.Debug("OnHsNewView no HighQC base selected", "view", v)
 			return nil
 		}
@@ -932,18 +1029,58 @@ func (h *Hotstuff) OnHsNewView(peerID string, pkt interface{}) error {
 				"err", err)
 			return nil
 		}
-		if newViewCount < QuorumSize(len(snap.validators())) {
+		validNewViews := 0
+		maxTCView = 0
+		for addr, message := range newViewsCopy {
+			if _, ok := snap.Validators[addr]; ok {
+				validNewViews++
+				if message.HighTCView > maxTCView {
+					maxTCView = message.HighTCView
+				}
+			}
+		}
+		if validNewViews < QuorumSize(len(snap.validators())) {
+			return nil
+		}
+		if selectedLeader, err := h.getLeaderForViewAt(h.chain, base, v); err != nil || selectedLeader != h.ConsensusAddress() {
 			return nil
 		}
 
-		// Update highTCView if we found a higher one (short lock)
-		if maxTCView > currentHighTCView {
-			h.lock.Lock()
-			st = h.getHsState()
-			if st != nil && maxTCView > st.highTCView {
-				st.highTCView = maxTCView
-			}
+		// Install the quorum-selected sync state before waking the miner. This is
+		// safety-critical because GetProposalParent and Seal read these fields.
+		h.lock.Lock()
+		st = h.getHsState()
+		if st == nil || v < st.currentView {
 			h.lock.Unlock()
+			return nil
+		}
+		if existing := st.qcsByView[maxQCView]; existing != nil && existing.BlockHash != base {
+			h.lock.Unlock()
+			return nil
+		}
+		if st.highQC == nil || maxQCView > st.highQC.View {
+			st.highQC = &HsQC{
+				BlockHash: base, View: maxQCView, SignersSet: selected.HighQCSignersSet,
+				Sig: common.CopyBytes(selected.HighQCAggSig),
+			}
+			st.qcsByView[maxQCView] = st.highQC
+		} else if maxQCView == st.highQC.View && st.highQC.BlockHash != base {
+			h.lock.Unlock()
+			return nil
+		}
+		if maxTCView > st.highTCView {
+			st.highTCView = maxTCView
+		}
+		viewAdvanced := v > st.currentView
+		if viewAdvanced {
+			st.currentView = v
+		}
+		if err := h.checkpointHsStateLocked(); err != nil {
+			log.Error("Failed to persist NewView quorum state", "view", v, "err", err)
+		}
+		h.lock.Unlock()
+		if viewAdvanced {
+			h.restartViewTimeout()
 		}
 
 		// Propose (no lock - proposeFromHighQC just notifies miner)
@@ -954,6 +1091,9 @@ func (h *Hotstuff) OnHsNewView(peerID string, pkt interface{}) error {
 
 // OnHsTimeout collects timeouts and advances view on TC (simplified).
 func (h *Hotstuff) OnHsTimeout(peerID string, pkt interface{}) error {
+	if !h.hsProtocolActive() {
+		return errHotstuffProtocolInactive
+	}
 	// Aggregate timeouts; if reach quorum, advance to next view and trigger NewView/proposal
 	// CRITICAL FIX: Do NOT call moveToView while holding h.lock, as moveToView needs to acquire it.
 	// Optimized lock usage: minimize lock acquisition and state retrieval.
@@ -981,7 +1121,7 @@ func (h *Hotstuff) OnHsTimeout(peerID string, pkt interface{}) error {
 	// CRITICAL FIX: Reject timeouts for past views (with tolerance for pipelining)
 	// Allow timeouts from currentView-2 to handle network delays and pipelining
 	const timeoutViewTolerance = 2
-	if st.currentView > timeoutViewTolerance && to.ViewNumber+timeoutViewTolerance < st.currentView {
+	if viewTooOld(to.ViewNumber, st.currentView, timeoutViewTolerance) {
 		log.Debug("Rejecting stale timeout from past view",
 			"timeoutView", to.ViewNumber,
 			"currentView", st.currentView,
@@ -1000,22 +1140,8 @@ func (h *Hotstuff) OnHsTimeout(peerID string, pkt interface{}) error {
 		return nil
 	}
 	if !blsAvailable {
-		// BLS not available (before Luban fork), try multiple fallback methods
-		addr = common.Address{}
-
-		// Method 1: Try to resolve from peer ID mapping
-		if h._hsNet != nil {
-			if a, ok := h._hsNet.ResolveAddress(peerID); ok {
-				addr = a
-				log.Debug("Resolved address from peer ID", "view", to.ViewNumber, "addr", addr)
-			}
-		}
-
-		// Method 2: If still no address, use BLS pubkey hash as fallback
-		if addr == (common.Address{}) {
-			addr = common.BytesToAddress(crypto.Keccak256(to.VotePubKey[:])[:20])
-			log.Debug("Using BLS pubkey hash for timeout (fallback)", "view", to.ViewNumber, "addr", addr)
-		}
+		log.Debug("Rejecting timeout without a validator BLS mapping", "view", to.ViewNumber, "peer", peerID)
+		return nil
 	}
 
 	// Phase 3: Re-acquire lock once, update state, then release for snapshot calculation
@@ -1028,7 +1154,7 @@ func (h *Hotstuff) OnHsTimeout(peerID string, pkt interface{}) error {
 
 	// Double-check view hasn't advanced too far (race condition protection)
 	// Use same tolerance as initial check
-	if st.currentView > timeoutViewTolerance && v+timeoutViewTolerance < st.currentView {
+	if viewTooOld(v, st.currentView, timeoutViewTolerance) {
 		log.Debug("Rejecting stale timeout (view advanced during processing)",
 			"timeoutView", v,
 			"currentView", st.currentView,
@@ -1041,18 +1167,24 @@ func (h *Hotstuff) OnHsTimeout(peerID string, pkt interface{}) error {
 	if st.timeouts[v] == nil {
 		st.timeouts[v] = make(map[common.Address]*hs.TimeoutPacket)
 	}
+	if _, exists := st.timeouts[v][addr]; exists {
+		h.lock.Unlock()
+		return nil
+	}
 	st.timeouts[v][addr] = to
-	timeoutCount := len(st.timeouts[v])
+	timeoutMapCopy := make(map[common.Address]*hs.TimeoutPacket, len(st.timeouts[v]))
+	for validator, timeout := range st.timeouts[v] {
+		timeoutMapCopy[validator] = timeout
+	}
 	h.lock.Unlock()
 
-	// Phase 4: Get snapshot for quorum calculation (no lock held - may block)
-	snap, err := h.getSnapshotAtHashOrView(h.chain, to.HighQCHash, to.HighQCView)
-	if err != nil || snap == nil {
+	// Phase 4: Count only validators in the deterministic highest-HighQC set.
+	timeoutCount, qsize, err := h.timeoutQuorum(timeoutMapCopy)
+	if err != nil {
 		log.Debug("OnHsTimeout failed to get timeout snapshot", "view", v, "highQCView", to.HighQCView, "highQCHash", to.HighQCHash, "err", err)
 		return nil
 	}
-	qsize := QuorumSize(len(snap.validators()))
-	log.Debug("OnHsTimeout view timeout collected", "view", v, "snap", snap.Number, "cnt", timeoutCount, "qsize", qsize)
+	log.Debug("OnHsTimeout view timeout collected", "view", v, "cnt", timeoutCount, "qsize", qsize)
 
 	// Phase 5: Re-acquire lock once, check quorum and update highTCView
 	var nextView uint64
@@ -1062,9 +1194,13 @@ func (h *Hotstuff) OnHsTimeout(peerID string, pkt interface{}) error {
 		st = h.getHsState()
 		if st != nil {
 			// Re-check timeout count (may have changed)
-			if st.timeouts[v] != nil && len(st.timeouts[v]) >= qsize {
-				log.Debug("OnHsTimeout quorum view timeout collected", "view", v, "snap", snap.Number, "cnt", len(st.timeouts[v]), "qsize", qsize)
+			if st.timeouts[v] != nil {
+				log.Debug("OnHsTimeout quorum view timeout collected", "view", v, "cnt", timeoutCount, "qsize", qsize)
 				// form TC implicitly; advance to v+1
+				if v == math.MaxUint64 {
+					h.lock.Unlock()
+					return nil
+				}
 				if v > st.highTCView {
 					st.highTCView = v
 				}
@@ -1086,6 +1222,9 @@ func (h *Hotstuff) OnHsTimeout(peerID string, pkt interface{}) error {
 // OnHsQuorumCert updates HighQC from remote
 // CRITICAL FIX: Refactored to avoid holding lock during blocking operations.
 func (h *Hotstuff) OnHsQuorumCert(peerID string, pkt interface{}) error {
+	if !h.hsProtocolActive() {
+		return errHotstuffProtocolInactive
+	}
 	// Phase 1: Decode (no lock)
 	qc, ok := pkt.(*hs.QuorumCertPacket)
 	if !ok {
@@ -1109,7 +1248,7 @@ func (h *Hotstuff) OnHsQuorumCert(peerID string, pkt interface{}) error {
 	log.Debug("OnHsQuorumCert", "view", qc.ViewNumber, "currentView", currentView, "highQC", highQCView, "peer", peerID)
 
 	// Reject stale QCs
-	if currentView > 0 && qc.ViewNumber+1 < currentView {
+	if viewTooOld(qc.ViewNumber, currentView, 1) {
 		log.Debug("Rejecting stale QC from old view",
 			"qcView", qc.ViewNumber,
 			"currentView", currentView,
@@ -1132,7 +1271,7 @@ func (h *Hotstuff) OnHsQuorumCert(peerID string, pkt interface{}) error {
 	}
 
 	// Re-check if QC is still relevant
-	if st.currentView > 0 && qc.ViewNumber+1 < st.currentView {
+	if viewTooOld(qc.ViewNumber, st.currentView, 1) {
 		h.lock.Unlock()
 		return nil
 	}
@@ -1147,17 +1286,26 @@ func (h *Hotstuff) OnHsQuorumCert(peerID string, pkt interface{}) error {
 	// executed locally, write it to rawdb now so final commit can use the
 	// known-block fast path more often.
 	shouldPrewriteQCBlock = st.proposalsByHashBlock[qc.TargetHash] != nil
+	if existing := st.qcsByView[qc.ViewNumber]; existing != nil && existing.BlockHash != qc.TargetHash {
+		h.lock.Unlock()
+		log.Warn("Rejecting conflicting QC for an already certified view", "view", qc.ViewNumber, "existing", existing.BlockHash, "received", qc.TargetHash)
+		return nil
+	}
+	if st.highQC != nil && qc.ViewNumber == st.highQC.View && qc.TargetHash != st.highQC.BlockHash {
+		h.lock.Unlock()
+		log.Warn("Rejecting QC conflicting with local highQC", "view", qc.ViewNumber, "local", st.highQC.BlockHash, "received", qc.TargetHash)
+		return nil
+	}
 
 	if st.highQC == nil || qc.ViewNumber >= st.highQC.View {
 		shouldUpdate = (st.highQC == nil ||
-			qc.ViewNumber > st.highQC.View ||
-			(qc.ViewNumber == st.highQC.View && qc.TargetHash != st.highQC.BlockHash))
+			qc.ViewNumber > st.highQC.View)
 
 		if shouldUpdate {
 			st.highQC = &HsQC{
 				BlockHash:  qc.TargetHash,
 				View:       qc.ViewNumber,
-				Sig:        qc.AggregateSig,
+				Sig:        common.CopyBytes(qc.AggregateSig),
 				SignersSet: qc.SignersSet,
 			}
 			st.qcsByView[qc.ViewNumber] = st.highQC
@@ -1231,11 +1379,18 @@ func (h *Hotstuff) OnHsQuorumCert(peerID string, pkt interface{}) error {
 		}
 
 		// Check if we should advance view
+		if qc.ViewNumber == math.MaxUint64 {
+			h.lock.Unlock()
+			return nil
+		}
 		newView = qc.ViewNumber + 1
 		if newView > st.currentView {
 			st.currentView = newView
 			shouldAdvanceView = true
 			log.Info("View advanced after receiving QC", "oldView", qc.ViewNumber, "newView", newView)
+		}
+		if err := h.checkpointHsStateLocked(); err != nil {
+			log.Error("Failed to persist received QC", "view", qc.ViewNumber, "err", err)
 		}
 	}
 	h.lock.Unlock()
@@ -1263,10 +1418,10 @@ func (h *Hotstuff) OnHsQuorumCert(peerID string, pkt interface{}) error {
 	// Phase 5: Post-update operations (no lock - may block)
 	if shouldAdvanceView {
 		// Check if we are the leader for the new view
-		newLeader, err := h.getLeaderForView(h.chain, newView)
+		newLeader, err := h.getLeaderForViewAt(h.chain, qc.TargetHash, newView)
 		if err != nil {
 			log.Warn("Failed to get leader for new view", "view", newView, "err", err)
-		} else if newLeader == h.val {
+		} else if newLeader == h.ConsensusAddress() {
 			// CRITICAL FIX: Only notify miner if highQC block state is ready!
 			// If highQC block is still pending (state not committed), miner will fail
 			// with "missing trie node" error. In that case, wait for pending proposal
@@ -1348,6 +1503,7 @@ func (h *Hotstuff) processQCCertifiedProposal(pending *pendingProposal, qc *hs.Q
 
 	// Mark as processing
 	st.processingBlocks[headerHash] = struct{}{}
+	executingState := st
 	h.lock.Unlock()
 
 	// Phase 2: Verify header and execute block
@@ -1404,6 +1560,7 @@ func (h *Hotstuff) processQCCertifiedProposal(pending *pendingProposal, qc *hs.Q
 	h.lock.Lock()
 	st = h.getHsState()
 	if st == nil {
+		delete(executingState.proposalStates, headerHash)
 		h.lock.Unlock()
 		return errors.New("HotStuff state lost")
 	}
@@ -1477,8 +1634,8 @@ func (h *Hotstuff) processQCCertifiedProposal(pending *pendingProposal, qc *hs.Q
 		h.lock.RUnlock()
 
 		// Check if we are the leader for current view
-		leaderForCurrent, _ := h.getLeaderForView(h.chain, currentViewForMiner)
-		if leaderForCurrent == h.val {
+		leaderForCurrent, _ := h.getLeaderForViewAt(h.chain, highQCHashForMiner, currentViewForMiner)
+		if leaderForCurrent == h.ConsensusAddress() {
 			shouldNotifyMiner = true
 		}
 	} else {
@@ -1512,8 +1669,8 @@ func (h *Hotstuff) processProposalHeader(header *types.Header) error {
 		return nil
 	}
 	// Use view number from header, not block number
-	view := getViewFromHeader(header)
-	leader, _ := h.getLeaderForView(h.chain, view)
+	view := getViewFromHeader(header, h.chainConfig)
+	leader, _ := h.getLeaderForViewAt(h.chain, header.ParentHash, view)
 	if leader != header.Coinbase {
 		return nil
 	}
@@ -1528,10 +1685,14 @@ func (h *Hotstuff) processProposalHeader(header *types.Header) error {
 		st.currentView = view
 	}
 	// BLS sign and send vote
-	if h.voteSigner == nil {
+	if h.blsVoteSigner() == nil {
 		return nil
 	}
 
+	if err := h.prepareVoteLocked(view, header.Hash()); err != nil {
+		log.Error("Refusing to sign HotStuff vote without durable safety state", "view", view, "hash", header.Hash(), "err", err)
+		return nil
+	}
 	digest := h.hsVoteDigest(header.Hash(), view)
 	pub, sig, err := h.signHsVote(digest)
 	if err != nil {
@@ -1539,7 +1700,7 @@ func (h *Hotstuff) processProposalHeader(header *types.Header) error {
 	}
 	vote := &hs.VotePacket{BlockHash: header.Hash(), ViewNumber: view, VotePubKey: pub, Signature: sig}
 	// Use local validator address (no need to verify own address, receiver will verify)
-	addr := h.val
+	addr := h.ConsensusAddress()
 	if st.votes[view] == nil {
 		st.votes[view] = make(map[common.Hash]map[common.Address]*hs.VotePacket)
 	}
@@ -1570,9 +1731,7 @@ func (h *Hotstuff) processVotePacket(vp *hs.VotePacket) error {
 		return nil
 	}
 	if !blsAvailable {
-		// BLS not available (before Luban fork), use BLS pubkey hash as fallback address
-		addr = common.BytesToAddress(crypto.Keccak256(vp.VotePubKey[:])[:20])
-		log.Debug("Using BLS pubkey hash for vote (BLS not available)", "view", vp.ViewNumber, "addr", addr)
+		return nil
 	}
 	view := vp.ViewNumber
 	if st.votes[view] == nil {
@@ -1609,7 +1768,9 @@ func (h *Hotstuff) processVotePacket(vp *hs.VotePacket) error {
 		}
 		qc.Sig = agg
 		qc.SignersSet = bitset
-		if !qc.hasAggregateProof() {
+		if !qc.hasAggregateProof() || !h.verifyAggregateQC(&hs.QuorumCertPacket{
+			TargetHash: qc.BlockHash, ViewNumber: qc.View, SignersSet: qc.SignersSet, AggregateSig: qc.Sig,
+		}) {
 			log.Warn("processVotePacket formed QC without aggregate proof",
 				"view", view,
 				"blockHash", vp.BlockHash.Hex()[:8],
@@ -1617,8 +1778,16 @@ func (h *Hotstuff) processVotePacket(vp *hs.VotePacket) error {
 				"aggSigLen", len(qc.Sig))
 			return nil
 		}
-		st.highQC = qc
+		if existing := st.qcsByView[view]; existing != nil && existing.BlockHash != qc.BlockHash {
+			return nil
+		}
+		if st.highQC != nil && view == st.highQC.View && st.highQC.BlockHash != qc.BlockHash {
+			return nil
+		}
 		st.qcsByView[view] = qc
+		if st.highQC == nil || view > st.highQC.View {
+			st.highQC = qc
+		}
 		err := h.broadcastHsQCWithAggLocked(vp.BlockHash, view, agg, bitset)
 		if err != nil {
 			log.Warn("processVotePacket broadcastHsQCWithAggLocked failed", err)
@@ -1628,13 +1797,23 @@ func (h *Hotstuff) processVotePacket(vp *hs.VotePacket) error {
 		if err := h.tryCommitBlocks(st, vp.BlockHash, view); err != nil {
 			log.Error("Failed to commit blocks in processVotePacket", "view", view, "err", err)
 		}
+		if err := h.checkpointHsStateLocked(); err != nil {
+			log.Error("Failed to persist formed QC", "view", view, "err", err)
+		}
 	}
 	return nil
 }
 
 func (h *Hotstuff) processNewViewPacket(peerID string, nv *hs.NewViewPacket) error {
+	if !h.hsProtocolActive() {
+		return errHotstuffProtocolInactive
+	}
 	v := newViewTargetView(nv)
 	if !h.verifyNewViewTimeoutCert(nv, v) {
+		return nil
+	}
+	addr, err := h.resolveNewViewValidator(peerID, nv)
+	if err != nil {
 		return nil
 	}
 
@@ -1646,12 +1825,6 @@ func (h *Hotstuff) processNewViewPacket(peerID string, nv *hs.NewViewPacket) err
 	}
 	if st.newViews[v] == nil {
 		st.newViews[v] = make(map[common.Address]*hs.NewViewPacket)
-	}
-	addr := common.Address{}
-	if h._hsNet != nil {
-		if a, ok := h._hsNet.ResolveAddress(peerID); ok {
-			addr = a
-		}
 	}
 	st.newViews[v][addr] = nv
 
@@ -1668,14 +1841,13 @@ func (h *Hotstuff) processNewViewPacket(peerID string, nv *hs.NewViewPacket) err
 	currentHighTCView := st.highTCView
 	h.lock.Unlock()
 
-	leader, _ := h.getLeaderForView(h.chain, v)
-	if leader == h.val {
+	{
 		// Pick highest QC and highest TC among new-views
 		var maxQCView uint64
 		var base common.Hash
 		var maxTCView uint64
 		for _, m := range newViewsCopy {
-			if m.HighQCView >= maxQCView {
+			if m.HighQCView > maxQCView || (m.HighQCView == maxQCView && bytes.Compare(m.HighQCHash[:], base[:]) > 0) {
 				maxQCView = m.HighQCView
 				base = m.HighQCHash
 			}
@@ -1690,7 +1862,20 @@ func (h *Hotstuff) processNewViewPacket(peerID string, nv *hs.NewViewPacket) err
 		if err != nil || snap == nil {
 			return nil
 		}
-		if newViewCount < QuorumSize(len(snap.validators())) {
+		validNewViews := 0
+		maxTCView = 0
+		for addr, message := range newViewsCopy {
+			if _, ok := snap.Validators[addr]; ok {
+				validNewViews++
+				if message.HighTCView > maxTCView {
+					maxTCView = message.HighTCView
+				}
+			}
+		}
+		if validNewViews < QuorumSize(len(snap.validators())) {
+			return nil
+		}
+		if selectedLeader, err := h.getLeaderForViewAt(h.chain, base, v); err != nil || selectedLeader != h.ConsensusAddress() {
 			return nil
 		}
 		// Update highTCView to the highest from quorum
@@ -1706,111 +1891,13 @@ func (h *Hotstuff) processNewViewPacket(peerID string, nv *hs.NewViewPacket) err
 	return nil
 }
 
-func (h *Hotstuff) processTimeoutPacket(to *hs.TimeoutPacket) error {
-	h.lock.Lock()
-	nextView, shouldMoveToView := h.processTimeoutPacketLocked(to)
-	h.lock.Unlock()
-
-	if shouldMoveToView {
-		h.moveToView(nextView)
-	}
-	return nil
-}
-
-// processTimeoutPacketLocked is the internal version that assumes lock is already held
-// processTimeoutPacketLocked processes a timeout packet while lock is held.
-// Returns (nextView, shouldMoveToView) so caller can call moveToView after releasing lock.
-func (h *Hotstuff) processTimeoutPacketLocked(to *hs.TimeoutPacket) (uint64, bool) {
-	st := h.getHsState()
-	if st == nil {
-		return 0, false
-	}
-	v := to.ViewNumber
-	if st.timeouts[v] == nil {
-		st.timeouts[v] = make(map[common.Address]*hs.TimeoutPacket)
-	}
-	// Verify and resolve sender from BLS pubkey
-	addr, blsAvailable, err := h.verifyHsTimeoutAndResolveAddr(to)
-	if err != nil {
-		return 0, false
-	}
-	if !blsAvailable {
-		// BLS not available (before Luban fork), try to use a fallback address
-		// Since we don't have peerID here, use BLS pubkey hash as a deterministic address
-		addr = common.BytesToAddress(crypto.Keccak256(to.VotePubKey[:])[:20])
-		log.Debug("Using BLS pubkey hash for timeout (BLS not available)", "view", to.ViewNumber, "addr", addr)
-	}
-	st.timeouts[v][addr] = to
-	head := h.chain.CurrentHeader()
-	snap, _ := h.snapshot(h.chain, head.Number.Uint64(), head.Hash(), nil)
-	if snap == nil {
-		return 0, false
-	}
-	qsize := QuorumSize(len(snap.validators()))
-	if len(st.timeouts[v]) >= qsize {
-		if v > st.highTCView {
-			st.highTCView = v
-		}
-		// Return next view; caller will call moveToView after releasing lock
-		return v + 1, true
-	}
-	return 0, false
-}
-
-func (h *Hotstuff) processQCPacket(qc *hs.QuorumCertPacket) error {
-	h.lock.Lock()
-	st := h.getHsState()
-	if st == nil {
-		h.lock.Unlock()
-		return nil
-	}
-	qcBlockExists := st.proposalsByHashBlock[qc.TargetHash] != nil
-	qcVerified := false
-	if st.highQC == nil || qc.ViewNumber > st.highQC.View {
-		// Verify QC by BLS fast aggregate verify using provided signer set.
-		if !h.verifyAggregateQC(qc) {
-			h.lock.Unlock()
-			return nil
-		}
-		qcVerified = true
-		// CRITICAL FIX: Must copy SignersSet from QC packet!
-		st.highQC = &HsQC{
-			BlockHash:  qc.TargetHash,
-			View:       qc.ViewNumber,
-			Sig:        qc.AggregateSig,
-			SignersSet: qc.SignersSet,
-		}
-		st.qcsByView[qc.ViewNumber] = st.highQC
-		log.Debug("processQCPacket: updated highQC",
-			"view", qc.ViewNumber,
-			"blockHash", qc.TargetHash.Hex()[:8],
-			"signersSet", qc.SignersSet,
-			"aggSigLen", len(qc.AggregateSig))
-		// Try update lockedQC via 3-chain rule when adjacent QC exists and headers are known
-		if prev := st.qcsByView[qc.ViewNumber-1]; prev != nil {
-			currHdr := st.proposalsByHash[qc.TargetHash]
-			prevHdr := st.proposalsByHash[prev.BlockHash]
-			if currHdr != nil && prevHdr != nil && currHdr.ParentHash == prevHdr.Hash() {
-				st.lockedQC = prev
-			}
-		}
-	} else if qcBlockExists {
-		qcVerified = h.verifyAggregateQC(qc)
-	}
-	h.lock.Unlock()
-	if qcVerified && qcBlockExists {
-		h.prewriteBlock(qc.TargetHash)
-	}
-	return nil
-}
-
 // restartViewTimeout restarts the per-view timeout timer and schedules local timeout
 // CRITICAL: This function manages its own locks. Caller should NOT hold lock when calling.
 func (h *Hotstuff) restartViewTimeout() {
 	// Phase 1: Get current view (short lock)
 	h.lock.RLock()
 	st := h.getHsState()
-	if st == nil {
+	if st == nil || h.closed {
 		h.lock.RUnlock()
 		return
 	}
@@ -1836,6 +1923,10 @@ func (h *Hotstuff) restartViewTimeout() {
 
 	// Phase 3: Update timer (short lock)
 	h.lock.Lock()
+	if h.closed {
+		h.lock.Unlock()
+		return
+	}
 	if h.hsTimer != nil {
 		h.hsTimer.Stop()
 	}
@@ -1845,13 +1936,17 @@ func (h *Hotstuff) restartViewTimeout() {
 	h.lock.Unlock()
 }
 
-// onLocalViewTimeout constructs and broadcasts a TimeoutPacket; then aggregates
-// CRITICAL FIX: Refactored to avoid calling moveToView while holding lock
+// onLocalViewTimeout constructs, verifies and broadcasts a local TimeoutPacket.
 func (h *Hotstuff) onLocalViewTimeout(view uint64) {
 	log.Info("[onLocalViewTimeout] ENTER", "view", view)
+	if !h.hsProtocolActive() {
+		h.restartViewTimeout()
+		return
+	}
 
-	// Phase 1: Build and sign timeout packet (short lock)
-	h.lock.Lock()
+	// Snapshot the current safety state, then release the lock before wallet and
+	// BLS operations.
+	h.lock.RLock()
 	st := h.getHsState()
 	if st == nil || view != st.currentView {
 		log.Info("[onLocalViewTimeout] EXIT - state nil or view mismatch", "view", view, "currentView", func() uint64 {
@@ -1860,41 +1955,52 @@ func (h *Hotstuff) onLocalViewTimeout(view uint64) {
 			}
 			return 0
 		}())
-		h.lock.Unlock()
+		h.lock.RUnlock()
 		return
 	}
 	log.Info("[onLocalViewTimeout] Processing timeout", "view", view)
-
-	// build timeout packet with BLS signature
 	to := &hs.TimeoutPacket{ViewNumber: view}
 	if st.highQC != nil {
 		to.HighQCView = st.highQC.View
 		to.HighQCHash = st.highQC.BlockHash
+		to.HighQCSignersSet = st.highQC.SignersSet
+		to.HighQCAggSig = common.CopyBytes(st.highQC.Sig)
 	}
-	if h.voteSigner != nil {
-		root := h.hsTimeoutDigest(to)
-		pub, sig, err := h.signHsVote(root)
-		if err == nil {
-			to.VotePubKey = pub
-			to.Signature = sig
-		}
+	h.lock.RUnlock()
+
+	if h.blsVoteSigner() == nil {
+		log.Debug("Skip local timeout without BLS signer", "view", view)
+		h.restartViewTimeout()
+		return
+	}
+	root := h.hsTimeoutDigest(to)
+	pub, sig, err := h.signHsVote(root)
+	if err != nil {
+		log.Warn("Failed to sign local HotStuff timeout", "view", view, "err", err)
+		h.restartViewTimeout()
+		return
+	}
+	to.VotePubKey = pub
+	to.Signature = sig
+
+	// Recheck the view before publishing the packet as this node's latest local
+	// timeout. OnHsTimeout performs full proof, membership and quorum validation.
+	h.lock.Lock()
+	st = h.getHsState()
+	if st == nil || st.currentView != view {
+		h.lock.Unlock()
+		return
 	}
 	h.lastTimeoutView = view
 	h.lastTimeoutPacket = to
-
-	// Process locally and check if we should move to next view
-	nextView, shouldMoveToView := h.processTimeoutPacketLocked(to)
 	h.lock.Unlock()
-
-	// Phase 2: Broadcast (no lock needed for network IO)
-	if h._hsNet != nil {
-		h._hsNet.BroadcastTimeout(to)
+	if err := h.OnHsTimeout("local", to); err != nil {
+		log.Debug("Local timeout validation failed", "view", view, "err", err)
+		return
 	}
 
-	// Phase 3: Move to next view if quorum reached (this function acquires its own lock)
-	if shouldMoveToView {
-		log.Info("[onLocalViewTimeout] Quorum reached, moving to next view", "currentView", view, "nextView", nextView)
-		h.moveToView(nextView)
+	if network := h.hsNetwork(); network != nil {
+		network.BroadcastTimeout(to)
 	}
 }
 
@@ -1962,10 +2068,12 @@ func (h *Hotstuff) onHsCommit(hash common.Hash) {
 
 	// If not in chain, try to get from hsState (prewritten blocks)
 	if block == nil {
+		h.lock.RLock()
 		st := h.getHsState()
 		if st != nil {
 			block = st.proposalsByHashBlock[hash]
 		}
+		h.lock.RUnlock()
 	}
 
 	if block == nil {
@@ -2018,6 +2126,7 @@ func (h *Hotstuff) getChain() consensus.ChainHeaderReader { return h.chain }
 // In Chained HotStuff, this is the block pointed to by highQC (not the committed chain head).
 // This enables pipelining: Block1 <- QC1 <- Block2 <- QC2 <- Block3 <- QC3
 func (h *Hotstuff) GetProposalParent(chain consensus.ChainHeaderReader) common.Hash {
+	h.ensureBootstrapAtHead()
 	h.lock.RLock()
 	defer h.lock.RUnlock()
 

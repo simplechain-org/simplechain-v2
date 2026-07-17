@@ -3,6 +3,7 @@ package hotstuff
 import (
 	"errors"
 	"fmt"
+	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -13,13 +14,28 @@ import (
 	"github.com/prysmaticlabs/prysm/v5/crypto/bls"
 )
 
+const (
+	hsVoteDomain    = "simplechain/hotstuff/v1/vote"
+	hsTimeoutDomain = "simplechain/hotstuff/v1/timeout"
+)
+
 // hsVoteDigest computes the digest for a HotStuff vote
 func (h *Hotstuff) hsVoteDigest(blockHash common.Hash, view uint64) [32]byte {
-	type voteTuple struct {
-		BlockHash  common.Hash
-		ViewNumber uint64
+	return makeHsVoteDigest(h.chainConfig.ChainID, h.genesisHash, blockHash, view)
+}
+
+func makeHsVoteDigest(chainID *big.Int, genesisHash, blockHash common.Hash, view uint64) [32]byte {
+	type voteSigningData struct {
+		Domain      string
+		ChainID     *big.Int
+		GenesisHash common.Hash
+		BlockHash   common.Hash
+		ViewNumber  uint64
 	}
-	enc, err := rlp.EncodeToBytes(&voteTuple{BlockHash: blockHash, ViewNumber: view})
+	enc, err := rlp.EncodeToBytes(&voteSigningData{
+		Domain: hsVoteDomain, ChainID: chainID, GenesisHash: genesisHash,
+		BlockHash: blockHash, ViewNumber: view,
+	})
 	if err != nil {
 		return [32]byte{}
 	}
@@ -28,10 +44,11 @@ func (h *Hotstuff) hsVoteDigest(blockHash common.Hash, view uint64) [32]byte {
 
 // signHsVote signs a vote using BLS
 func (h *Hotstuff) signHsVote(root [32]byte) (types.BLSPublicKey, types.BLSSignature, error) {
-	if h.voteSigner == nil {
+	signer := h.blsVoteSigner()
+	if signer == nil {
 		return types.BLSPublicKey{}, types.BLSSignature{}, errors.New("vote signer not initialized")
 	}
-	return h.voteSigner.SignRoot(root)
+	return signer.SignRoot(root)
 }
 
 // addrFromVotePubKeyAt resolves vote pubkey at a contextual snapshot (by baseHash or view)
@@ -53,9 +70,12 @@ func (h *Hotstuff) addrFromVotePubKeyAt(pk types.BLSPublicKey, baseHash common.H
 		var hdr *types.Header
 		hdr = h.chain.GetHeaderByHash(baseHash)
 		if hdr == nil {
-			// Fallback: try HotStuff state (for pipelined blocks)
-			if block := h.getBlockFromStateUnsafe(baseHash); block != nil {
-				hdr = block.Header()
+			// The sync.Map cache is safe for verification paths that do not hold h.lock.
+			if cached, ok := h.proposalBlocksCache.Load(baseHash); ok {
+				block, _ := cached.(*types.Block)
+				if block != nil {
+					hdr = block.Header()
+				}
 			}
 		}
 
@@ -108,6 +128,9 @@ func (h *Hotstuff) addrFromVotePubKey(pk types.BLSPublicKey) (common.Address, bo
 // Returns (address, isBLSAvailable, error)
 // When BLS is not available, returns (zero address, false, nil) to allow flow to continue without BLS validation
 func (h *Hotstuff) verifyHsBlsVoteAndResolveAddr(vp *hs.VotePacket, targetHeader *types.Header) (common.Address, bool, error) {
+	if vp == nil || targetHeader == nil || targetHeader.Hash() != vp.BlockHash || getViewFromHeader(targetHeader, h.chainConfig) != vp.ViewNumber {
+		return common.Address{}, false, errors.New("vote target/view mismatch")
+	}
 	// Try to verify BLS signature and resolve address
 	blsPub, err := bls.PublicKeyFromBytes(vp.VotePubKey[:])
 	if err != nil {
@@ -178,7 +201,7 @@ func (h *Hotstuff) aggregateHsVoteSignatures(votes map[common.Address]*hs.VotePa
 
 // verifyAggregateQC verifies an aggregated QC signature with provided signer set from qc packet
 func (h *Hotstuff) verifyAggregateQC(qc *hs.QuorumCertPacket) bool {
-	if qc == nil || qc.TargetHash == (common.Hash{}) {
+	if qc == nil || qc.TargetHash == (common.Hash{}) || h.chain == nil {
 		return false
 	}
 
@@ -189,35 +212,34 @@ func (h *Hotstuff) verifyAggregateQC(qc *hs.QuorumCertPacket) bool {
 	// Try canonical chain first
 	targetHeader = h.chain.GetHeaderByHash(qc.TargetHash)
 
-	// Fallback: try HotStuff state (for pipelined blocks)
-	// CRITICAL: Use getBlockFromStateUnsafe because caller (OnHsProposal/OnHsQuorumCert/processQCPacket)
-	// already holds h.lock.Lock(), calling GetBlockFromState would deadlock trying to acquire RLock
+	// Fallback to the lock-free proposal cache for pipelined blocks.
 	if targetHeader == nil {
 		log.Debug("verifyAggregateQC: target not in canonical chain, trying HotStuff state",
 			"targetHash", qc.TargetHash.Hex()[:8],
 			"view", qc.ViewNumber)
-		if block := h.getBlockFromStateUnsafe(qc.TargetHash); block != nil {
-			targetHeader = block.Header()
-			log.Debug("verifyAggregateQC: got target from HotStuff state",
-				"targetHash", qc.TargetHash.Hex()[:8],
-				"number", block.NumberU64())
+		if cached, ok := h.proposalBlocksCache.Load(qc.TargetHash); ok {
+			if block, ok := cached.(*types.Block); ok && block != nil {
+				targetHeader = block.Header()
+				log.Debug("verifyAggregateQC: got target from HotStuff state",
+					"targetHash", qc.TargetHash.Hex()[:8],
+					"number", block.NumberU64())
+			}
 		}
 	}
-
-	// Before Luban fork, BLS aggregate QC is not supported, skip verification but allow QC
-	if targetHeader != nil {
-		if !h.chainConfig.IsLuban(targetHeader.Number) {
-			log.Debug("Skip aggregate QC verification before Luban fork (allow QC)",
-				"block", targetHeader.Number, "view", qc.ViewNumber)
-			return true
-		}
-	} else {
+	if targetHeader == nil {
 		log.Warn("verifyAggregateQC: target header not found (neither in chain nor HotStuff state)",
 			"targetHash", qc.TargetHash.Hex()[:8],
 			"view", qc.ViewNumber)
 		return false
 	}
-	if qc.ViewNumber > 0 && (qc.SignersSet == 0 || len(qc.AggregateSig) != types.BLSSignatureLength) {
+	if targetHeader.Number == nil || targetHeader.Number.Sign() == 0 {
+		return false
+	}
+	if getViewFromHeader(targetHeader, h.chainConfig) != qc.ViewNumber {
+		log.Debug("verifyAggregateQC: target view mismatch", "qcView", qc.ViewNumber, "headerView", getViewFromHeader(targetHeader, h.chainConfig))
+		return false
+	}
+	if qc.SignersSet == 0 || len(qc.AggregateSig) != types.BLSSignatureLength {
 		log.Warn("verifyAggregateQC: missing aggregate proof",
 			"view", qc.ViewNumber,
 			"targetHash", qc.TargetHash.Hex()[:8],
@@ -317,14 +339,70 @@ func (h *Hotstuff) verifyAggregateQC(qc *hs.QuorumCertPacket) bool {
 	return result
 }
 
+// verifyHighQCPayload validates the proof separately from timeout/NewView
+// signatures. The only proofless HighQC allowed is the Parlia parent at the
+// HotStuff activation boundary.
+func (h *Hotstuff) verifyHighQCPayload(hash common.Hash, view uint64, signersSet types.ValidatorsBitSet, sig []byte) bool {
+	if hash == (common.Hash{}) {
+		return false
+	}
+	if h.isBootstrapHighQC(hash, view) && signersSet == 0 && len(sig) == 0 {
+		return true
+	}
+	if !hasHighQCProof(signersSet, len(sig)) {
+		return false
+	}
+	return h.verifyAggregateQC(&hs.QuorumCertPacket{
+		TargetHash: hash, ViewNumber: view, SignersSet: signersSet, AggregateSig: sig,
+	})
+}
+
+func (h *Hotstuff) isBootstrapHighQC(hash common.Hash, view uint64) bool {
+	if h == nil || h.chain == nil || h.chainConfig == nil || h.chainConfig.HotstuffBlock == nil {
+		return false
+	}
+	header := h.chain.GetHeaderByHash(hash)
+	if header == nil {
+		if cached, ok := h.proposalBlocksCache.Load(hash); ok {
+			if block, ok := cached.(*types.Block); ok && block != nil {
+				header = block.Header()
+			}
+		}
+	}
+	if header == nil || header.Number == nil {
+		return false
+	}
+	if h.chainConfig.HotstuffBlock.Sign() == 0 {
+		canonicalGenesis := h.chain.GetHeaderByNumber(0)
+		return header.Number.Sign() == 0 && view == getViewFromHeader(header, h.chainConfig) &&
+			canonicalGenesis != nil && canonicalGenesis.Hash() == hash
+	}
+	next := new(big.Int).Add(header.Number, common.Big1)
+	if !h.chainConfig.IsOnHotstuff(next) || getViewFromHeader(header, h.chainConfig) != view {
+		return false
+	}
+	canonical := h.chain.GetHeaderByNumber(header.Number.Uint64())
+	return canonical != nil && canonical.Hash() == hash
+}
+
 // hsTimeoutDigest computes the digest for a timeout message
 func (h *Hotstuff) hsTimeoutDigest(to *hs.TimeoutPacket) [32]byte {
-	type toTuple struct {
-		ViewNumber uint64
-		HighQCView uint64
-		HighQCHash common.Hash
+	if to == nil {
+		return [32]byte{}
 	}
-	enc, err := rlp.EncodeToBytes(&toTuple{ViewNumber: to.ViewNumber, HighQCView: to.HighQCView, HighQCHash: to.HighQCHash})
+	return makeHsTimeoutDigest(h.chainConfig.ChainID, h.genesisHash, to.ViewNumber)
+}
+
+func makeHsTimeoutDigest(chainID *big.Int, genesisHash common.Hash, view uint64) [32]byte {
+	type timeoutSigningData struct {
+		Domain      string
+		ChainID     *big.Int
+		GenesisHash common.Hash
+		ViewNumber  uint64
+	}
+	enc, err := rlp.EncodeToBytes(&timeoutSigningData{
+		Domain: hsTimeoutDomain, ChainID: chainID, GenesisHash: genesisHash, ViewNumber: view,
+	})
 	if err != nil {
 		return [32]byte{}
 	}
@@ -349,6 +427,9 @@ func (h *Hotstuff) verifyHsTimeoutAndResolveAddr(to *hs.TimeoutPacket) (common.A
 	copy(rootBytes, root[:])
 	if !sig.Verify(blsPub, rootBytes) {
 		return common.Address{}, false, errors.New("invalid timeout bls signature")
+	}
+	if !h.verifyHighQCPayload(to.HighQCHash, to.HighQCView, to.HighQCSignersSet, to.HighQCAggSig) {
+		return common.Address{}, false, errors.New("invalid timeout HighQC proof")
 	}
 	baseHash := to.HighQCHash
 	addr, blsAvailable, err := h.addrFromVotePubKeyAt(to.VotePubKey, baseHash, to.ViewNumber)

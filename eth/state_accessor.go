@@ -283,18 +283,6 @@ func (eth *Ethereum) stateAtTransaction(ctx context.Context, block *types.Block,
 					beforeSystemTx = false
 				}
 			}
-			if hs, ok := eth.Engine().(consensus.HotStuff); ok {
-				if isSystem, _ := hs.IsSystemTransaction(tx, block.Header()); isSystem {
-					balance := statedb.GetBalance(consensus.SystemAddress)
-					if balance.Cmp(common.U2560) > 0 {
-						statedb.SetBalance(consensus.SystemAddress, uint256.NewInt(0), tracing.BalanceChangeUnspecified)
-						statedb.AddBalance(block.Header().Coinbase, balance, tracing.BalanceChangeUnspecified)
-					}
-
-					systemcontracts.TryUpdateBuildInSystemContract(eth.blockchain.Config(), block.Number(), parent.Time(), block.Time(), statedb, false)
-					beforeSystemTx = false
-				}
-			}
 		}
 
 		if idx == txIndex {

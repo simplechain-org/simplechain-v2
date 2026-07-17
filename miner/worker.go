@@ -32,7 +32,6 @@ import (
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
-	"github.com/ethereum/go-ethereum/consensus/parlia"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/stateless"
@@ -163,6 +162,28 @@ type hotstuffMiningEngine interface {
 
 type hotstuffProposalEngine interface {
 	HasPendingProposal() bool
+}
+
+type systemTxGasEstimator interface {
+	EstimateGasReservedForSystemTxs(consensus.ChainHeaderReader, *types.Header) uint64
+}
+
+type blockIntervalReader interface {
+	BlockInterval(consensus.ChainHeaderReader, *types.Header) (uint64, error)
+}
+
+type recentSignerChecker interface {
+	SignRecently(consensus.ChainReader, *types.Header) (bool, error)
+	IsSlash() bool
+}
+
+type proposalScheduleReader interface {
+	NextProposalBlock(consensus.ChainHeaderReader, *types.Header, common.Address) (uint64, uint64, error)
+	BlockInterval(consensus.ChainHeaderReader, *types.Header) (uint64, error)
+}
+
+type proposalStateProvider interface {
+	GetProposalState(common.Hash) *state.StateDB
 }
 
 const (
@@ -499,7 +520,7 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 			}
 			clearPending(head.Header.Number.Uint64())
 			timestamp = time.Now().Unix()
-			if p, ok := w.engine.(*parlia.Parlia); ok {
+			if p, ok := w.engine.(recentSignerChecker); ok {
 				signedRecent, err := p.SignRecently(w.chain, head.Header)
 				if err != nil {
 					timer.Reset(recommit)
@@ -759,7 +780,19 @@ func (w *worker) makeEnv(parent *types.Header, header *types.Header, coinbase co
 	// the miner to speed block sealing up a bit
 	state, err := w.chain.StateAt(parent.Root)
 	if err != nil {
-		return nil, err
+		provider, ok := w.engine.(proposalStateProvider)
+		if !ok {
+			return nil, err
+		}
+		proposalState := provider.GetProposalState(parent.Hash())
+		if proposalState == nil {
+			return nil, err
+		}
+		state = proposalState.Copy()
+		if root := state.IntermediateRoot(w.chainConfig.IsEIP158(parent.Number)); root != parent.Root {
+			return nil, fmt.Errorf("proposal state root mismatch for parent %s: have %s want %s", parent.Hash(), root, parent.Root)
+		}
+		log.Debug("Using speculative proposal state for sealing", "parent", parent.Hash(), "number", parent.Number)
 	}
 	if witness {
 		bundle, err := stateless.NewWitness(header, w.chain)
@@ -875,8 +908,8 @@ func (w *worker) commitTransactions(env *environment, plainTxs, blobTxs *transac
 	gasLimit := env.header.GasLimit
 	if env.gasPool == nil {
 		env.gasPool = new(core.GasPool).AddGas(gasLimit)
-		if p, ok := w.engine.(*parlia.Parlia); ok {
-			gasReserved := p.EstimateGasReservedForSystemTxs(w.chain, env.header)
+		if estimator, ok := w.engine.(systemTxGasEstimator); ok {
+			gasReserved := estimator.EstimateGasReservedForSystemTxs(w.chain, env.header)
 			env.gasPool.SubGas(gasReserved)
 			log.Debug("commitTransactions", "number", env.header.Number.Uint64(), "time", env.header.Time, "EstimateGasReservedForSystemTxs", gasReserved)
 		}
@@ -1735,15 +1768,15 @@ func (w *worker) getSealingBlock(params *generateParams) *newPayloadResult {
 }
 
 func (w *worker) tryWaitProposalDoneWhenStopping() {
-	parlia, ok := w.engine.(*parlia.Parlia)
-	// if the consensus is not parlia, just skip waiting
+	scheduler, ok := w.engine.(proposalScheduleReader)
+	// If the consensus engine does not expose proposal scheduling, skip waiting.
 	if !ok {
 		return
 	}
 
 	currentHeader := w.chain.CurrentBlock()
 	currentBlock := currentHeader.Number.Uint64()
-	startBlock, endBlock, err := parlia.NextProposalBlock(w.chain, currentHeader, w.coinbase)
+	startBlock, endBlock, err := scheduler.NextProposalBlock(w.chain, currentHeader, w.coinbase)
 	if err != nil {
 		log.Warn("Failed to get next proposal block, skip waiting", "err", err)
 		return
@@ -1755,7 +1788,7 @@ func (w *worker) tryWaitProposalDoneWhenStopping() {
 		log.Warn("next proposal end block has passed, ignore")
 		return
 	}
-	blockInterval, err := parlia.BlockInterval(w.chain, currentHeader)
+	blockInterval, err := scheduler.BlockInterval(w.chain, currentHeader)
 	if err != nil {
 		log.Debug("failed to get BlockInterval when tryWaitProposalDoneWhenStopping")
 	}

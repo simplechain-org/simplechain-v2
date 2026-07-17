@@ -142,10 +142,7 @@ func (h *Hotstuff) GetNodeIDs() ([]enode.ID, error) {
 func (h *Hotstuff) AddNodeIDs(nodeIDs []enode.ID, nonce uint64) (*types.Transaction, error) {
 	log.Debug("Adding node IDs", "count", len(nodeIDs), "nonce", nonce)
 
-	h.lock.RLock()
-	signTxFn := h.signTxFn
-	val := h.val
-	h.lock.RUnlock()
+	val, _, signTxFn := h.signerCredentials()
 
 	if signTxFn == nil {
 		log.Error("Signing function not set")
@@ -224,10 +221,7 @@ func (h *Hotstuff) GetNodeIDsMap() (map[common.Address][]enode.ID, error) {
 func (h *Hotstuff) RemoveNodeIDs(nodeIDs []enode.ID, nonce uint64) (*types.Transaction, error) {
 	log.Debug("Removing node IDs", "count", len(nodeIDs), "nonce", nonce)
 
-	h.lock.RLock()
-	signTxFn := h.signTxFn
-	val := h.val
-	h.lock.RUnlock()
+	val, _, signTxFn := h.signerCredentials()
 
 	if signTxFn == nil {
 		log.Error("Signing function not set")

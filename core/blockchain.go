@@ -814,7 +814,19 @@ func (bc *BlockChain) loadLastState() error {
 		snapTd := bc.GetTd(currentSnapBlock.Hash(), currentSnapBlock.Number.Uint64())
 		log.Info("Loaded most recent local snap block", "number", currentSnapBlock.Number, "hash", currentSnapBlock.Hash(), "root", currentSnapBlock.Root, "td", snapTd, "age", common.PrettyAge(time.Unix(int64(currentSnapBlock.Time), 0)))
 	}
-	if posa, ok := bc.engine.(consensus.PoSA); ok {
+	if bc.chainConfig.IsHotstuff(headHeader.Number) {
+		if hash := rawdb.ReadFinalizedBlockHash(bc.db); hash != (common.Hash{}) {
+			if header := bc.GetHeaderByHash(hash); header != nil &&
+				header.Number.Cmp(headHeader.Number) <= 0 &&
+				bc.GetCanonicalHash(header.Number.Uint64()) == hash {
+				bc.currentFinalBlock.Store(header)
+				finalTd := bc.GetTd(hash, header.Number.Uint64())
+				log.Info("Loaded most recent local HotStuff finalized block", "number", header.Number, "hash", hash, "root", header.Root, "td", finalTd, "age", common.PrettyAge(time.Unix(int64(header.Time), 0)))
+			} else {
+				log.Warn("Ignoring invalid HotStuff finalized marker", "hash", hash)
+			}
+		}
+	} else if posa, ok := bc.engine.(consensus.PoSA); ok {
 		if currentFinalizedHeader := posa.GetFinalizedHeader(bc, headHeader); currentFinalizedHeader != nil {
 			bc.currentFinalBlock.Store(currentFinalizedHeader)
 			if currentFinalizedBlock := bc.GetBlockByHash(currentFinalizedHeader.Hash()); currentFinalizedBlock != nil {
@@ -1102,11 +1114,30 @@ func (bc *BlockChain) rewindHead(head *types.Header, root common.Hash) (*types.H
 // SetFinalized sets the finalized block.
 // This function differs slightly from Ethereum; we fine-tune it through the outer-layer setting finalizedBlockGauge.
 func (bc *BlockChain) SetFinalized(header *types.Header) {
-	bc.currentFinalBlock.Store(header)
+	if header != nil && bc.chainConfig.IsHotstuff(header.Number) {
+		if canonical := bc.GetCanonicalHash(header.Number.Uint64()); canonical != header.Hash() {
+			log.Error("Refusing to finalize a non-canonical HotStuff block",
+				"number", header.Number, "hash", header.Hash(), "canonical", canonical)
+			return
+		}
+		if current := bc.currentFinalBlock.Load(); current != nil {
+			if header.Number.Cmp(current.Number) < 0 ||
+				(header.Number.Cmp(current.Number) == 0 && header.Hash() != current.Hash()) {
+				log.Error("Refusing to move HotStuff finalized marker backwards or sideways",
+					"currentNumber", current.Number, "currentHash", current.Hash(),
+					"newNumber", header.Number, "newHash", header.Hash())
+				return
+			}
+		}
+	}
 	if header != nil {
 		rawdb.WriteFinalizedBlockHash(bc.db, header.Hash())
+		bc.currentFinalBlock.Store(header)
+		finalizedBlockGauge.Update(int64(header.Number.Uint64()))
 	} else {
 		rawdb.WriteFinalizedBlockHash(bc.db, common.Hash{})
+		bc.currentFinalBlock.Store(nil)
+		finalizedBlockGauge.Update(0)
 	}
 }
 

@@ -26,28 +26,52 @@ func (h *hsHandler) PeerInfo(id enode.ID) interface{} {
 
 // Handle routes decoded packets to the HotStuff engine.
 func (h *hsHandler) Handle(peer *hs.Peer, packet hs.Packet) error {
-	eng, ok := h.chain.Engine().(interface {
+	if eng, ok := h.chain.Engine().(interface {
 		OnHsProposal(string, *hs.ProposalPacket) error
 		OnHsVote(string, *hs.VotePacket) error
 		OnHsNewView(string, *hs.NewViewPacket) error
 		OnHsTimeout(string, *hs.TimeoutPacket) error
 		OnHsQuorumCert(string, *hs.QuorumCertPacket) error
-	})
-	if !ok {
-		return fmt.Errorf("hotstuff protocol not enabled")
+	}); ok {
+		switch pkt := packet.(type) {
+		case *hs.ProposalPacket:
+			return eng.OnHsProposal(peer.ID(), pkt)
+		case *hs.VotePacket:
+			return eng.OnHsVote(peer.ID(), pkt)
+		case *hs.NewViewPacket:
+			return eng.OnHsNewView(peer.ID(), pkt)
+		case *hs.TimeoutPacket:
+			return eng.OnHsTimeout(peer.ID(), pkt)
+		case *hs.QuorumCertPacket:
+			return eng.OnHsQuorumCert(peer.ID(), pkt)
+		default:
+			return fmt.Errorf("unexpected hs packet type: %T", packet)
+		}
 	}
-	switch pkt := packet.(type) {
-	case *hs.ProposalPacket:
-		return eng.OnHsProposal(peer.ID(), pkt)
-	case *hs.VotePacket:
-		return eng.OnHsVote(peer.ID(), pkt)
-	case *hs.NewViewPacket:
-		return eng.OnHsNewView(peer.ID(), pkt)
-	case *hs.TimeoutPacket:
-		return eng.OnHsTimeout(peer.ID(), pkt)
-	case *hs.QuorumCertPacket:
-		return eng.OnHsQuorumCert(peer.ID(), pkt)
-	default:
-		return fmt.Errorf("unexpected hs packet type: %T", packet)
+	// Standalone HotStuff currently exposes generic packet arguments, while the
+	// transition engine exposes strongly typed methods. Support both until the
+	// engine interface is unified.
+	if eng, ok := h.chain.Engine().(interface {
+		OnHsProposal(string, interface{}) error
+		OnHsVote(string, interface{}) error
+		OnHsNewView(string, interface{}) error
+		OnHsTimeout(string, interface{}) error
+		OnHsQuorumCert(string, interface{}) error
+	}); ok {
+		switch packet.(type) {
+		case *hs.ProposalPacket:
+			return eng.OnHsProposal(peer.ID(), packet)
+		case *hs.VotePacket:
+			return eng.OnHsVote(peer.ID(), packet)
+		case *hs.NewViewPacket:
+			return eng.OnHsNewView(peer.ID(), packet)
+		case *hs.TimeoutPacket:
+			return eng.OnHsTimeout(peer.ID(), packet)
+		case *hs.QuorumCertPacket:
+			return eng.OnHsQuorumCert(peer.ID(), packet)
+		default:
+			return fmt.Errorf("unexpected hs packet type: %T", packet)
+		}
 	}
+	return fmt.Errorf("hotstuff protocol not enabled")
 }

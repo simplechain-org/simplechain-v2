@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/lru"
@@ -95,7 +96,7 @@ const (
 	// HotStuff SyncInfo encoding constants
 	viewSize                    = 8                              // uint64 size in bytes
 	hashSize                    = 32                             // common.Hash size in bytes
-	countSize                   = 4                              // uint32 size in bytes
+	countSize                   = 8                              // uint64 validator bitset size in bytes
 	addressSize                 = 20                             // common.Address size in bytes
 	syncInfoTotalSize           = viewSize + hashSize + viewSize // hqcView + hqcHash + htcView
 	syncInfoProofTotalSize      = syncInfoTotalSize + countSize + types.BLSSignatureLength
@@ -218,6 +219,12 @@ var (
 type SignerFn func(accounts.Account, string, []byte) ([]byte, error)
 type SignerTxFn func(accounts.Account, *types.Transaction, *big.Int) (*types.Transaction, error)
 
+type authorizedSigner struct {
+	val      common.Address
+	signFn   SignerFn
+	signTxFn SignerTxFn
+}
+
 func isToSystemContract(to common.Address) bool {
 	return systemContracts[to]
 }
@@ -281,17 +288,12 @@ type Hotstuff struct {
 
 	signer types.Signer
 
-	val      common.Address // Ethereum address of the signing key
-	signFn   SignerFn       // Signer function to authorize hashes with
-	signTxFn SignerTxFn
+	authorized atomic.Pointer[authorizedSigner]
 
-	lock sync.RWMutex // Protects the signer fields
+	lock sync.RWMutex // Protects HotStuff runtime state
 
-	// stateLock protects state commit operations to prevent concurrent snap.Cap/Flatten:
-	// 1. executeBlocks: StateDB.Commit (OnHsProposal) - minimal lock scope
-	// 2. commitBlockWithAncestors: InsertChain (OnHsQuorumCert) - full function scope
-	// This prevents "parent diff layer is stale" panics when both operations trigger
-	// snap.Cap → flatten on the same parent diff layer concurrently.
+	// stateLock serializes speculative metadata prewrites with canonical
+	// InsertChain. Speculative StateDBs are never committed to the shared trie.
 	stateLock sync.Mutex
 
 	ethAPI                     *ethapi.BlockChainAPI
@@ -304,19 +306,22 @@ type Hotstuff struct {
 
 	// HotStuff core state (non-final, for hs subprotocol integration)
 	_hs *hsState
-	// hs network adapter set by p2p side
-	_hsNet HsNetwork
+	// Runtime dependencies are atomically published so no consensus lock is
+	// held across wallet or network calls.
+	hsNet atomic.Pointer[hsNetworkRef]
 
 	// Chain reader for hs runtime paths
 	chain consensus.ChainHeaderReader
 
 	// BLS vote signer (optional). When set, HotStuff votes will be BLS-signed.
-	voteSigner HsBlsSigner
+	blsSigner atomic.Pointer[blsSignerRef]
 
 	// View timeout management
 	hsTimer         *time.Timer
 	hsBaseTimeoutMS uint64 // base timeout in milliseconds; 0 => derive from snapshot
 	lastTimeoutView uint64
+	hsWALError      error
+	closed          bool
 
 	// proposalBlocksCache is a lock-free cache for proposal blocks.
 	// Used by executeBlocks/Finalize to access parent blocks without acquiring h.lock,
@@ -325,8 +330,8 @@ type Hotstuff struct {
 	proposalBlocksCache sync.Map
 	lastTimeoutPacket   *hs.TimeoutPacket
 
-	// The channels for hotstuff engine notifications
-	commitCh chan *types.Block
+	commitMu      sync.Mutex
+	commitWaiters map[common.Hash]map[chan *types.Block]struct{}
 
 	// notifyMinerCh is used to notify miner to immediately produce a block
 	// when view changes and this node becomes the leader
@@ -343,12 +348,22 @@ type HsNetwork interface {
 	ResolveAddress(peerID string) (common.Address, bool)
 }
 
+type hsNetworkRef struct{ network HsNetwork }
+type blsSignerRef struct{ signer HsBlsSigner }
+
 // SetHsNetwork sets the hs network adapter from p2p side
 // Accept interface{} to match backend type assertion, then cast to HsNetwork.
 func (h *Hotstuff) SetHsNetwork(n interface{}) {
 	if net, ok := n.(HsNetwork); ok {
-		h._hsNet = net
+		h.hsNet.Store(&hsNetworkRef{network: net})
 	}
+}
+
+func (h *Hotstuff) hsNetwork() HsNetwork {
+	if ref := h.hsNet.Load(); ref != nil {
+		return ref.network
+	}
+	return nil
 }
 
 // relab engine integration removed
@@ -364,31 +379,60 @@ func (h *Hotstuff) SetChainReader(chain consensus.ChainHeaderReader) {
 				h.lock.Lock()
 				st := h.getHsState()
 				if st != nil {
-					st.currentView = snap.CurrentView
+					nextView := snap.CurrentView
+					if nextView < math.MaxUint64 {
+						nextView++
+					}
+					if nextView > st.currentView {
+						st.currentView = nextView
+					}
+					if st.hasLastVote && st.lastVotedView < math.MaxUint64 && st.lastVotedView+1 > st.currentView {
+						st.currentView = st.lastVotedView + 1
+					}
 					if snap.HighQCView > 0 && (snap.HighQCHash != (common.Hash{})) {
-						// Initialize from snapshot (SignersSet/Sig not stored in snapshot, will be updated from QC messages)
-						st.highQC = &HsQC{BlockHash: snap.HighQCHash, View: snap.HighQCView, SignersSet: 0, Sig: nil}
+						// Preserve a proof-bearing WAL HighQC. Snapshot checkpoints only
+						// persist the hash/view and cannot replace its aggregate proof.
+						if st.highQC == nil {
+							st.highQC = &HsQC{BlockHash: snap.HighQCHash, View: snap.HighQCView}
+						}
 						log.Debug("initHsState: initialized highQC from snapshot",
 							"view", snap.HighQCView,
 							"blockHash", snap.HighQCHash.Hex()[:8],
 							"note", "SignersSet/Sig will be updated from QC messages")
 					}
-					if snap.HighTCView > 0 {
-						st.highTCView = snap.HighTCView
+					if st.highQC == nil && h.chainConfig != nil && h.chainConfig.HotstuffBlock != nil {
+						next := new(big.Int).Add(head.Number, common.Big1)
+						bootstrap := h.chainConfig.IsOnHotstuff(next) ||
+							(h.chainConfig.HotstuffBlock.Sign() == 0 && head.Number.Sign() == 0)
+						if bootstrap {
+							st.highQC = &HsQC{BlockHash: head.Hash(), View: getViewFromHeader(head, h.chainConfig)}
+							log.Info("Initialized HotStuff bootstrap HighQC", "number", head.Number, "hash", head.Hash(), "view", st.highQC.View)
+						}
 					}
 				}
 				h.lock.Unlock()
 			}
 		}
+		if err := h.recoverSpeculativeTail(); err != nil {
+			log.Error("Failed to recover HotStuff speculative tail; voting remains disabled", "err", err)
+		}
 	}
+	h.restartViewTimeout()
 }
 
 // SetBLSVoteSigner injects a BLS vote signer for HotStuff votes
 // Accept interface{} for backend-friendly dynamic injection
 func (h *Hotstuff) SetBLSVoteSigner(vs interface{}) {
 	if s, ok := vs.(HsBlsSigner); ok {
-		h.voteSigner = s
+		h.blsSigner.Store(&blsSignerRef{signer: s})
 	}
+}
+
+func (h *Hotstuff) blsVoteSigner() HsBlsSigner {
+	if ref := h.blsSigner.Load(); ref != nil {
+		return ref.signer
+	}
+	return nil
 }
 
 // HsBlsSigner is the minimal interface required from a BLS signer
@@ -441,15 +485,18 @@ func New(
 		stakeHubABI:                stABI,
 		signer:                     types.LatestSigner(chainConfig),
 		hotstuffConfig:             hotstuffConfig,
-		commitCh:                   make(chan *types.Block, 1),
+		commitWaiters:              make(map[common.Hash]map[chan *types.Block]struct{}),
 		notifyMinerCh:              make(chan struct{}, 1),
 	}
 	// init hs runtime state
 	c.initHsState()
+	if err := c.loadHsWAL(); err != nil {
+		c.hsWALError = err
+		log.Error("Failed to restore HotStuff safety WAL; voting is disabled", "err", err)
+	}
 	// initialize timeout parameters
 	// Base timeout = block interval + 5s buffer for network delay, execution, etc.
 	c.hsBaseTimeoutMS = defaultBlockInterval + 5000 // base timeout: block interval + buffer
-	c.restartViewTimeout()
 	return c
 }
 
@@ -459,21 +506,80 @@ func (h *Hotstuff) GetNotifyMinerCh() <-chan struct{} {
 	return h.notifyMinerCh
 }
 
+func (h *Hotstuff) registerCommitWaiter(hash common.Hash) chan *types.Block {
+	waiter := make(chan *types.Block, 1)
+	h.commitMu.Lock()
+	if h.commitWaiters == nil {
+		h.commitWaiters = make(map[common.Hash]map[chan *types.Block]struct{})
+	}
+	if h.commitWaiters[hash] == nil {
+		h.commitWaiters[hash] = make(map[chan *types.Block]struct{})
+	}
+	h.commitWaiters[hash][waiter] = struct{}{}
+	h.commitMu.Unlock()
+	return waiter
+}
+
+func (h *Hotstuff) unregisterCommitWaiter(hash common.Hash, waiter chan *types.Block) {
+	h.commitMu.Lock()
+	if waiters := h.commitWaiters[hash]; waiters != nil {
+		delete(waiters, waiter)
+		if len(waiters) == 0 {
+			delete(h.commitWaiters, hash)
+		}
+	}
+	h.commitMu.Unlock()
+}
+
+func (h *Hotstuff) notifyCommittedBlock(block *types.Block) {
+	if block == nil {
+		return
+	}
+	hash := block.Hash()
+	h.commitMu.Lock()
+	waiterSet := h.commitWaiters[hash]
+	waiters := make([]chan *types.Block, 0, len(waiterSet))
+	for waiter := range waiterSet {
+		waiters = append(waiters, waiter)
+	}
+	delete(h.commitWaiters, hash)
+	h.commitMu.Unlock()
+	for _, waiter := range waiters {
+		waiter <- block
+	}
+}
+
 func (h *Hotstuff) IsHotstuffMining(number *big.Int) bool {
-	return true
+	active := h.chainConfig != nil && h.chainConfig.IsHotstuff(number)
+	if active {
+		h.ensureBootstrapAtHead()
+	}
+	return active
 }
 
 func (h *Hotstuff) HasPendingProposal() bool {
+	h.ensureBootstrapAtHead()
+	h.lock.RLock()
+	defer h.lock.RUnlock()
 	st := h.getHsState()
 	if st == nil {
 		return false
 	}
-	return h.HasProposalForView(st.currentView)
+	_, exists := st.proposalsByView[st.currentView]
+	return exists
 }
 
 // ConsensusAddress returns the consensus address of the validator
 func (h *Hotstuff) ConsensusAddress() common.Address {
-	return h.val
+	val, _, _ := h.signerCredentials()
+	return val
+}
+
+func (h *Hotstuff) signerCredentials() (common.Address, SignerFn, SignerTxFn) {
+	if signer := h.authorized.Load(); signer != nil {
+		return signer.val, signer.signFn, signer.signTxFn
+	}
+	return common.Address{}, nil, nil
 }
 
 // VerifyHeader checks whether a header conforms to the consensus rules.
@@ -513,7 +619,7 @@ func getValidatorBytesFromHeader(header *types.Header, chainConfig *params.Chain
 	if len(header.Extra) <= extraVanity+extraSeal {
 		return nil
 	}
-	hsExtraSize := syncInfoSize(header)
+	hsExtraSize := hotstuffExtraSize(header, chainConfig)
 	if !chainConfig.IsLuban(header.Number) {
 		if header.Number.Uint64()%epochLength == 0 && (len(header.Extra)-extraSeal-extraVanity-hsExtraSize)%validatorBytesLengthBeforeLuban != 0 {
 			return nil
@@ -805,7 +911,7 @@ func (h *Hotstuff) verifyCascadingFields(chain consensus.ChainHeaderReader, head
 	}
 
 	// HotStuff chained-safety minimal check: HighQC must justify parent
-	if err := h.verifyHotstuffRules(chain, header, snap, tc); err != nil {
+	if err := h.verifyHotstuffRules(chain, header, parent, snap, tc); err != nil {
 		return err
 	}
 
@@ -849,24 +955,29 @@ func (h *Hotstuff) assembleHighQC(chain consensus.ChainHeaderReader, header *typ
 	}
 	// enough votes for parent: embed HighQC into header extra for this proposal
 	// Use view number from parent header, not block number
-	parentView := getViewFromHeader(parent)
+	parentView := getViewFromHeader(parent, h.chainConfig)
 	return h.embedHighQC(header, parent.Hash(), parentView)
 }
 
 // verifyHotstuffRules checks HighQC justifies parent (minimal chained HotStuff rule)
-func (h *Hotstuff) verifyHotstuffRules(chain consensus.ChainHeaderReader, header *types.Header, snap *Snapshot, tc *hsTimeoutCert) error {
-	ok, hqcView, hqcHash, htcView, signersSet, sig, hasProof := parseSyncInfoWithProof(header)
-	if !ok {
-		// 允许缺失 SyncInfo（创世或早期块），不阻断
+func (h *Hotstuff) verifyHotstuffRules(chain consensus.ChainHeaderReader, header, parent *types.Header, snap *Snapshot, tc *hsTimeoutCert) error {
+	if !h.chainConfig.IsHotstuff(header.Number) {
 		return nil
+	}
+	ok, hqcView, hqcHash, htcView, signersSet, sig, hasProof := parseSyncInfoWithProof(header, h.chainConfig)
+	if !ok {
+		return errors.New("missing HotStuff SyncInfo")
 	}
 	// 最小规则：HighQC 指向 parent
 	if hqcHash != header.ParentHash {
 		return errors.New("invalid HighQC: hash mismatch")
 	}
 	// Header view must be exactly derived from the proof it carries.
-	currentView := getViewFromHeader(header)
+	currentView := getViewFromHeader(header, h.chainConfig)
 	expectedView := hqcView + 1
+	if tc != nil && (htcView == 0 || tc.View != htcView) {
+		return errors.New("TimeoutCert does not match declared htcView")
+	}
 	if htcView > 0 && htcView >= hqcView {
 		if tc == nil {
 			return errors.New("missing TimeoutCert for htcView")
@@ -879,10 +990,11 @@ func (h *Hotstuff) verifyHotstuffRules(chain consensus.ChainHeaderReader, header
 	if currentView != expectedView {
 		return fmt.Errorf("invalid view: have %d want %d", currentView, expectedView)
 	}
-	if h.chainConfig.IsHotstuff(header.Number) && !h.chainConfig.IsOnHotstuff(header.Number) && h.chainConfig.IsLuban(header.Number) && !hasProof {
+	bootstrap := h.isBootstrapHeaderHighQC(header, parent, hqcHash, hqcView)
+	if !hasProof && !bootstrap {
 		return errors.New("missing HighQC aggregate proof")
 	}
-	if h.chainConfig.IsLuban(header.Number) && hasProof {
+	if hasProof {
 		qc := &hs.QuorumCertPacket{
 			TargetHash:   hqcHash,
 			ViewNumber:   hqcView,
@@ -894,6 +1006,17 @@ func (h *Hotstuff) verifyHotstuffRules(chain consensus.ChainHeaderReader, header
 		}
 	}
 	return nil
+}
+
+func (h *Hotstuff) isBootstrapHeaderHighQC(header, parent *types.Header, hash common.Hash, view uint64) bool {
+	if header == nil || parent == nil || header.Number == nil || parent.Number == nil ||
+		parent.Hash() != hash || getViewFromHeader(parent, h.chainConfig) != view || parent.Number.Uint64()+1 != header.Number.Uint64() {
+		return false
+	}
+	if h.chainConfig.HotstuffBlock.Sign() == 0 {
+		return parent.Number.Sign() == 0 && header.Number.Uint64() == 1
+	}
+	return h.chainConfig.IsOnHotstuff(header.Number)
 }
 
 // snapshotWithFallback wraps snapshot with fallback logic for Chained HotStuff pipelining
@@ -1027,7 +1150,7 @@ func (h *Hotstuff) snapshotInternal(chain consensus.ChainHeaderReader, number ui
 			header = chain.GetHeader(hash, number)
 			if header == nil {
 				// Try HotStuff in-memory proposals (pipelined block not in canonical chain yet)
-				block := h.getBlockFromStateUnsafe(hash)
+				block := h.getBlockWithoutStateLock(hash)
 				if block != nil && block.NumberU64() == number {
 					header = block.Header()
 					log.Debug("snapshotInternal: using HotStuff state header",
@@ -1056,9 +1179,9 @@ func (h *Hotstuff) snapshotInternal(chain consensus.ChainHeaderReader, number ui
 		headers[i], headers[len(headers)-1-i] = headers[len(headers)-1-i], headers[i]
 	}
 
-	// Pass getBlockFromStateUnsafe as a callback for FindAncientHeader to access HotStuff state
-	// CRITICAL: Use Unsafe version because caller may already hold lock
-	snap, err := snap.apply(headers, chain, parents, h.chainConfig, h.getBlockFromStateUnsafe)
+	// Snapshot verification may run without h.lock, so only use lock-free/cache
+	// and durable lookups for pipelined ancestors.
+	snap, err := snap.apply(headers, chain, parents, h.chainConfig, h.getBlockWithoutStateLock)
 	if err != nil {
 		log.Error("Failed to apply headers to snapshot", "err", err)
 		return nil, err
@@ -1131,18 +1254,20 @@ func (h *Hotstuff) verifySeal(chain consensus.ChainHeaderReader, header *types.H
 		h.recentHeaders.Add(key, header.Hash())
 	}
 
-	// Before Luban fork, skip validator set check since BLS addresses are not available
-	// HotStuff consensus can only verify signature validity, not validator membership
-	if !h.chainConfig.IsLuban(header.Number) {
-		log.Debug("Skip validator set check before Luban fork", "number", header.Number, "signer", signer)
-		return nil
-	}
-
 	if _, ok := snap.Validators[signer]; !ok {
-		// TODO: only for test
-		//return errUnauthorizedValidator(signer.String())
 		log.Warn("Unauthorized validator", "number", header.Number, "signer", signer)
-		return nil
+		return errUnauthorizedValidator(signer.String())
+	}
+	if h.chainConfig.IsHotstuff(header.Number) {
+		validators := snap.validators()
+		if len(validators) == 0 {
+			return errors.New("empty HotStuff validator set")
+		}
+		view := getViewFromHeader(header, h.chainConfig)
+		leader := validators[view%uint64(len(validators))]
+		if signer != leader {
+			return fmt.Errorf("unauthorized HotStuff proposer: have %s want leader %s for view %d", signer, leader, view)
+		}
 	}
 
 	return nil
@@ -1301,52 +1426,13 @@ func (h *Hotstuff) blockTime(snap *Snapshot, header, parent *types.Header) uint6
 // Prepare implements consensus.Engine, preparing all the consensus fields of the
 // header for running the transactions on top.
 func (h *Hotstuff) Prepare(chain consensus.ChainHeaderReader, header *types.Header) error {
-	header.Coinbase = h.val
+	header.Coinbase = h.ConsensusAddress()
 	header.Nonce = types.BlockNonce{}
 
 	number := header.Number.Uint64()
 	snap, err := h.snapshot(chain, number-1, header.ParentHash, nil)
 	if err != nil {
-		// Fallback: if parent block is not in chain yet (e.g., highQC points to uncommitted block),
-		// try to get parent block from HotStuff state and use its parent's snapshot
-		log.Debug("Failed to get snapshot from parent, trying fallback", "parentHash", header.ParentHash.Hex()[:8], "parentNumber", number-1, "err", err)
-		parentBlock := h.GetBlockFromState(header.ParentHash)
-		if parentBlock != nil && parentBlock.NumberU64() > 0 {
-			// Use parent's parent hash to get snapshot from canonical chain
-			parentParentHash := parentBlock.ParentHash()
-			parentParentNumber := parentBlock.NumberU64() - 1
-			snap, err = h.snapshot(chain, parentParentNumber, parentParentHash, nil)
-			if err == nil {
-				log.Debug("Using fallback snapshot from parent's parent", "parentParentHash", parentParentHash.Hex()[:8], "parentParentNumber", parentParentNumber)
-			} else {
-				log.Debug("Failed to get snapshot from parent's parent, trying current head", "err", err)
-				// Last resort: use current chain head's snapshot
-				currentHead := chain.CurrentHeader()
-				if currentHead != nil {
-					snap, err = h.snapshot(chain, currentHead.Number.Uint64(), currentHead.Hash(), nil)
-					if err != nil {
-						log.Debug("Failed to get snapshot from current head", "err", err)
-						return err
-					}
-					log.Debug("Using fallback snapshot from current head", "headNumber", currentHead.Number.Uint64())
-				} else {
-					return err
-				}
-			}
-		} else {
-			// Parent block not found in HotStuff state, use current chain head's snapshot
-			currentHead := chain.CurrentHeader()
-			if currentHead != nil {
-				snap, err = h.snapshot(chain, currentHead.Number.Uint64(), currentHead.Hash(), nil)
-				if err != nil {
-					log.Debug("Failed to get snapshot from current head", "err", err)
-					return err
-				}
-				log.Debug("Using fallback snapshot from current head", "headNumber", currentHead.Number.Uint64())
-			} else {
-				return err
-			}
-		}
+		return fmt.Errorf("resolve parent snapshot %s at block %d: %w", header.ParentHash, number-1, err)
 	}
 
 	header.Difficulty = big.NewInt(0)
@@ -1946,8 +2032,9 @@ func (h *Hotstuff) Finalize(chain consensus.ChainHeaderReader, header *types.Hea
 
 	cx := chainContext{Chain: chain, parlia: h}
 
-	// Get parent header for other operations
-	parent := parents[0]
+	// Parents are ordered oldest-to-newest for snapshot application. Consensus
+	// state transitions must use the direct parent, i.e. the final element.
+	parent := parents[len(parents)-1]
 
 	// DEBUG: Initial state root in Finalize
 	initialRoot := state.IntermediateRoot(h.chainConfig.IsEIP158(header.Number))
@@ -2267,7 +2354,7 @@ func (h *Hotstuff) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header
 		}
 	}
 
-	err := h.distributeIncoming(h.val, state, header, cx, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
+	err := h.distributeIncoming(h.ConsensusAddress(), state, header, cx, &body.Transactions, &receipts, nil, &header.GasUsed, true, tracer)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2346,7 +2433,7 @@ func (h *Hotstuff) IsActiveValidatorAt(chain consensus.ChainHeaderReader, header
 		return false
 	}
 	validators := snap.Validators
-	validatorInfo, ok := validators[h.val]
+	validatorInfo, ok := validators[h.ConsensusAddress()]
 
 	return ok && (checkVoteKeyFn == nil || (validatorInfo != nil && checkVoteKeyFn(&validatorInfo.VoteAddress)))
 }
@@ -2374,9 +2461,10 @@ func (h *Hotstuff) VerifyVote(chain consensus.ChainHeaderReader, vote *types.Vot
 
 	validators := snap.Validators
 	voteAddress := vote.VoteAddress
+	local := h.ConsensusAddress()
 	for addr, validator := range validators {
 		if validator.VoteAddress == voteAddress {
-			if addr == h.val {
+			if addr == local {
 				validVotesfromSelfCounter.Inc(1)
 			}
 			metrics.GetOrRegisterCounter(fmt.Sprintf("parlia/VerifyVote/%s", addr.String()), nil).Inc(1)
@@ -2390,12 +2478,7 @@ func (h *Hotstuff) VerifyVote(chain consensus.ChainHeaderReader, vote *types.Vot
 // Authorize injects a private key into the consensus engine to mint new blocks
 // with.
 func (h *Hotstuff) Authorize(val common.Address, signFn SignerFn, signTxFn SignerTxFn) {
-	h.lock.Lock()
-	defer h.lock.Unlock()
-
-	h.val = val
-	h.signFn = signFn
-	h.signTxFn = signTxFn
+	h.authorized.Store(&authorizedSigner{val: val, signFn: signFn, signTxFn: signTxFn})
 }
 
 // Argument leftOver is the time reserved for block finalize(calculate root, distribute income...)
@@ -2403,45 +2486,8 @@ func (h *Hotstuff) Delay(chain consensus.ChainReader, header *types.Header, left
 	number := header.Number.Uint64()
 	snap, err := h.snapshot(chain, number-1, header.ParentHash, nil)
 	if err != nil {
-		// Fallback: if parent block is not in chain yet, try to get snapshot from parent's parent or current head
-		log.Debug("Failed to get snapshot in Delay, trying fallback", "parentHash", header.ParentHash.Hex()[:8], "parentNumber", number-1, "err", err)
-		parentBlock := h.GetBlockFromState(header.ParentHash)
-		if parentBlock != nil && parentBlock.NumberU64() > 0 {
-			// Use parent's parent hash to get snapshot from canonical chain
-			parentParentHash := parentBlock.ParentHash()
-			parentParentNumber := parentBlock.NumberU64() - 1
-			snap, err = h.snapshot(chain, parentParentNumber, parentParentHash, nil)
-			if err == nil {
-				log.Debug("Using fallback snapshot from parent's parent in Delay", "parentParentHash", parentParentHash.Hex()[:8], "parentParentNumber", parentParentNumber)
-			} else {
-				log.Debug("Failed to get snapshot from parent's parent in Delay, trying current head", "err", err)
-				// Last resort: use current chain head's snapshot
-				currentHead := chain.CurrentHeader()
-				if currentHead != nil {
-					snap, err = h.snapshot(chain, currentHead.Number.Uint64(), currentHead.Hash(), nil)
-					if err != nil {
-						log.Debug("Failed to get snapshot from current head in Delay", "err", err)
-						return nil
-					}
-					log.Debug("Using fallback snapshot from current head in Delay", "headNumber", currentHead.Number.Uint64())
-				} else {
-					return nil
-				}
-			}
-		} else {
-			// Parent block not found in HotStuff state, use current chain head's snapshot
-			currentHead := chain.CurrentHeader()
-			if currentHead != nil {
-				snap, err = h.snapshot(chain, currentHead.Number.Uint64(), currentHead.Hash(), nil)
-				if err != nil {
-					log.Debug("Failed to get snapshot from current head in Delay", "err", err)
-					return nil
-				}
-				log.Debug("Using fallback snapshot from current head in Delay", "headNumber", currentHead.Number.Uint64())
-			} else {
-				return nil
-			}
-		}
+		log.Debug("Failed to resolve exact parent snapshot in Delay", "parentHash", header.ParentHash, "parentNumber", number-1, "err", err)
+		return nil
 	}
 	delay := time.Until(time.UnixMilli(int64(header.MilliTimestamp())))
 
@@ -2473,9 +2519,8 @@ func (h *Hotstuff) Seal(chain consensus.ChainHeaderReader, block *types.Block, r
 		log.Info("[Seal] EXIT - genesis block, skipping")
 		return errUnknownBlock
 	}
-	// Don't hold the val fields for the entire sealing procedure
+	val, signFn, _ := h.signerCredentials()
 	h.lock.RLock()
-	val, signFn := h.val, h.signFn
 	st := h.getHsState()
 	currentView := uint64(0)
 	var highQCView uint64
@@ -2488,6 +2533,9 @@ func (h *Hotstuff) Seal(chain consensus.ChainHeaderReader, block *types.Block, r
 		}
 	}
 	h.lock.RUnlock()
+	if signFn == nil {
+		return errors.New("HotStuff signer is not configured")
+	}
 
 	log.Info("[Seal] Got HotStuff state",
 		"currentView", currentView,
@@ -2512,9 +2560,9 @@ func (h *Hotstuff) Seal(chain consensus.ChainHeaderReader, block *types.Block, r
 	// HotStuff: Check if we are the leader for current view
 	// Non-leaders should not propose to avoid "Ignore proposal from non-leader" errors
 	log.Info("[Seal] Checking if we are leader", "currentView", currentView, "self", val.Hex())
-	leader, err := h.getLeaderForView(chain, currentView)
+	leader, err := h.getLeaderForViewAt(chain, header.ParentHash, currentView)
 	if err != nil {
-		log.Warn("[Seal] Failed to get leader for view", "view", currentView, "err", err)
+		return fmt.Errorf("resolve HotStuff leader for view %d: %w", currentView, err)
 	}
 	log.Info("[Seal] Leader check result", "leader", leader.Hex(), "self", val.Hex(), "isLeader", leader == val)
 	isLeader := (leader == val)
@@ -2535,10 +2583,17 @@ func (h *Hotstuff) Seal(chain consensus.ChainHeaderReader, block *types.Block, r
 	// CRITICAL FIX: Check if block's parent matches current highQC
 	// If highQC was updated after block construction, this block is stale
 	log.Info("[Seal] We are leader! Checking parent match with highQC", "view", currentView)
+	parentHeader := chain.GetHeaderByHash(header.ParentHash)
+	if parentHeader == nil {
+		if parentBlock := h.getBlockWithoutStateLock(header.ParentHash); parentBlock != nil {
+			parentHeader = parentBlock.Header()
+		}
+	}
 	h.lock.RLock()
 	st = h.getHsState()
-	if h.chainConfig.IsHotstuff(header.Number) && !h.chainConfig.IsOnHotstuff(header.Number) {
-		if st == nil || st.highQC == nil || !st.highQC.hasAggregateProof() {
+	if h.chainConfig.IsHotstuff(header.Number) {
+		bootstrap := st != nil && st.highQC != nil && h.isBootstrapHeaderHighQC(header, parentHeader, st.highQC.BlockHash, st.highQC.View)
+		if st == nil || st.highQC == nil || (!st.highQC.hasAggregateProof() && !bootstrap) {
 			log.Warn("[Seal] EXIT - missing verified highQC after HotStuff activation",
 				"blockNumber", number,
 				"view", currentView)
@@ -2655,7 +2710,7 @@ func (h *Hotstuff) Seal(chain consensus.ChainHeaderReader, block *types.Block, r
 			log.Info("[Seal goroutine] HighTC assembled (or no TC needed)")
 		}
 
-		headerView := getViewFromHeader(header)
+		headerView := getViewFromHeader(header, h.chainConfig)
 		h.lock.RLock()
 		stateView := currentView
 		if st := h.getHsState(); st != nil {
@@ -2685,6 +2740,8 @@ func (h *Hotstuff) Seal(chain consensus.ChainHeaderReader, block *types.Block, r
 		x := header.Extra
 		copy(x[len(x)-extraSeal:], sealer)
 		block := block.WithSeal(header)
+		commitWaiter := h.registerCommitWaiter(block.Hash())
+		defer h.unregisterCommitWaiter(block.Hash(), commitWaiter)
 		log.Info("[Seal goroutine] Block sealed with signature")
 
 		// Broadcast HotStuff proposal from miner path using the sealed header and body
@@ -2697,72 +2754,77 @@ func (h *Hotstuff) Seal(chain consensus.ChainHeaderReader, block *types.Block, r
 			encBody, berr := rlp.EncodeToBytes(body)
 			if berr != nil {
 				log.Warn("[Seal goroutine] Failed to encode body for HS proposal broadcast", "err", berr)
-			} else {
-				log.Info("[Seal goroutine] Body encoded successfully", "encLen", len(encBody), "txCount", len(body.Transactions))
+				return
 			}
+			log.Info("[Seal goroutine] Body encoded successfully", "encLen", len(encBody), "txCount", len(body.Transactions))
 
 			// Use current HotStuff view as ProposalPacket.Number (view number)
 			view := headerView
 			log.Info("[Seal goroutine] Creating proposal packet", "view", view, "blockHash", header.Hash().Hex()[:10])
 
-			prop := &hs.ProposalPacket{ParentHash: header.ParentHash, BlockHash: header.Hash(), View: view, HeaderRLP: encHead, BodyRLP: encBody}
-			if st := h.getHsState(); st != nil {
-				if st.highQC != nil {
-					// attach HighQC to proposal
-					prop.HighQC = hs.HsQC{BlockHash: st.highQC.BlockHash, View: st.highQC.View, SignersSet: st.highQC.SignersSet, Sig: st.highQC.Sig}
-					log.Info("[Seal goroutine] Attaching HighQC to proposal",
-						"proposalView", view,
-						"highQCView", st.highQC.View,
-						"highQCBlockHash", st.highQC.BlockHash.Hex()[:8],
-						"highQCSignersSet", st.highQC.SignersSet,
-						"highQCAggSigLen", len(st.highQC.Sig))
-				} else {
-					log.Warn("[Seal goroutine] No highQC available for proposal", "view", view)
-				}
+			hasSyncInfo, highQCView, highQCHash, _, highQCSigners, highQCSig, _ := parseSyncInfoWithProof(header, h.chainConfig)
+			if !hasSyncInfo {
+				log.Warn("[Seal goroutine] Refusing to broadcast proposal without SyncInfo", "block", header.Hash())
+				return
+			}
+			prop := &hs.ProposalPacket{
+				ParentHash: header.ParentHash,
+				BlockHash:  header.Hash(),
+				HighQC: hs.HsQC{
+					BlockHash: highQCHash, View: highQCView,
+					SignersSet: highQCSigners, Sig: common.CopyBytes(highQCSig),
+				},
+				View: view, HeaderRLP: encHead, BodyRLP: encBody,
 			}
 
 			log.Info("[Seal goroutine] Processing own proposal locally", "view", view, "block", header.Hash().Hex()[:8])
 			if err := h.OnHsProposal("self", prop); err != nil {
 				log.Warn("[Seal goroutine] Failed to process own proposal", "err", err)
-			} else {
-				log.Info("[Seal goroutine] Successfully processed own proposal locally")
+				return
+			}
+			h.lock.RLock()
+			acceptedLocally := false
+			if st := h.getHsState(); st != nil {
+				acceptedLocally = st.proposalsByHashBlock[block.Hash()] != nil
+			}
+			h.lock.RUnlock()
+			if !acceptedLocally {
+				log.Warn("[Seal goroutine] Local consensus rejected proposal; skipping broadcast", "block", block.Hash())
+				return
 			}
 
 			log.Info("[Seal goroutine] Broadcasting proposal to replicas")
 			if err := h.broadcastHsProposal(prop); err != nil {
-				log.Warn("[Seal goroutine] HS proposal broadcast failed", "err", err)
-				// Still need to return the block even if broadcast failed
-				// Single node or no peers case: seal the block without consensus
-				results <- block
-				log.Info("[Seal goroutine] Returned block after broadcast failure")
-				return
+				// A local quorum may still make progress, but an uncommitted block
+				// must never be returned to the miner.
+				log.Warn("[Seal goroutine] HS proposal broadcast failed; waiting for commit", "err", err)
 			}
 			log.Info("[Seal goroutine] ✅ Proposal broadcast successful!")
 		} else {
 			log.Warn("[Seal goroutine] Failed to encode header for HS proposal broadcast", "err", err)
-			// Still return the block to avoid blocking miner
-			results <- block
 			return
 		}
 		// Wait for commit signal from HotStuff consensus (3-chain rule)
 		log.Info("[Seal goroutine] Waiting for commit signal from 3-chain rule", "blockHash", block.Hash().Hex()[:10])
-		select {
-		case result := <-h.commitCh:
-			// if the block hash and the hash from channel are the same,
-			// return the result. Otherwise, keep waiting the next hash.
-			log.Info("[Seal goroutine] Received commit signal", "resultHash", result.Hash().Hex()[:10], "ourHash", block.Hash().Hex()[:10])
-			if result != nil && block.Hash() == result.Hash() {
-				results <- result
-				log.Info("[Seal goroutine] ✅ Block committed via HotStuff 3-chain rule",
-					"hash", result.Hash().Hex(),
-					"number", result.NumberU64())
+		for {
+			select {
+			case result := <-commitWaiter:
+				// if the block hash and the hash from channel are the same,
+				// return the result. Otherwise, keep waiting the next hash.
+				if result != nil && block.Hash() == result.Hash() {
+					results <- result
+					log.Info("[Seal goroutine] ✅ Block committed via HotStuff 3-chain rule",
+						"hash", result.Hash().Hex(),
+						"number", result.NumberU64())
+					return
+				} else {
+					log.Warn("[Seal goroutine] Commit signal for different block, continuing to wait")
+					continue
+				}
+			case <-stop:
+				log.Warn("[Seal goroutine] Sealing stopped before commit", "sealhash", h.SealHash(header).Hex()[:10])
 				return
-			} else {
-				log.Warn("[Seal goroutine] Commit signal for different block, continuing to wait")
 			}
-		case <-stop:
-			log.Warn("[Seal goroutine] Sealing stopped before commit", "sealhash", h.SealHash(header).Hex()[:10])
-			return
 		}
 	}()
 	log.Info("[Seal] Seal goroutine started, returning from Seal function")
@@ -2790,11 +2852,11 @@ func (h *Hotstuff) EnoughDistance(chain consensus.ChainReader, header *types.Hea
 	if err != nil {
 		return true
 	}
-	return snap.enoughDistance(h.val, header)
+	return snap.enoughDistance(h.ConsensusAddress(), header)
 }
 
 func (h *Hotstuff) IsLocalBlock(header *types.Header) bool {
-	return h.val == header.Coinbase
+	return h.ConsensusAddress() == header.Coinbase
 }
 
 func (h *Hotstuff) CalcDifficulty(chain consensus.ChainHeaderReader, time uint64, parent *types.Header) *big.Int {
@@ -2844,8 +2906,14 @@ func (h *Hotstuff) APIs(chain consensus.ChainHeaderReader) []rpc.API {
 	}}
 }
 
-// Close implements consensus.Engine. It's a noop for parlia as there are no background threads.
 func (h *Hotstuff) Close() error {
+	h.lock.Lock()
+	h.closed = true
+	if h.hsTimer != nil {
+		h.hsTimer.Stop()
+		h.hsTimer = nil
+	}
+	h.lock.Unlock()
 	return nil
 }
 
@@ -3074,9 +3142,13 @@ func (h *Hotstuff) applyTransaction(
 	expectedTx := types.NewTransaction(nonce, *msg.To, msg.Value, msg.GasLimit, msg.GasPrice, msg.Data)
 	expectedHash := h.signer.Hash(expectedTx)
 
-	if msg.From == h.val && mining {
+	val, _, signTxFn := h.signerCredentials()
+	if msg.From == val && mining {
+		if signTxFn == nil {
+			return errors.New("HotStuff transaction signer is not configured")
+		}
 		var err error
-		expectedTx, err = h.signTxFn(accounts.Account{Address: msg.From}, expectedTx, h.chainConfig.ChainID)
+		expectedTx, err = signTxFn(accounts.Account{Address: msg.From}, expectedTx, h.chainConfig.ChainID)
 		if err != nil {
 			return err
 		}
@@ -3169,22 +3241,10 @@ func (h *Hotstuff) GetFinalizedHeader(chain consensus.ChainHeaderReader, header 
 	if chain == nil || header == nil {
 		return nil
 	}
-	if !chain.Config().IsPlato(header.Number) {
-		return chain.GetHeaderByNumber(0)
+	if finalized := h.finalizedHeaderOnBranch(chain, header, nil); finalized != nil {
+		return finalized
 	}
-
-	snap, err := h.snapshot(chain, header.Number.Uint64(), header.Hash(), nil)
-	if err != nil {
-		log.Error("Unexpected error when getting snapshot",
-			"error", err, "blockNumber", header.Number.Uint64(), "blockHash", header.Hash())
-		return nil
-	}
-
-	if snap.Attestation == nil {
-		return chain.GetHeaderByNumber(0) // keep consistent with GetJustifiedNumberAndHash
-	}
-
-	return chain.GetHeader(snap.Attestation.SourceHash, snap.Attestation.SourceNumber)
+	return chain.GetHeaderByNumber(0)
 }
 
 // GetJustifiedNumberAndHash retrieves the number and hash of the highest justified block
@@ -3194,19 +3254,90 @@ func (h *Hotstuff) GetJustifiedNumberAndHash(chain consensus.ChainHeaderReader, 
 		return 0, common.Hash{}, errors.New("illegal chain or header")
 	}
 	head := headers[len(headers)-1]
-	snap, err := h.snapshot(chain, head.Number.Uint64(), head.Hash(), headers)
-	if err != nil {
-		log.Error("Unexpected error when getting snapshot",
-			"error", err, "blockNumber", head.Number.Uint64(), "blockHash", head.Hash())
-		return 0, common.Hash{}, err
+	if finalized := h.finalizedHeaderOnBranch(chain, head, headers); finalized != nil {
+		return finalized.Number.Uint64(), finalized.Hash(), nil
 	}
-	if snap.Attestation == nil {
-		if h.chainConfig.IsLuban(head.Number) {
-			log.Debug("once one attestation generated, attestation of snap would not be nil forever basically")
+	genesis := chain.GetHeaderByNumber(0)
+	if genesis == nil {
+		return 0, common.Hash{}, errors.New("genesis header not found")
+	}
+	return 0, genesis.Hash(), nil
+}
+
+// finalizedHeaderOnBranch returns the highest block at or below head that is
+// known finalized by the durable marker. The marker can be either before head
+// (normal latest-head queries) or after head (historical queries).
+func (h *Hotstuff) finalizedHeaderOnBranch(chain consensus.ChainHeaderReader, head *types.Header, headers []*types.Header) *types.Header {
+	finalized := h.durableFinalizedHeader(chain)
+	if finalized == nil {
+		return nil
+	}
+	if headerDescendsFrom(chain, head, finalized, headers) {
+		return finalized
+	}
+	if headerDescendsFrom(chain, finalized, head, nil) {
+		return head
+	}
+	return nil
+}
+
+func (h *Hotstuff) durableFinalizedHeader(chain consensus.ChainHeaderReader) *types.Header {
+	if provider, ok := chain.(interface{ CurrentFinalBlock() *types.Header }); ok {
+		if finalized := provider.CurrentFinalBlock(); finalized != nil {
+			return finalized
 		}
-		return 0, chain.GetHeaderByNumber(0).Hash(), nil
 	}
-	return snap.Attestation.TargetNumber, snap.Attestation.TargetHash, nil
+	if h.db != nil {
+		if hash := rawdb.ReadFinalizedBlockHash(h.db); hash != (common.Hash{}) {
+			if number := rawdb.ReadHeaderNumber(h.db, hash); number != nil {
+				if header := rawdb.ReadHeader(h.db, hash, *number); header != nil {
+					return header
+				}
+			}
+		}
+	}
+	// SetFinalized is authoritative, but retain an in-process fallback until its
+	// durable marker becomes visible through the chain reader.
+	h.lock.RLock()
+	var best *types.Header
+	if st := h.getHsState(); st != nil {
+		for hash, number := range st.committedBlocks {
+			if best != nil && number <= best.Number.Uint64() {
+				continue
+			}
+			if block := h.getBlockWithoutStateLock(hash); block != nil {
+				best = block.Header()
+			} else if candidate := chain.GetHeader(hash, number); candidate != nil {
+				best = candidate
+			}
+		}
+	}
+	h.lock.RUnlock()
+	return best
+}
+
+func headerDescendsFrom(chain consensus.ChainHeaderReader, head, ancestor *types.Header, headers []*types.Header) bool {
+	if head == nil || ancestor == nil || head.Number.Uint64() < ancestor.Number.Uint64() {
+		return false
+	}
+	byHash := make(map[common.Hash]*types.Header, len(headers))
+	for _, header := range headers {
+		if header != nil {
+			byHash[header.Hash()] = header
+		}
+	}
+	cursor := head
+	for cursor.Number.Uint64() > ancestor.Number.Uint64() {
+		if parent := byHash[cursor.ParentHash]; parent != nil {
+			cursor = parent
+		} else {
+			cursor = chain.GetHeader(cursor.ParentHash, cursor.Number.Uint64()-1)
+		}
+		if cursor == nil {
+			return false
+		}
+	}
+	return cursor.Hash() == ancestor.Hash()
 }
 
 // BlockInterval returns number of blocks in one epoch for the given header
@@ -3415,10 +3546,12 @@ func (h *Hotstuff) getTurnLength(chain consensus.ChainHeaderReader, header *type
 // - error if state unavailable or execution failed
 func (h *Hotstuff) callContractAtState(header *types.Header, contractAddr common.Address, callData []byte) ([]byte, error) {
 	// Get statedb from header's state root using type assertion
-	var statedb *state.StateDB
+	statedb := h.GetProposalState(header.Hash())
 	var err error
 
-	if bc, ok := h.chain.(interface {
+	if statedb != nil {
+		log.Debug("[callContractAtState] using isolated proposal state", "blockNumber", header.Number.Uint64(), "hash", header.Hash())
+	} else if bc, ok := h.chain.(interface {
 		StateAt(root common.Hash) (*state.StateDB, error)
 	}); ok {
 		statedb, err = bc.StateAt(header.Root)
@@ -3742,7 +3875,7 @@ func (h *Hotstuff) IsSystemContract(to *common.Address) bool {
 // getNodeReplicaID returns the HotStuff replica ID for this node
 func (h *Hotstuff) getNodeReplicaID() ID {
 	// Get this node's validator address
-	addr := h.val
+	addr := h.ConsensusAddress()
 	if (addr == common.Address{}) {
 		log.Warn("No validator address set for replica ID, using default")
 		return ID(1)
@@ -3770,7 +3903,7 @@ func (h *Hotstuff) GetValidatorPeers() (map[common.Address][]*enode.Node, error)
 
 // Author implements consensus.Engine, returning the SystemAddress
 func (h *Hotstuff) Author(header *types.Header) (common.Address, error) {
-	return header.Coinbase, nil
+	return ecrecover(header, h.signatures, h.chainConfig.ChainID)
 }
 
 // Utility functions moved to hotstuff_utils.go
@@ -3800,6 +3933,9 @@ type hsState struct {
 	currentView     uint64
 	highQC          *HsQC
 	lockedQC        *HsQC
+	hasLastVote     bool
+	lastVotedView   uint64
+	lastVotedHash   common.Hash
 	votes           map[uint64]map[common.Hash]map[common.Address]*hs.VotePacket
 	newViews        map[uint64]map[common.Address]*hs.NewViewPacket
 	proposalsByView map[uint64]*types.Header
@@ -3807,6 +3943,7 @@ type hsState struct {
 	// 存储完整的区块数据，用于提交时使用
 	proposalsByHashBlock    map[common.Hash]*types.Block
 	proposalsByHashReceipts map[common.Hash]types.Receipts
+	proposalStates          map[common.Hash]*state.StateDB
 	qcsByView               map[uint64]*HsQC
 	// timeout aggregation per view
 	timeouts map[uint64]map[common.Address]*hs.TimeoutPacket
@@ -3849,6 +3986,7 @@ func (h *Hotstuff) initHsState() {
 			proposalsByHash:         make(map[common.Hash]*types.Header),
 			proposalsByHashBlock:    make(map[common.Hash]*types.Block),
 			proposalsByHashReceipts: make(map[common.Hash]types.Receipts),
+			proposalStates:          make(map[common.Hash]*state.StateDB),
 			qcsByView:               make(map[uint64]*HsQC),
 			timeouts:                make(map[uint64]map[common.Address]*hs.TimeoutPacket),
 			committedBlocks:         make(map[common.Hash]uint64),
@@ -3870,12 +4008,48 @@ func (h *Hotstuff) getHsState() *hsState {
 
 // GetCurrentView returns the current view number (thread-safe for external callers)
 func (h *Hotstuff) GetCurrentView() uint64 {
+	h.ensureBootstrapAtHead()
 	h.lock.RLock()
 	defer h.lock.RUnlock()
 	if h._hs == nil {
 		return 0
 	}
 	return h._hs.currentView
+}
+
+// ensureBootstrapAtHead initializes the proofless QC allowed exactly at the
+// Parlia->HotStuff boundary (or genesis activation). It is idempotent and is
+// also called by runtime entry points so a node need not restart at the fork.
+func (h *Hotstuff) ensureBootstrapAtHead() {
+	if h == nil || h.chain == nil || h.chainConfig == nil || h.chainConfig.HotstuffBlock == nil {
+		return
+	}
+	head := h.chain.CurrentHeader()
+	if head == nil || head.Number == nil {
+		return
+	}
+	next := new(big.Int).Add(head.Number, common.Big1)
+	bootstrap := h.chainConfig.IsOnHotstuff(next) ||
+		(h.chainConfig.HotstuffBlock.Sign() == 0 && head.Number.Sign() == 0)
+	if !bootstrap {
+		return
+	}
+	headView := getViewFromHeader(head, h.chainConfig)
+	if headView == math.MaxUint64 {
+		return
+	}
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	st := h.getHsState()
+	if st == nil {
+		return
+	}
+	if st.highQC == nil {
+		st.highQC = &HsQC{BlockHash: head.Hash(), View: headView}
+	}
+	if headView+1 > st.currentView {
+		st.currentView = headView + 1
+	}
 }
 
 // HasProposalForView checks if we already have a proposal for the given view (thread-safe for external callers)
@@ -3902,7 +4076,7 @@ func (h *Hotstuff) getSnapshotAtHashOrView(chain consensus.ChainHeaderReader, ba
 
 		// Fallback: try HotStuff state (for pipelined blocks not yet committed)
 		if targetHeader == nil {
-			if block := h.getBlockFromStateUnsafe(baseHash); block != nil {
+			if block := h.getBlockWithoutStateLock(baseHash); block != nil {
 				targetHeader = block.Header()
 				log.Debug("getSnapshotAtHashOrView: got header from HotStuff state",
 					"baseHash", baseHash.Hex()[:8],
@@ -3910,11 +4084,10 @@ func (h *Hotstuff) getSnapshotAtHashOrView(chain consensus.ChainHeaderReader, ba
 			}
 		}
 
-		if targetHeader != nil {
-			if snap, err := h.snapshot(chain, targetHeader.Number.Uint64(), targetHeader.Hash(), nil); err == nil {
-				return snap, nil
-			}
+		if targetHeader == nil {
+			return nil, consensus.ErrUnknownAncestor
 		}
+		return h.snapshot(chain, targetHeader.Number.Uint64(), targetHeader.Hash(), nil)
 	}
 
 	// Try to find block by number (view may not equal block number when TC is used)
@@ -3926,19 +4099,6 @@ func (h *Hotstuff) getSnapshotAtHashOrView(chain consensus.ChainHeaderReader, ba
 			}
 		}
 
-		// Fallback: try HotStuff state proposals by view
-		st := h.getHsState()
-		if st != nil {
-			if proposalHdr := st.proposalsByView[view]; proposalHdr != nil {
-				log.Debug("getSnapshotAtHashOrView: got header from HotStuff proposalsByView",
-					"view", view,
-					"hash", proposalHdr.Hash().Hex()[:8],
-					"number", proposalHdr.Number.Uint64())
-				if snap, err := h.snapshot(chain, proposalHdr.Number.Uint64(), proposalHdr.Hash(), nil); err == nil {
-					return snap, nil
-				}
-			}
-		}
 	}
 
 	// Fallback to current head
@@ -4020,7 +4180,7 @@ func getVoteAttestationFromHeader(header *types.Header, chainConfig *params.Chai
 		return nil, nil
 	}
 
-	hsExtraSize := syncInfoSize(header)
+	hsExtraSize := hotstuffExtraSize(header, chainConfig)
 	end := len(header.Extra) - extraSeal - hsExtraSize
 	if end <= extraVanity {
 		return nil, nil
@@ -4140,10 +4300,12 @@ func (h *Hotstuff) moveToView(view uint64) {
 	// - Do NOT hold h.lock while doing potentially blocking work (snapshot/contract calls/network IO),
 	//   otherwise TC paths can stall liveness.
 	var (
-		highQCView     uint64
-		highQCHash     common.Hash
-		highTCView     uint64
-		timeoutMapCopy map[common.Address]*hs.TimeoutPacket
+		highQCView       uint64
+		highQCHash       common.Hash
+		highQCSignersSet types.ValidatorsBitSet
+		highQCAggSig     []byte
+		highTCView       uint64
+		timeoutMapCopy   map[common.Address]*hs.TimeoutPacket
 	)
 
 	log.Info("moveToView: acquiring lock", "view", view)
@@ -4160,9 +4322,14 @@ func (h *Hotstuff) moveToView(view uint64) {
 		return
 	}
 	st.currentView = view
+	if err := h.checkpointHsStateLocked(); err != nil {
+		log.Error("Failed to persist HotStuff view change", "view", view, "err", err)
+	}
 	if st.highQC != nil {
 		highQCView = st.highQC.View
 		highQCHash = st.highQC.BlockHash
+		highQCSignersSet = st.highQC.SignersSet
+		highQCAggSig = common.CopyBytes(st.highQC.Sig)
 	}
 	highTCView = st.highTCView
 	if highTCView > 0 {
@@ -4189,20 +4356,30 @@ func (h *Hotstuff) moveToView(view uint64) {
 	// As replica, send NewView to leader with our HighQC and HighTC.
 	log.Info("moveToView: preparing NewView packet", "view", view, "highQCView", highQCView, "highTCView", highTCView)
 	nv := &hs.NewViewPacket{
-		HighQCView: highQCView,
-		HighQCHash: highQCHash,
-		HighTCView: highTCView,
+		HighQCView:       highQCView,
+		HighQCHash:       highQCHash,
+		HighQCSignersSet: highQCSignersSet,
+		HighQCAggSig:     highQCAggSig,
+		HighTCView:       highTCView,
+	}
+	requiresTC := highTCView > 0 && highTCView >= highQCView && view == highTCView+1
+	if requiresTC && timeoutMapCopy == nil {
+		log.Error("moveToView: missing timeout messages for required TC", "view", view, "highTCView", highTCView)
+		return
 	}
 	if highTCView > 0 && timeoutMapCopy != nil {
-		// Carry TC signer set + agg sig if we can build it (best-effort).
+		// Carry TC signer set + aggregate signature.
 		if tc, err := h.createTimeoutCert(highTCView, timeoutMapCopy); err == nil && tc != nil {
 			nv.TimeoutSignersSet = tc.SignerSet
 			nv.TimeoutAggSig = tc.AggSig
 		} else {
-			log.Warn("moveToView: failed to attach timeout certificate, clearing HighTC",
+			log.Warn("moveToView: failed to attach timeout certificate",
 				"view", view,
 				"highTCView", highTCView,
 				"err", err)
+			if requiresTC {
+				return
+			}
 			nv.HighTCView = 0
 		}
 	}
@@ -4212,9 +4389,14 @@ func (h *Hotstuff) moveToView(view uint64) {
 
 	// If we're leader for this view, try to propose (this is a soft trigger; miner does the actual work).
 	log.Info("moveToView: checking if we are leader", "view", view)
-	leader, _ := h.getLeaderForView(h.chain, view)
-	log.Info("moveToView: leader determined", "view", view, "leader", leader, "self", h.val, "isLeader", leader == h.val)
-	if leader == h.val {
+	leader, err := h.getLeaderForViewAt(h.chain, highQCHash, view)
+	if err != nil {
+		log.Error("moveToView: failed to resolve contextual leader", "view", view, "highQC", highQCHash, "err", err)
+		return
+	}
+	self := h.ConsensusAddress()
+	log.Info("moveToView: leader determined", "view", view, "leader", leader, "self", self, "isLeader", leader == self)
+	if leader == self {
 		base := highQCHash
 		log.Info("moveToView: we are leader, proposing from HighQC", "view", view, "base", base.Hex()[:10])
 		h.proposeFromHighQC(view, base)
@@ -4232,6 +4414,10 @@ func (h *Hotstuff) restartViewTimeoutForView(view uint64, timeoutMs uint64) {
 	log.Info("restartViewTimeoutForView: acquiring lock", "view", view)
 	h.lock.Lock()
 	log.Info("restartViewTimeoutForView: lock acquired", "view", view)
+	if h.closed {
+		h.lock.Unlock()
+		return
+	}
 
 	oldTimer := h.hsTimer
 	if oldTimer != nil {
@@ -4302,26 +4488,8 @@ func (h *Hotstuff) getCurrentValidatorsBeforeLuban(header *types.Header) ([]comm
 //  4. RLock blocked because Lock() is waiting (Go RWMutex write-priority)
 //  5. Deadlock: Lock() waits for executeBlocks, executeBlocks waits for RLock
 func (h *Hotstuff) GetBlockFromState(hash common.Hash) *types.Block {
-	// Step 1: Try lock-free cache first (prevents deadlock)
-	if cached, ok := h.proposalBlocksCache.Load(hash); ok {
-		if block, ok := cached.(*types.Block); ok && block != nil {
-			log.Debug("[GetBlockFromState] Found in lock-free cache", "hash", hash.Hex()[:10])
-			return block
-		}
-	}
-
-	// Step 2: Try rawdb (no lock needed)
-	if h.db != nil {
-		// Try multiple possible block numbers (we don't know the exact number)
-		for _, num := range []uint64{0, 1, 2} {
-			if header := rawdb.ReadHeader(h.db, hash, num); header != nil {
-				if body := rawdb.ReadBody(h.db, hash, header.Number.Uint64()); body != nil {
-					block := types.NewBlockWithHeader(header).WithBody(*body)
-					log.Debug("[GetBlockFromState] Found in rawdb", "hash", hash.Hex()[:10], "number", header.Number.Uint64())
-					return block
-				}
-			}
-		}
+	if block := h.getBlockWithoutStateLock(hash); block != nil {
+		return block
 	}
 
 	// Step 3: Fall back to locked access (may block, but necessary for correctness)
@@ -4331,6 +4499,20 @@ func (h *Hotstuff) GetBlockFromState(hash common.Hash) *types.Block {
 	result := h.getBlockFromStateUnsafe(hash)
 	log.Debug("[GetBlockFromState] EXIT", "hash", hash.Hex()[:10], "found", result != nil)
 	return result
+}
+
+func (h *Hotstuff) getBlockWithoutStateLock(hash common.Hash) *types.Block {
+	if cached, ok := h.proposalBlocksCache.Load(hash); ok {
+		if block, ok := cached.(*types.Block); ok && block != nil {
+			return block
+		}
+	}
+	if h.db != nil {
+		if number := rawdb.ReadHeaderNumber(h.db, hash); number != nil {
+			return rawdb.ReadBlock(h.db, hash, *number)
+		}
+	}
+	return nil
 }
 
 // getBlockFromStateUnsafe retrieves a block without acquiring locks.
@@ -4362,16 +4544,8 @@ func (h *Hotstuff) getBlockFromStateUnsafe(hash common.Hash) *types.Block {
 	}
 
 	// 2. Try to get from rawdb (prewritten blocks)
-	if h.db != nil {
-		if header := rawdb.ReadHeader(h.db, hash, 0); header != nil {
-			if body := rawdb.ReadBody(h.db, hash, header.Number.Uint64()); body != nil {
-				block := types.NewBlockWithHeader(header).WithBody(*body)
-				log.Debug("GetBlockFromState: found in rawdb",
-					"hash", hash.Hex()[:8],
-					"number", block.NumberU64())
-				return block
-			}
-		}
+	if block := h.getBlockWithoutStateLock(hash); block != nil {
+		return block
 	}
 
 	log.Debug("GetBlockFromState: block not found",

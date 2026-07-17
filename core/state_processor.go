@@ -108,7 +108,6 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 
 	// Iterate over and process the individual transactions
 	posa, isPoSA := p.chain.engine.(consensus.PoSA)
-	hotstuff, isHotstuff := p.chain.engine.(consensus.HotStuff)
 	commonTxs := make([]*types.Transaction, 0, txNum)
 
 	// initialise bloom processors
@@ -120,15 +119,6 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 	for i, tx := range block.Transactions() {
 		if isPoSA {
 			if isSystemTx, err := posa.IsSystemTransaction(tx, block.Header()); err != nil {
-				bloomProcessors.Close()
-				return nil, err
-			} else if isSystemTx {
-				systemTxs = append(systemTxs, tx)
-				continue
-			}
-		}
-		if isHotstuff {
-			if isSystemTx, err := hotstuff.IsSystemTransaction(tx, block.Header()); err != nil {
 				bloomProcessors.Close()
 				return nil, err
 			} else if isSystemTx {

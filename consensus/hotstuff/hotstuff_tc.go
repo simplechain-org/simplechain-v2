@@ -1,7 +1,9 @@
 package hotstuff
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -9,26 +11,19 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/protocols/hs"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/prysmaticlabs/prysm/v5/crypto/bls"
+)
+
+const (
+	tcFlag       byte = 0xB6
+	tcFooterSize      = 5 // uint32 encoded payload length + marker
 )
 
 // assembleHighTC aggregates timeout messages and creates TimeoutCert for this view
 // CRITICAL FIX: Refactored to avoid holding lock during blocking operations.
 func (h *Hotstuff) assembleHighTC(chain consensus.ChainHeaderReader, header *types.Header) error {
-	// Phase 1: Get snapshot (no lock - may block)
-	head := chain.CurrentHeader()
-	if head == nil {
-		return nil
-	}
-	snap, err := h.snapshot(chain, head.Number.Uint64(), head.Hash(), nil)
-	if err != nil {
-		return err
-	}
-	qsize := QuorumSize(len(snap.validators()))
-	validators := snap.validators()
-
-	// Phase 2: Find highest TC view and copy timeout map (short lock)
 	h.lock.RLock()
 	st := h.getHsState()
 	if st == nil {
@@ -36,31 +31,28 @@ func (h *Hotstuff) assembleHighTC(chain consensus.ChainHeaderReader, header *typ
 		return nil
 	}
 
-	// Find the highest view with sufficient timeouts to form a TC
-	var highestTCView uint64 = 0
-
-	// Check all timeout collections to find the highest valid TC
+	timeoutMaps := make(map[uint64]map[common.Address]*hs.TimeoutPacket, len(st.timeouts))
 	for view, timeoutMap := range st.timeouts {
-		if len(timeoutMap) >= qsize && view > highestTCView {
-			// Verify timeout messages are valid
-			if h.validateTimeoutMessages(timeoutMap, view, validators) {
-				highestTCView = view
-			}
+		copied := make(map[common.Address]*hs.TimeoutPacket, len(timeoutMap))
+		for addr, packet := range timeoutMap {
+			copied[addr] = packet
 		}
-	}
-
-	// CRITICAL: Copy timeout map under lock before releasing
-	var timeoutMapCopy map[common.Address]*hs.TimeoutPacket
-	if highestTCView > 0 {
-		timeoutMapCopy = make(map[common.Address]*hs.TimeoutPacket, len(st.timeouts[highestTCView]))
-		for addr, tp := range st.timeouts[highestTCView] {
-			timeoutMapCopy[addr] = tp
-		}
+		timeoutMaps[view] = copied
 	}
 	h.lock.RUnlock()
 
-	// If we found a valid TC, create and embed it
-	if highestTCView > 0 {
+	var (
+		highestTCView  uint64
+		timeoutMapCopy map[common.Address]*hs.TimeoutPacket
+		requiredQuorum int
+	)
+	for view, timeoutMap := range timeoutMaps {
+		count, qsize, err := h.timeoutQuorum(timeoutMap)
+		if err == nil && count >= qsize && (timeoutMapCopy == nil || view > highestTCView) {
+			highestTCView, timeoutMapCopy, requiredQuorum = view, timeoutMap, qsize
+		}
+	}
+	if timeoutMapCopy != nil {
 		tc, err := h.createTimeoutCert(highestTCView, timeoutMapCopy)
 		if err != nil {
 			log.Warn("Failed to create timeout certificate", "view", highestTCView, "err", err)
@@ -77,7 +69,7 @@ func (h *Hotstuff) assembleHighTC(chain consensus.ChainHeaderReader, header *typ
 		log.Info("Assembled and embedded TimeoutCert",
 			"view", highestTCView,
 			"timeoutCount", len(timeoutMapCopy),
-			"requiredQuorum", qsize)
+			"requiredQuorum", requiredQuorum)
 	}
 
 	return nil
@@ -120,20 +112,9 @@ func (h *Hotstuff) validateTimeoutMessages(timeoutMap map[common.Address]*hs.Tim
 
 // createTimeoutCert creates a TimeoutCert from aggregated timeout messages
 func (h *Hotstuff) createTimeoutCert(view uint64, timeoutMap map[common.Address]*hs.TimeoutPacket) (*hsTimeoutCert, error) {
-	// Extract highest QC from timeout messages
-	var highestQC *HsQC
-	var highestQCView uint64 = 0
-
-	for _, timeout := range timeoutMap {
-		// CRITICAL FIX: Compare HighQCView, not ViewNumber!
-		// timeout.ViewNumber is the view that timed out (e.g., 46)
-		// timeout.HighQCView is the view of the highest QC the sender has (e.g., 45 or earlier)
-		if timeout.HighQCView > highestQCView {
-			highestQCView = timeout.HighQCView
-			// The TimeoutPacket carries HighQC view/hash only; no QC aggregate
-			// signature is present to reconstruct. Leave Sig/SignersSet empty.
-			highestQC = &HsQC{BlockHash: timeout.HighQCHash, View: timeout.HighQCView}
-		}
+	highestQC := selectTimeoutHighQC(timeoutMap)
+	if highestQC == nil {
+		return nil, fmt.Errorf("timeout certificate has no HighQC")
 	}
 
 	// Create the timeout certificate
@@ -146,21 +127,9 @@ func (h *Hotstuff) createTimeoutCert(view uint64, timeoutMap map[common.Address]
 	// Collect signers and aggregate signatures
 	sigs := make([][]byte, 0, len(timeoutMap))
 
-	// CRITICAL FIX: Use snapshot from HighQC block's PARENT, not current head
-	// This ensures SignerSet bitset matches the validator set at the time of timeout
-	// Following Parlia convention: validators are determined by parent block
-	var snap *Snapshot
-	if highestQC != nil && highestQC.BlockHash != (common.Hash{}) {
-		if hdr := h.chain.GetHeaderByHash(highestQC.BlockHash); hdr != nil {
-			// Use parent block's snapshot (number-1, ParentHash)
-			snap, _ = h.snapshot(h.chain, hdr.Number.Uint64()-1, hdr.ParentHash, nil)
-		}
-	}
-	if snap == nil {
-		// Fallback to current head if HighQC block not found
-		head := h.chain.CurrentHeader()
-		snap, _ = h.snapshot(h.chain, head.Number.Uint64(), head.Hash(), nil)
-		log.Debug("createTimeoutCert: using head snapshot (highQC block not found)", "view", view)
+	snap, err := h.getSnapshotAtHashOrView(h.chain, highestQC.BlockHash, highestQC.View)
+	if err != nil || snap == nil {
+		return nil, fmt.Errorf("resolve timeout validator snapshot: %w", err)
 	}
 
 	validators := snap.validators()
@@ -170,11 +139,17 @@ func (h *Hotstuff) createTimeoutCert(view uint64, timeoutMap map[common.Address]
 	}
 	var bitset uint64
 	for addr, pkt := range timeoutMap {
+		if _, ok := snap.Validators[addr]; !ok || pkt.ViewNumber != view {
+			continue
+		}
 		tc.Signers = append(tc.Signers, addr)
 		sigs = append(sigs, pkt.Signature[:])
 		if idx, ok := vsetIndex[addr]; ok && idx < 64 {
 			bitset |= (1 << uint(idx))
 		}
+	}
+	if len(tc.Signers) < QuorumSize(len(validators)) {
+		return nil, fmt.Errorf("insufficient validator timeouts: have %d want %d", len(tc.Signers), QuorumSize(len(validators)))
 	}
 	tc.SignerSet = types.ValidatorsBitSet(bitset)
 	if ms, err := bls.MultipleSignaturesFromBytes(sigs); err == nil && len(ms) > 0 {
@@ -184,12 +159,47 @@ func (h *Hotstuff) createTimeoutCert(view uint64, timeoutMap map[common.Address]
 	log.Debug("Created TimeoutCert with aggregate signature",
 		"view", view,
 		"signerCount", len(tc.Signers),
-		"highQCView", highestQCView,
+		"highQCView", highestQC.View,
 		"signerSet", tc.SignerSet,
 		"aggSigLen", len(tc.AggSig),
 		"validatorCount", len(validators))
 
 	return tc, nil
+}
+
+func selectTimeoutHighQC(timeoutMap map[common.Address]*hs.TimeoutPacket) *HsQC {
+	var highestQC *HsQC
+	for _, timeout := range timeoutMap {
+		if timeout == nil {
+			continue
+		}
+		if highestQC == nil || timeout.HighQCView > highestQC.View ||
+			(timeout.HighQCView == highestQC.View && bytes.Compare(timeout.HighQCHash[:], highestQC.BlockHash[:]) > 0) {
+			highestQC = &HsQC{
+				BlockHash: timeout.HighQCHash, View: timeout.HighQCView,
+				SignersSet: timeout.HighQCSignersSet, Sig: common.CopyBytes(timeout.HighQCAggSig),
+			}
+		}
+	}
+	return highestQC
+}
+
+func (h *Hotstuff) timeoutQuorum(timeoutMap map[common.Address]*hs.TimeoutPacket) (int, int, error) {
+	highestQC := selectTimeoutHighQC(timeoutMap)
+	if highestQC == nil {
+		return 0, 0, errors.New("timeout set has no HighQC")
+	}
+	snap, err := h.getSnapshotAtHashOrView(h.chain, highestQC.BlockHash, highestQC.View)
+	if err != nil || snap == nil {
+		return 0, 0, err
+	}
+	count := 0
+	for addr := range timeoutMap {
+		if _, ok := snap.Validators[addr]; ok {
+			count++
+		}
+	}
+	return count, QuorumSize(len(snap.validators())), nil
 }
 
 // embedTimeoutCert embeds a TimeoutCert into the block header
@@ -200,22 +210,24 @@ func (h *Hotstuff) embedTimeoutCert(header *types.Header, tc *hsTimeoutCert) err
 		return fmt.Errorf("failed to encode timeout cert: %w", err)
 	}
 
-	// Embed into header Extra field with a special marker
-	const tcFlag byte = 0xB6 // Different from QC flag (0xA5)
-	marker := []byte{tcFlag}
+	// TC is a deterministic trailer immediately before SyncInfo:
+	// [base extra][tcData][uint32 tcDataLen][tcFlag][SyncInfo][seal].
 	tcLength := make([]byte, 4)
 	binary.LittleEndian.PutUint32(tcLength, uint32(len(tcData)))
+	insertData := make([]byte, 0, len(tcData)+tcFooterSize)
+	insertData = append(insertData, tcData...)
+	insertData = append(insertData, tcLength...)
+	insertData = append(insertData, tcFlag)
 
-	// Find insertion point (before signature seal)
 	payload := header.Extra
-	end := len(payload)
-	if end >= extraSeal {
-		end = end - extraSeal
+	if len(payload) < extraSeal {
+		return fmt.Errorf("header extra missing seal")
 	}
-
-	// Insert: marker + length + tcData
-	insertData := append(marker, append(tcLength, tcData...)...)
-	header.Extra = append(payload[:end], append(insertData, payload[end:]...)...)
+	insertAt := len(payload) - extraSeal - syncInfoSize(header, h.chainConfig)
+	if insertAt < extraVanity {
+		return fmt.Errorf("malformed HotStuff extra-data")
+	}
+	header.Extra = append(payload[:insertAt], append(insertData, payload[insertAt:]...)...)
 
 	log.Debug("Embedded TimeoutCert in header", "tcDataLen", len(tcData), "view", tc.View)
 	return nil
@@ -225,11 +237,13 @@ func (h *Hotstuff) embedTimeoutCert(header *types.Header, tc *hsTimeoutCert) err
 func (h *Hotstuff) encodeTimeoutCert(tc *hsTimeoutCert) ([]byte, error) {
 	// RLP encoding with signer bitset and agg sig
 	type encTC struct {
-		View       uint64
-		HighQCView uint64
-		HighQCHash common.Hash
-		SignerSet  uint64
-		AggSig     []byte
+		View             uint64
+		HighQCView       uint64
+		HighQCHash       common.Hash
+		HighQCSignerSet  uint64
+		HighQCAggSig     []byte
+		TimeoutSignerSet uint64
+		TimeoutAggSig    []byte
 	}
 	var hqv uint64
 	var hqh common.Hash
@@ -237,58 +251,90 @@ func (h *Hotstuff) encodeTimeoutCert(tc *hsTimeoutCert) ([]byte, error) {
 		hqv = tc.HighQC.View
 		hqh = tc.HighQC.BlockHash
 	}
-	e := encTC{View: tc.View, HighQCView: hqv, HighQCHash: hqh, SignerSet: uint64(tc.SignerSet), AggSig: tc.AggSig[:]}
+	var hqSignerSet uint64
+	var hqSig []byte
+	if tc.HighQC != nil {
+		hqSignerSet = uint64(tc.HighQC.SignersSet)
+		hqSig = common.CopyBytes(tc.HighQC.Sig)
+	}
+	e := encTC{
+		View:             tc.View,
+		HighQCView:       hqv,
+		HighQCHash:       hqh,
+		HighQCSignerSet:  hqSignerSet,
+		HighQCAggSig:     hqSig,
+		TimeoutSignerSet: uint64(tc.SignerSet),
+		TimeoutAggSig:    tc.AggSig[:],
+	}
 	return rlp.EncodeToBytes(&e)
 }
 
-// parseTimeoutCert scans header.Extra for a timeout cert block (flag 0xB6) and decodes it
-func (h *Hotstuff) parseTimeoutCert(header *types.Header) (*hsTimeoutCert, error) {
-	const tcFlag byte = 0xB6
-	payload := header.Extra
-	end := len(payload)
-	if end >= extraSeal {
-		end = end - extraSeal
+// timeoutCertSize returns the exact TC trailer size. Malformed or misplaced
+// markers are ignored here and rejected by parseTimeoutCert during validation.
+func timeoutCertSize(header *types.Header, chainConfig *params.ChainConfig) int {
+	if header == nil || header.Number == nil || chainConfig == nil || !chainConfig.IsHotstuff(header.Number) ||
+		len(header.Extra) < extraVanity+extraSeal+tcFooterSize {
+		return 0
 	}
-	for i := 0; i < end; i++ {
-		if payload[i] != tcFlag {
-			continue
-		}
-		if i+1+4 > end {
-			break
-		}
-		l := binary.LittleEndian.Uint32(payload[i+1 : i+5])
-		if i+5+int(l) > end {
-			break
-		}
-		if i+5+int(l) != end {
-			continue
+	end := len(header.Extra) - extraSeal - syncInfoSize(header, chainConfig)
+	if end < extraVanity+tcFooterSize || header.Extra[end-1] != tcFlag {
+		return 0
+	}
+	length := int(binary.LittleEndian.Uint32(header.Extra[end-tcFooterSize : end-1]))
+	if length <= 0 || end-tcFooterSize-length < extraVanity {
+		return 0
+	}
+	return length + tcFooterSize
+}
+
+// parseTimeoutCert decodes the deterministic TC trailer before SyncInfo.
+func (h *Hotstuff) parseTimeoutCert(header *types.Header) (*hsTimeoutCert, error) {
+	if header == nil || len(header.Extra) < extraVanity+extraSeal {
+		return nil, nil
+	}
+	payload := header.Extra
+	end := len(payload) - extraSeal - syncInfoSize(header, h.chainConfig)
+	if end >= extraVanity+tcFooterSize && payload[end-1] == tcFlag {
+		l := int(binary.LittleEndian.Uint32(payload[end-tcFooterSize : end-1]))
+		start := end - tcFooterSize - l
+		if l <= 0 || start < extraVanity {
+			return nil, fmt.Errorf("invalid TimeoutCert framing")
 		}
 		type encTC struct {
-			View       uint64
-			HighQCView uint64
-			HighQCHash common.Hash
-			SignerSet  uint64
-			AggSig     []byte
+			View             uint64
+			HighQCView       uint64
+			HighQCHash       common.Hash
+			HighQCSignerSet  uint64
+			HighQCAggSig     []byte
+			TimeoutSignerSet uint64
+			TimeoutAggSig    []byte
 		}
 		var e encTC
-		if err := rlp.DecodeBytes(payload[i+5:i+5+int(l)], &e); err != nil {
+		if err := rlp.DecodeBytes(payload[start:start+l], &e); err != nil {
 			log.Debug("parseTimeoutCert: failed to decode TC data",
 				"error", err,
 				"tcDataLength", l,
-				"availableLength", end-i-5)
+				"availableLength", end-start-tcFooterSize)
 			return nil, fmt.Errorf("invalid TimeoutCert encoding: %w", err)
 		}
 
-		// Validate AggSig length
-		if len(e.AggSig) != types.BLSSignatureLength {
+		if len(e.TimeoutAggSig) != types.BLSSignatureLength {
 			log.Debug("parseTimeoutCert: invalid AggSig length",
 				"expected", types.BLSSignatureLength,
-				"got", len(e.AggSig))
-			return nil, fmt.Errorf("invalid TimeoutCert aggregate signature length: have %d want %d", len(e.AggSig), types.BLSSignatureLength)
+				"got", len(e.TimeoutAggSig))
+			return nil, fmt.Errorf("invalid TimeoutCert aggregate signature length: have %d want %d", len(e.TimeoutAggSig), types.BLSSignatureLength)
 		}
-
-		tc := &hsTimeoutCert{View: e.View, HighQC: &HsQC{View: e.HighQCView, BlockHash: e.HighQCHash}, SignerSet: types.ValidatorsBitSet(e.SignerSet)}
-		copy(tc.AggSig[:], e.AggSig)
+		tc := &hsTimeoutCert{
+			View: e.View,
+			HighQC: &HsQC{
+				View:       e.HighQCView,
+				BlockHash:  e.HighQCHash,
+				SignersSet: types.ValidatorsBitSet(e.HighQCSignerSet),
+				Sig:        common.CopyBytes(e.HighQCAggSig),
+			},
+			SignerSet: types.ValidatorsBitSet(e.TimeoutSignerSet),
+		}
+		copy(tc.AggSig[:], e.TimeoutAggSig)
 		return tc, nil
 	}
 	return nil, nil
@@ -305,32 +351,12 @@ func (h *Hotstuff) verifyTimeoutCert(tc *hsTimeoutCert) bool {
 	if tc.SignerSet == 0 {
 		return false
 	}
-
-	// Before Luban fork, BLS timeout cert is not supported, skip verification but allow TC
-	if tc.HighQC != nil && tc.HighQC.BlockHash != (common.Hash{}) {
-		if hdr := h.chain.GetHeaderByHash(tc.HighQC.BlockHash); hdr != nil {
-			if !h.chainConfig.IsLuban(hdr.Number) {
-				log.Debug("Skip timeout cert verification before Luban fork (allow TC)", "block", hdr.Number, "view", tc.View)
-				// Return true to allow chain to progress before Luban fork
-				return true
-			}
-		}
+	if !h.verifyHighQCPayload(tc.HighQC.BlockHash, tc.HighQC.View, tc.HighQC.SignersSet, tc.HighQC.Sig) {
+		log.Debug("verifyTimeoutCert: invalid carried HighQC", "view", tc.View, "highQCView", tc.HighQC.View)
+		return false
 	}
 
-	// CRITICAL FIX: Use snapshot from HighQC block's PARENT
-	// Following Parlia convention: validators are determined by parent block
-	var snap *Snapshot
-	var err error
-	if tc.HighQC != nil && tc.HighQC.BlockHash != (common.Hash{}) {
-		if hdr := h.chain.GetHeaderByHash(tc.HighQC.BlockHash); hdr != nil {
-			// Use parent block's snapshot (number-1, ParentHash)
-			snap, err = h.snapshot(h.chain, hdr.Number.Uint64()-1, hdr.ParentHash, nil)
-		}
-	}
-	if snap == nil {
-		// Fallback to getSnapshotAtHashOrView
-		snap, err = h.getSnapshotAtHashOrView(h.chain, tc.HighQC.BlockHash, tc.View)
-	}
+	snap, err := h.getSnapshotAtHashOrView(h.chain, tc.HighQC.BlockHash, tc.HighQC.View)
 	if err != nil || snap == nil {
 		return false
 	}
@@ -382,7 +408,7 @@ func (h *Hotstuff) verifyTimeoutCert(tc *hsTimeoutCert) bool {
 		return false
 	}
 
-	root := h.hsTimeoutDigest(&hs.TimeoutPacket{ViewNumber: tc.View, HighQCView: tc.HighQC.View, HighQCHash: tc.HighQC.BlockHash})
+	root := h.hsTimeoutDigest(&hs.TimeoutPacket{ViewNumber: tc.View})
 	var rootBytes [32]byte
 	copy(rootBytes[:], root[:])
 	agg, err := bls.SignatureFromBytes(tc.AggSig[:])
@@ -415,8 +441,13 @@ func (h *Hotstuff) timeoutCertFromNewView(nv *hs.NewViewPacket) *hsTimeoutCert {
 		return nil
 	}
 	tc := &hsTimeoutCert{
-		View:      nv.HighTCView,
-		HighQC:    &HsQC{View: nv.HighQCView, BlockHash: nv.HighQCHash},
+		View: nv.HighTCView,
+		HighQC: &HsQC{
+			View:       nv.HighQCView,
+			BlockHash:  nv.HighQCHash,
+			SignersSet: nv.HighQCSignersSet,
+			Sig:        common.CopyBytes(nv.HighQCAggSig),
+		},
 		SignerSet: nv.TimeoutSignersSet,
 	}
 	tc.AggSig = nv.TimeoutAggSig

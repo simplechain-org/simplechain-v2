@@ -96,28 +96,28 @@ func (a *hsNetworkAdapter) isSelfValidator(validator common.Address) bool {
 func (a *hsNetworkAdapter) sendVoteToSelf(vote *hs.VotePacket) error {
 	// Get HotStuff engine
 	engine := a.h.chain.Engine()
-	hs, ok := engine.(interface {
-		OnHsVote(string, interface{}) error
-	})
-	if !ok {
-		return errors.New("engine does not support OnHsVote")
+	if hs, ok := engine.(interface {
+		OnHsVote(string, *hs.VotePacket) error
+	}); ok {
+		go a.processSelfVote(func() error { return hs.OnHsVote("self", vote) }, vote)
+		return nil
 	}
+	if hs, ok := engine.(interface {
+		OnHsVote(string, interface{}) error
+	}); ok {
+		go a.processSelfVote(func() error { return hs.OnHsVote("self", vote) }, vote)
+		return nil
+	}
+	return errors.New("engine does not support OnHsVote")
+}
 
-	// CRITICAL FIX: Process vote asynchronously to avoid deadlock
-	// The caller (OnHsProposal Phase 4) holds h.lock, but OnHsVote also needs h.lock
-	// Running in a new goroutine allows OnHsProposal to release its lock first
+func (a *hsNetworkAdapter) processSelfVote(process func() error, vote *hs.VotePacket) {
 	log.Debug("sendVoteToSelf: scheduling async processing", "view", vote.ViewNumber, "blockHash", vote.BlockHash.Hex()[:8])
-
-	go func() {
-		err := hs.OnHsVote("self", vote)
-		if err != nil {
-			log.Warn("Failed to process self vote", "err", err, "view", vote.ViewNumber)
-		} else {
-			log.Debug("Successfully processed self vote locally", "view", vote.ViewNumber, "blockHash", vote.BlockHash.Hex()[:8])
-		}
-	}()
-
-	return nil
+	if err := process(); err != nil {
+		log.Warn("Failed to process self vote", "err", err, "view", vote.ViewNumber)
+	} else {
+		log.Debug("Successfully processed self vote locally", "view", vote.ViewNumber, "blockHash", vote.BlockHash.Hex()[:8])
+	}
 }
 
 // BroadcastNewView broadcasts NewView to all hs-capable peers

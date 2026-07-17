@@ -29,6 +29,11 @@ type API struct {
 	parlia *Parlia
 }
 
+// NewAPI creates the RPC service used to query Parlia snapshots.
+func NewAPI(chain consensus.ChainHeaderReader, parlia *Parlia) *API {
+	return &API{chain: chain, parlia: parlia}
+}
+
 // GetSnapshot retrieves the state snapshot at a given block.
 func (api *API) GetSnapshot(number *rpc.BlockNumber) (*Snapshot, error) {
 	header := api.getHeader(number)

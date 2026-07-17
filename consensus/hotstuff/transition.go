@@ -1,6 +1,7 @@
 package hotstuff
 
 import (
+	"errors"
 	"math/big"
 	"time"
 
@@ -24,6 +25,13 @@ type Transition struct {
 	hotstuff *Hotstuff
 }
 
+var (
+	_ consensus.Engine   = (*Transition)(nil)
+	_ consensus.PoSA     = (*Transition)(nil)
+	_ consensus.HotStuff = (*Transition)(nil)
+	_ consensus.HotStuff = (*Hotstuff)(nil)
+)
+
 func NewTransition(parliaEngine *parlia.Parlia, hotstuffEngine *Hotstuff) *Transition {
 	return &Transition{parlia: parliaEngine, hotstuff: hotstuffEngine}
 }
@@ -31,6 +39,53 @@ func NewTransition(parliaEngine *parlia.Parlia, hotstuffEngine *Hotstuff) *Trans
 func (t *Transition) Hotstuff() *Hotstuff { return t.hotstuff }
 func (t *Transition) Parlia() *parlia.Parlia {
 	return t.parlia
+}
+
+// SetVotePool injects the shared vote pool into both sides of the transition.
+func (t *Transition) SetVotePool(pool consensus.VotePool) {
+	t.parlia.VotePool = pool
+	t.hotstuff.VotePool = pool
+}
+
+// ConsensusAddress returns the validator address shared by both child engines.
+// Authorize always configures both engines with the same address.
+func (t *Transition) ConsensusAddress() common.Address {
+	return t.hotstuff.ConsensusAddress()
+}
+
+// EstimateGasReservedForSystemTxs reserves gas according to the engine active
+// at the block being assembled.
+func (t *Transition) EstimateGasReservedForSystemTxs(chain consensus.ChainHeaderReader, header *types.Header) uint64 {
+	if chain.Config().IsHotstuff(header.Number) {
+		return t.hotstuff.EstimateGasReservedForSystemTxs(chain, header)
+	}
+	return t.parlia.EstimateGasReservedForSystemTxs(chain, header)
+}
+
+// BlockInterval returns the interval configured by the active child engine.
+func (t *Transition) BlockInterval(chain consensus.ChainHeaderReader, header *types.Header) (uint64, error) {
+	if chain.Config().IsHotstuff(header.Number) {
+		return t.hotstuff.BlockInterval(chain, header)
+	}
+	return t.parlia.BlockInterval(chain, header)
+}
+
+// SignRecently preserves Parlia's anti-double-sign scheduling before the
+// transition. HotStuff leader/view rules replace it for the next HotStuff block.
+func (t *Transition) SignRecently(chain consensus.ChainReader, parent *types.Header) (bool, error) {
+	next := new(big.Int).Add(parent.Number, common.Big1)
+	if chain.Config().IsHotstuff(next) {
+		return false, nil
+	}
+	return t.parlia.SignRecently(chain, parent)
+}
+
+func (t *Transition) IsSlash() bool { return t.parlia.IsSlash() }
+
+// GetProposalState exposes speculative HotStuff state to the miner. The miner
+// copies and validates the state before using it for a new proposal.
+func (t *Transition) GetProposalState(hash common.Hash) *state.StateDB {
+	return t.hotstuff.GetProposalState(hash)
 }
 
 func (t *Transition) SetHsNetwork(n interface{}) { t.hotstuff.SetHsNetwork(n) }
@@ -42,7 +97,7 @@ func (t *Transition) GetNotifyMinerCh() <-chan struct{} {
 	return t.hotstuff.GetNotifyMinerCh()
 }
 func (t *Transition) IsHotstuffMining(number *big.Int) bool {
-	return t.hotstuff.chainConfig.IsHotstuff(number)
+	return t.hotstuff.IsHotstuffMining(number)
 }
 func (t *Transition) HasPendingProposal() bool { return t.hotstuff.HasPendingProposal() }
 func (t *Transition) GetCurrentView() uint64   { return t.hotstuff.GetCurrentView() }
@@ -103,15 +158,56 @@ func (t *Transition) VerifyHeader(chain consensus.ChainHeaderReader, header *typ
 	return t.engine(chain, header).VerifyHeader(chain, header)
 }
 
+// batchHeaderReader makes already-seen batch headers available to the child
+// engine selected for the current header, including across the fork boundary.
+type batchHeaderReader struct {
+	consensus.ChainHeaderReader
+	parents []*types.Header
+}
+
+func (r *batchHeaderReader) GetHeader(hash common.Hash, number uint64) *types.Header {
+	for i := len(r.parents) - 1; i >= 0; i-- {
+		header := r.parents[i]
+		if header != nil && header.Number != nil && header.Number.Uint64() == number && header.Hash() == hash {
+			return header
+		}
+	}
+	return r.ChainHeaderReader.GetHeader(hash, number)
+}
+
+func (r *batchHeaderReader) GetHeaderByNumber(number uint64) *types.Header {
+	for i := len(r.parents) - 1; i >= 0; i-- {
+		header := r.parents[i]
+		if header != nil && header.Number != nil && header.Number.Uint64() == number {
+			return header
+		}
+	}
+	return r.ChainHeaderReader.GetHeaderByNumber(number)
+}
+
+func (r *batchHeaderReader) GetHeaderByHash(hash common.Hash) *types.Header {
+	for i := len(r.parents) - 1; i >= 0; i-- {
+		header := r.parents[i]
+		if header != nil && header.Hash() == hash {
+			return header
+		}
+	}
+	return r.ChainHeaderReader.GetHeaderByHash(hash)
+}
+
 func (t *Transition) VerifyHeaders(chain consensus.ChainHeaderReader, headers []*types.Header) (chan<- struct{}, <-chan error) {
 	abort := make(chan struct{})
 	results := make(chan error, len(headers))
 	go func() {
-		for _, header := range headers {
+		for i, header := range headers {
+			reader := consensus.ChainHeaderReader(chain)
+			if i > 0 {
+				reader = &batchHeaderReader{ChainHeaderReader: chain, parents: headers[:i]}
+			}
 			select {
 			case <-abort:
 				return
-			case results <- t.VerifyHeader(chain, header):
+			case results <- t.VerifyHeader(reader, header):
 			}
 		}
 	}()
@@ -176,15 +272,21 @@ func (t *Transition) Delay(chain consensus.ChainReader, header *types.Header, le
 }
 
 func (t *Transition) Close() error {
-	if err := t.parlia.Close(); err != nil {
-		return err
-	}
-	return t.hotstuff.Close()
+	return errors.Join(t.parlia.Close(), t.hotstuff.Close())
 }
 
 func (t *Transition) APIs(chain consensus.ChainHeaderReader) []rpc.API {
-	apis := t.parlia.APIs(chain)
-	return append(apis, t.hotstuff.APIs(chain)...)
+	return []rpc.API{{
+		Namespace: "parlia",
+		Version:   "1.0",
+		Service: &transitionAPI{
+			chain:       chain,
+			transition:  t,
+			parliaAPI:   parlia.NewAPI(chain, t.parlia),
+			hotstuffAPI: &API{chain: chain, parlia: t.hotstuff},
+		},
+		Public: false,
+	}}
 }
 
 func (t *Transition) IsSystemTransaction(tx *types.Transaction, header *types.Header) (bool, error) {
@@ -227,7 +329,14 @@ func (t *Transition) GetFinalizedHeader(chain consensus.ChainHeaderReader, heade
 }
 
 func (t *Transition) VerifyVote(chain consensus.ChainHeaderReader, vote *types.VoteEnvelope) error {
-	return t.hotstuff.VerifyVote(chain, vote)
+	if vote == nil || vote.Data == nil {
+		return errors.New("invalid vote: missing vote data")
+	}
+	targetNumber := new(big.Int).SetUint64(vote.Data.TargetNumber)
+	if chain.Config().IsHotstuff(targetNumber) {
+		return t.hotstuff.VerifyVote(chain, vote)
+	}
+	return t.parlia.VerifyVote(chain, vote)
 }
 
 func (t *Transition) IsActiveValidatorAt(chain consensus.ChainHeaderReader, header *types.Header, checkVoteKeyFn func(*types.BLSPublicKey) bool) bool {
@@ -238,7 +347,8 @@ func (t *Transition) IsActiveValidatorAt(chain consensus.ChainHeaderReader, head
 }
 
 func (t *Transition) NextProposalBlock(chain consensus.ChainHeaderReader, header *types.Header, proposer common.Address) (uint64, uint64, error) {
-	if chain.Config().IsHotstuff(header.Number) {
+	next := new(big.Int).Add(header.Number, common.Big1)
+	if chain.Config().IsHotstuff(next) {
 		return t.hotstuff.NextProposalBlock(chain, header, proposer)
 	}
 	return t.parlia.NextProposalBlock(chain, header, proposer)

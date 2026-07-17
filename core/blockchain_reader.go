@@ -57,6 +57,11 @@ func (bc *BlockChain) CurrentSnapBlock() *types.Header {
 // CurrentFinalBlock retrieves the current finalized block of the canonical
 // chain. The block is retrieved from the blockchain's internal cache.
 func (bc *BlockChain) CurrentFinalBlock() *types.Header {
+	if current := bc.CurrentHeader(); current != nil && bc.chainConfig.IsHotstuff(current.Number) {
+		// HotStuff finality is advanced explicitly by the 3-chain commit path.
+		// Recomputing it from the legacy PoSA attestation would discard that marker.
+		return bc.currentFinalBlock.Load()
+	}
 	if p, ok := bc.engine.(consensus.PoSA); ok {
 		currentHeader := bc.CurrentHeader()
 		if currentHeader == nil {
@@ -71,6 +76,11 @@ func (bc *BlockChain) CurrentFinalBlock() *types.Header {
 // CurrentSafeBlock retrieves the current safe block of the canonical
 // chain. The block is retrieved from the blockchain's internal cache.
 func (bc *BlockChain) CurrentSafeBlock() *types.Header {
+	if current := bc.CurrentHeader(); current != nil && bc.chainConfig.IsHotstuff(current.Number) {
+		// Until a separate durable highQC marker is maintained, finalized is the
+		// conservative safe head for HotStuff.
+		return bc.currentFinalBlock.Load()
+	}
 	if p, ok := bc.engine.(consensus.PoSA); ok {
 		currentHeader := bc.CurrentHeader()
 		if currentHeader == nil {

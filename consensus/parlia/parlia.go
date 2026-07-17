@@ -1948,7 +1948,7 @@ func (p *Parlia) APIs(chain consensus.ChainHeaderReader) []rpc.API {
 	return []rpc.API{{
 		Namespace: "parlia",
 		Version:   "1.0",
-		Service:   &API{chain: chain, parlia: p},
+		Service:   NewAPI(chain, p),
 		Public:    false,
 	}}
 }

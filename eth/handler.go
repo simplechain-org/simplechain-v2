@@ -899,13 +899,13 @@ func (h *handler) needFullBroadcastInEVN(block *types.Block) bool {
 		return false
 	}
 
-	parlia, ok := h.chain.Engine().(*parlia.Parlia)
+	engine, ok := h.chain.Engine().(interface{ ConsensusAddress() common.Address })
 	if !ok {
 		return false
 	}
 	coinbase := block.Coinbase()
 	// check whether the block is created by self
-	if parlia.ConsensusAddress() == coinbase {
+	if engine.ConsensusAddress() == coinbase {
 		log.Debug("full broadcast mined block to EVN", "coinbase", coinbase)
 		return true
 	}

@@ -161,6 +161,26 @@ type Ethereum struct {
 	stopCh   chan struct{}
 }
 
+type votePoolSetter interface {
+	SetVotePool(consensus.VotePool)
+}
+
+// setConsensusVotePool supports transition engines without requiring callers
+// to know which concrete child engine is active.
+func setConsensusVotePool(engine consensus.Engine, pool consensus.VotePool) bool {
+	switch engine := engine.(type) {
+	case votePoolSetter:
+		engine.SetVotePool(pool)
+	case *parlia.Parlia:
+		engine.VotePool = pool
+	case *hotstuff.Hotstuff:
+		engine.VotePool = pool
+	default:
+		return false
+	}
+	return true
+}
+
 // New creates a new Ethereum object (including the initialisation of the common Ethereum object),
 // whose lifecycle will be managed by the provided node.
 func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
@@ -480,13 +500,8 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		// Create votePool instance
 		votePool := vote.NewVotePool(eth.blockchain, posa)
 		eth.votePool = votePool
-		if parlia, ok := eth.engine.(*parlia.Parlia); ok {
-			if !config.Miner.DisableVoteAttestation {
-				// if there is no VotePool in Parlia Engine, the miner can't get votes for assembling
-				parlia.VotePool = votePool
-			}
-		} else {
-			return nil, errors.New("Engine is not Parlia type")
+		if !config.Miner.DisableVoteAttestation && !setConsensusVotePool(eth.engine, votePool) {
+			return nil, fmt.Errorf("consensus engine %T does not support vote pool injection", eth.engine)
 		}
 		log.Info("Create votePool successfully")
 		eth.handler.votepool = votePool
@@ -514,21 +529,19 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		SetHsNetwork(interface{})
 		SetBLSVoteSigner(interface{})
 	}); ok {
-		// chain reader
-		if cr, ok2 := any(eth).(interface{ BlockChain() *core.BlockChain }); ok2 {
-			hsEng.SetChainReader(cr.BlockChain())
-		}
-		// hs network
+		// Install one-shot runtime dependencies before SetChainReader starts the
+		// HotStuff view timer at an already-active fork height.
 		adapter := newHsNetworkAdapter(eth.handler)
 		hsEng.SetHsNetwork(adapter)
-		// BLS vote signer (reuse vote manager signer if available)
-		// Attempt to construct a BLS signer from node config if files provided
 		if cfg := stack.Config(); cfg != nil && cfg.BLSPasswordFile != "" && cfg.BLSWalletDir != "" {
 			if signer, err2 := vote.NewVoteSigner(cfg.BLSPasswordFile, cfg.BLSWalletDir); err2 == nil {
 				hsEng.SetBLSVoteSigner(signer)
 			} else {
 				log.Warn("Failed to create BLS signer for HotStuff", "err", err2)
 			}
+		}
+		if cr, ok2 := any(eth).(interface{ BlockChain() *core.BlockChain }); ok2 {
+			hsEng.SetChainReader(cr.BlockChain())
 		}
 	}
 	eth.APIBackend.gpo = gasprice.NewOracle(eth.APIBackend, config.GPO, config.Miner.GasPrice)
@@ -1036,7 +1049,9 @@ func (s *Ethereum) Protocols() []p2p.Protocol {
 		protos = append(protos, snap.MakeProtocols((*snapHandler)(s.handler))...)
 	}
 	protos = append(protos, bsc.MakeProtocols((*bscHandler)(s.handler))...)
-	protos = append(protos, hs.MakeProtocols((*hsHandler)(s.handler))...)
+	if s.blockchain.Config().Hotstuff != nil {
+		protos = append(protos, hs.MakeProtocols((*hsHandler)(s.handler))...)
+	}
 
 	return protos
 }

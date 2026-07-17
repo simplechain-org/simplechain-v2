@@ -3,22 +3,25 @@ package hotstuff
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/params"
 )
 
-func syncInfoSize(header *types.Header) int {
-	if header.Number == nil || header.Number.Uint64() == 0 {
+func syncInfoSize(header *types.Header, chainConfig *params.ChainConfig) int {
+	if header == nil || header.Number == nil || header.Number.Uint64() == 0 ||
+		chainConfig == nil || !chainConfig.IsHotstuff(header.Number) {
 		return 0
 	}
 	proofSyncInfoStart := len(header.Extra) - extraSeal - (1 + syncInfoProofTotalSize)
-	if proofSyncInfoStart > extraVanity && proofSyncInfoStart < len(header.Extra) && header.Extra[proofSyncInfoStart] == hsProofFlag {
+	if proofSyncInfoStart >= extraVanity && proofSyncInfoStart < len(header.Extra) && header.Extra[proofSyncInfoStart] == hsProofFlag {
 		return 1 + syncInfoProofTotalSize
 	}
 	syncInfoStart := len(header.Extra) - extraSeal - (1 + syncInfoTotalSize)
-	if syncInfoStart <= extraVanity || syncInfoStart >= len(header.Extra) {
+	if syncInfoStart < extraVanity || syncInfoStart >= len(header.Extra) {
 		return 0
 	}
 	if header.Extra[syncInfoStart] != hsFlag {
@@ -27,13 +30,19 @@ func syncInfoSize(header *types.Header) int {
 	return 1 + syncInfoTotalSize
 }
 
+// hotstuffExtraSize returns the deterministic HotStuff trailer before the seal.
+// The trailer layout is [TimeoutCert?][SyncInfo][seal].
+func hotstuffExtraSize(header *types.Header, chainConfig *params.ChainConfig) int {
+	return syncInfoSize(header, chainConfig) + timeoutCertSize(header, chainConfig)
+}
+
 // parseSyncInfo decodes minimal SyncInfo from header.Extra
-func parseSyncInfo(header *types.Header) (has bool, hqcView uint64, hqcHash common.Hash, htcView uint64) {
-	has, hqcView, hqcHash, htcView, _, _, _ = parseSyncInfoWithProof(header)
+func parseSyncInfo(header *types.Header, chainConfig *params.ChainConfig) (has bool, hqcView uint64, hqcHash common.Hash, htcView uint64) {
+	has, hqcView, hqcHash, htcView, _, _, _ = parseSyncInfoWithProof(header, chainConfig)
 	return has, hqcView, hqcHash, htcView
 }
 
-func parseSyncInfoWithProof(header *types.Header) (has bool, hqcView uint64, hqcHash common.Hash, htcView uint64, signersSet types.ValidatorsBitSet, sig []byte, hasProof bool) {
+func parseSyncInfoWithProof(header *types.Header, chainConfig *params.ChainConfig) (has bool, hqcView uint64, hqcHash common.Hash, htcView uint64, signersSet types.ValidatorsBitSet, sig []byte, hasProof bool) {
 	// CRITICAL FIX: Don't scan for hsFlag! It can appear in validator BLS pubkeys!
 	// Instead, calculate the exact position where syncInfo should be.
 	//
@@ -46,7 +55,7 @@ func parseSyncInfoWithProof(header *types.Header) (has bool, hqcView uint64, hqc
 		return false, 0, common.Hash{}, 0, 0, nil, false
 	}
 
-	size := syncInfoSize(header)
+	size := syncInfoSize(header, chainConfig)
 	if size == 0 {
 		return false, 0, common.Hash{}, 0, 0, nil, false
 	}
@@ -60,7 +69,7 @@ func parseSyncInfoWithProof(header *types.Header) (has bool, hqcView uint64, hqc
 	htcView = binary.LittleEndian.Uint64(payload[syncInfoStart+1+viewSize+hashSize : syncInfoStart+1+syncInfoTotalSize])
 	if payload[syncInfoStart] == hsProofFlag {
 		offset := syncInfoStart + 1 + syncInfoTotalSize
-		signersSet = types.ValidatorsBitSet(binary.LittleEndian.Uint32(payload[offset : offset+countSize]))
+		signersSet = types.ValidatorsBitSet(binary.LittleEndian.Uint64(payload[offset : offset+countSize]))
 		offset += countSize
 		sig = common.CopyBytes(payload[offset : offset+types.BLSSignatureLength])
 		hasProof = signersSet != 0 && len(sig) == types.BLSSignatureLength
@@ -68,8 +77,13 @@ func parseSyncInfoWithProof(header *types.Header) (has bool, hqcView uint64, hqc
 
 	// Sanity check: view should be reasonable (not corrupted data from BLS pubkey)
 	// For a valid syncInfo, view should be close to block number
-	maxReasonableView := header.Number.Uint64() + 100000 // Allow buffer for future blocks
-	if hqcView > maxReasonableView {
+	maxReasonableView := header.Number.Uint64()
+	if maxReasonableView <= math.MaxUint64-100000 {
+		maxReasonableView += 100000 // Allow timeout views ahead of height.
+	} else {
+		maxReasonableView = math.MaxUint64
+	}
+	if hqcView == math.MaxUint64 || htcView == math.MaxUint64 || hqcView > maxReasonableView || htcView > maxReasonableView {
 		log.Warn("parseSyncInfo: detected unreasonably large view, rejecting as corrupted",
 			"blockNumber", header.Number.Uint64(),
 			"parsedView", hqcView,
@@ -85,8 +99,8 @@ func parseSyncInfoWithProof(header *types.Header) (has bool, hqcView uint64, hqc
 // getViewFromHeader extracts the view number from a block header.
 // For HotStuff blocks with SyncInfo, the view is (hqcView+1) or htcView+1 if TC is present.
 // Falls back to block number if no SyncInfo is present (for backward compatibility).
-func getViewFromHeader(header *types.Header) uint64 {
-	has, hqcView, _, htcView := parseSyncInfo(header)
+func getViewFromHeader(header *types.Header, chainConfig *params.ChainConfig) uint64 {
+	has, hqcView, _, htcView := parseSyncInfo(header, chainConfig)
 	if has {
 		// If TC is present, the view is htcView+1
 		if htcView > 0 && htcView >= hqcView {
@@ -113,20 +127,9 @@ func (h *Hotstuff) embedSyncInfoInHeader(header *types.Header) error {
 		return errors.New("no hsState")
 	}
 
-	// Initialize highQC with parent only for bootstrap. After HotStuff has
-	// activated, Seal requires a verified highQC before proposing.
-	if st.highQC == nil && header.Number.Uint64() > 0 {
-		parentView := header.Number.Uint64() - 1
-		st.highQC = &HsQC{
-			BlockHash:  header.ParentHash,
-			View:       parentView,
-			SignersSet: 0,
-			Sig:        nil,
-		}
-		log.Warn("embedSyncInfoInHeader: initialized highQC with parent block (no QC yet)",
-			"block", header.Number.Uint64(),
-			"parentHash", header.ParentHash.Hex()[:10],
-			"parentView", parentView)
+	if st.highQC == nil {
+		h.lock.Unlock()
+		return errors.New("no verified or bootstrap HighQC available")
 	}
 
 	// Copy values under lock, then release
@@ -144,7 +147,7 @@ func (h *Hotstuff) embedSyncInfoInHeader(header *types.Header) error {
 		hqcSig = common.CopyBytes(st.highQC.Sig)
 	}
 	htcView = st.highTCView
-	hasHighQC := st.highQC != nil
+	hasHighQC := true
 
 	log.Debug("embedSyncInfoInHeader: current highQC state",
 		"block", header.Number.Uint64(),
@@ -157,10 +160,6 @@ func (h *Hotstuff) embedSyncInfoInHeader(header *types.Header) error {
 
 	h.lock.Unlock()
 
-	if !hasHighQC {
-		// Only for genesis block (block 0) - no highQC needed
-		return nil
-	}
 	size := syncInfoTotalSize
 	flag := hsFlag
 	if hasHighQCProof(hqcSignersSet, hqcSigLen) {
@@ -174,7 +173,7 @@ func (h *Hotstuff) embedSyncInfoInHeader(header *types.Header) error {
 	binary.LittleEndian.PutUint64(buf[1+viewSize+hashSize:1+syncInfoTotalSize], htcView)
 	if flag == hsProofFlag {
 		offset := 1 + syncInfoTotalSize
-		binary.LittleEndian.PutUint32(buf[offset:offset+countSize], uint32(hqcSignersSet))
+		binary.LittleEndian.PutUint64(buf[offset:offset+countSize], uint64(hqcSignersSet))
 		offset += countSize
 		copy(buf[offset:offset+types.BLSSignatureLength], hqcSig)
 	}
@@ -194,7 +193,7 @@ func (h *Hotstuff) embedHighQC(header *types.Header, hqcHash common.Hash, hqcVie
 	if end >= extraSeal {
 		end = end - extraSeal
 	}
-	hsSize := syncInfoSize(header)
+	hsSize := syncInfoSize(header, h.chainConfig)
 	idx := len(payload) - extraSeal - hsSize
 	if hsSize == 0 || idx < 0 {
 		// no sync info yet, create minimal one
@@ -202,7 +201,11 @@ func (h *Hotstuff) embedHighQC(header *types.Header, hqcHash common.Hash, hqcVie
 		buf[0] = hsFlag
 		binary.LittleEndian.PutUint64(buf[1:1+viewSize], hqcView)
 		copy(buf[1+viewSize:1+viewSize+hashSize], hqcHash[:])
-		header.Extra = append(header.Extra, buf...)
+		if end == len(header.Extra) {
+			header.Extra = append(header.Extra, buf...)
+		} else {
+			header.Extra = append(payload[:end], append(buf, payload[end:]...)...)
+		}
 		return nil
 	}
 
@@ -223,23 +226,25 @@ func (h *Hotstuff) embedHighTC(header *types.Header, tcView uint64) error {
 	if end >= extraSeal {
 		end = end - extraSeal
 	}
-	for i := end - 1; i >= 0; i-- {
-		if payload[i] == hsFlag || payload[i] == hsProofFlag {
-			// bounds check
-			if i+1+syncInfoTotalSize > end {
-				return errors.New("malformed syncInfo in header.Extra")
-			}
-			// write htcView field (last 8 bytes of syncInfo)
-			offset := i + 1 + viewSize + hashSize
-			binary.LittleEndian.PutUint64(header.Extra[offset:offset+viewSize], tcView)
-			return nil
+	hsSize := syncInfoSize(header, h.chainConfig)
+	if hsSize > 0 {
+		i := len(payload) - extraSeal - hsSize
+		if i < extraVanity || i+1+syncInfoTotalSize > end || (payload[i] != hsFlag && payload[i] != hsProofFlag) {
+			return errors.New("malformed syncInfo in header.Extra")
 		}
+		offset := i + 1 + viewSize + hashSize
+		binary.LittleEndian.PutUint64(header.Extra[offset:offset+viewSize], tcView)
+		return nil
 	}
 	// if syncInfo does not exist yet, create it
 	buf := make([]byte, 1+syncInfoTotalSize)
 	buf[0] = hsFlag
 	binary.LittleEndian.PutUint64(buf[1+viewSize+hashSize:1+syncInfoTotalSize], tcView)
-	header.Extra = append(header.Extra, buf...)
+	if end == len(header.Extra) {
+		header.Extra = append(header.Extra, buf...)
+	} else {
+		header.Extra = append(payload[:end], append(buf, payload[end:]...)...)
+	}
 	return nil
 }
 

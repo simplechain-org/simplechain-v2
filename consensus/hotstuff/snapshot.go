@@ -211,8 +211,11 @@ func (s *Snapshot) updateAttestation(header *types.Header, chainConfig *params.C
 	}
 
 	// The attestation should have been checked in verify header, update directly
-	attestation, _ := getVoteAttestationFromHeader(header, chainConfig, s.EpochLength)
-	if attestation == nil {
+	attestation, err := getVoteAttestationFromHeader(header, chainConfig, s.EpochLength)
+	if err != nil || attestation == nil || attestation.Data == nil {
+		if err != nil {
+			log.Debug("Ignore malformed vote attestation while updating snapshot", "block", header.Number, "err", err)
+		}
 		return
 	}
 
@@ -341,8 +344,8 @@ func (s *Snapshot) apply(headers []*types.Header, chain consensus.ChainHeaderRea
 
 		// Advance HotStuff view from header SyncInfo. View and block height may
 		// diverge after timeouts; fall back to block number only for legacy blocks.
-		snap.CurrentView = getViewFromHeader(header)
-		hasSyncInfo, hqcView, hqcHash, htcView := parseSyncInfo(header)
+		snap.CurrentView = getViewFromHeader(header, chainConfig)
+		hasSyncInfo, hqcView, hqcHash, htcView := parseSyncInfo(header, chainConfig)
 		if hasSyncInfo {
 			// Update HighQC if view increased
 			if snap.HighQCView < hqcView {
@@ -610,7 +613,7 @@ func parseTurnLength(header *types.Header, chainConfig *params.ChainConfig, epoc
 		return nil, errInvalidSpanValidators
 	}
 
-	hsExtraSize := syncInfoSize(header)
+	hsExtraSize := hotstuffExtraSize(header, chainConfig)
 
 	num := int(header.Extra[extraVanity])
 	pos := extraVanity + validatorNumberSize + num*validatorBytesLength
