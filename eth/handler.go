@@ -17,6 +17,7 @@
 package eth
 
 import (
+	"crypto/ecdsa"
 	"errors"
 	"fmt"
 	"maps"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/beacon"
 	"github.com/ethereum/go-ethereum/consensus/parlia"
 	"github.com/ethereum/go-ethereum/core"
@@ -69,6 +71,10 @@ const (
 	// All transactions with a higher size will be announced and need to be fetched
 	// by the peer.
 	txMaxBroadcastSize = 4096
+
+	// Keep provisional Bsc4 headers within the same near-head window used by
+	// the block fetcher. They are revalidated before import.
+	chunkDeferredHeaderDistance = 32
 )
 
 var (
@@ -126,10 +132,11 @@ type votePool interface {
 // handlerConfig is the collection of initialization parameters to create a full
 // node network handler.
 type handlerConfig struct {
-	NodeID                    enode.ID         // P2P node ID used for tx propagation topology
-	Database                  ethdb.Database   // Database for direct sync insertions
-	Chain                     *core.BlockChain // Blockchain to serve data from
-	TxPool                    txPool           // Transaction pool to propagate from
+	NodeID                    enode.ID          // P2P node ID used for tx propagation topology
+	NodeKey                   *ecdsa.PrivateKey // P2P node key used to sign Bsc4 shard manifests
+	Database                  ethdb.Database    // Database for direct sync insertions
+	Chain                     *core.BlockChain  // Blockchain to serve data from
+	TxPool                    txPool            // Transaction pool to propagate from
 	VotePool                  votePool
 	Network                   uint64                 // Network identifier to adfvertise
 	Sync                      ethconfig.SyncMode     // Whether to snap or full sync
@@ -143,11 +150,12 @@ type handlerConfig struct {
 	EnableEVNFeatures         bool
 	EVNNodeIdsWhitelist       []enode.ID
 	ProxyedValidatorAddresses []common.Address
-	ChunkConfig               bsc.ChunkConfig // Block chunk propagation config (Bsc3)
+	ChunkConfig               bsc.ChunkConfig // Block chunk origination config (Bsc4)
 }
 
 type handler struct {
 	nodeID                     enode.ID
+	nodeKey                    *ecdsa.PrivateKey
 	networkID                  uint64
 	disablePeerTxBroadcast     bool
 	enableEVNFeatures          bool
@@ -187,10 +195,19 @@ type handler struct {
 
 	requiredBlocks map[uint64]common.Hash
 
-	// chunkPool holds the Bsc3 block chunk reassembly state.  May be nil when
+	// chunkPool holds the Bsc4 block chunk reassembly state. May be nil when
 	// chunk propagation is disabled.
-	chunkPool   *bsc.ChunkPool
-	chunkConfig bsc.ChunkConfig
+	chunkPool           *bsc.ChunkPool
+	chunkConfig         bsc.ChunkConfig
+	chunkRepairMu       sync.Mutex
+	chunkRepairs        map[chunkRepairKey]*chunkRepairState
+	chunkRepairWG       sync.WaitGroup
+	chunkRepairStopped  bool
+	chunkReceiptMu      sync.Mutex
+	chunkReceipts       map[chunkReceiptKey]*chunkReceiptState
+	chunkReceiptWG      sync.WaitGroup
+	chunkReceiptSeq     uint64
+	chunkReceiptStopped bool
 
 	// channels for fetcher, syncer, txsyncLoop
 	quitSync chan struct{}
@@ -214,6 +231,7 @@ func newHandler(config *handlerConfig) (*handler, error) {
 	}
 	h := &handler{
 		nodeID:                     config.NodeID,
+		nodeKey:                    config.NodeKey,
 		networkID:                  config.Network,
 		disablePeerTxBroadcast:     config.DisablePeerTxBroadcast,
 		eventMux:                   config.EventMux,
@@ -232,6 +250,8 @@ func newHandler(config *handlerConfig) (*handler, error) {
 		handlerDoneCh:              make(chan struct{}),
 		handlerStartCh:             make(chan struct{}),
 		stopCh:                     make(chan struct{}),
+		chunkRepairs:               make(map[chunkRepairKey]*chunkRepairState),
+		chunkReceipts:              make(map[chunkReceiptKey]*chunkReceiptState),
 	}
 	for _, nodeID := range config.EVNNodeIdsWhitelist {
 		h.evnNodeIdsWhitelistMap[nodeID] = struct{}{}
@@ -333,7 +353,7 @@ func newHandler(config *handlerConfig) (*handler, error) {
 		if p.bscExt == nil {
 			return nil, fmt.Errorf("peer does not support bsc protocol, peer: %v", p.ID())
 		}
-		if p.bscExt.Version() != bsc.Bsc2 {
+		if p.bscExt.Version() < bsc.Bsc2 {
 			return nil, fmt.Errorf("remote peer does not support the required Bsc2 protocol version, peer: %v", p.ID())
 		}
 		res, err := p.bscExt.RequestBlocksByRange(startHeight, startHash, count)
@@ -393,33 +413,110 @@ func newHandler(config *handlerConfig) (*handler, error) {
 		return errors
 	}
 	h.txFetcher = fetcher.NewTxFetcher(h.txpool.Has, addTxs, fetchTx, h.removePeer)
-	// Bsc3 block chunk propagation: set up the chunk pool if enabled.  The
-	// pool delivers reassembled blocks to the same broadcast-with-check path
-	// used by the fetcher, so reconstructed blocks are imported and re-broadcast
-	// to non-EVN peers through the normal sqrt(peers) full-block path.
+	// Bsc4 block chunk propagation: reconstructed blocks enter the regular block
+	// fetcher so they receive the same header verification, import ordering and
+	// post-import announcement handling as eth NewBlock messages. Every EVN node
+	// keeps a bounded receive/relay pool even when local chunk origination is
+	// disabled; ordinary nodes omit the Bsc4 capability and negotiate Bsc2.
 	h.chunkConfig = config.ChunkConfig
-	if h.chunkConfig.Enable {
-		h.chunkPool = bsc.NewChunkPool(h.chunkConfig,
-			func(block *types.Block) {
-				broadcastBlockWithCheck(block, true)
+	if h.enableEVNFeatures || h.chunkConfig.Enable {
+		poolConfig := h.chunkConfig
+		poolConfig.Enable = true
+		chunkHeaderValidator := func(header *types.Header) error {
+			err := validator(header)
+			// A direct shard seed can arrive before its parent. The block fetcher is
+			// designed to queue that case and will run the full validator again once
+			// the parent is available, so unknown ancestry is provisional rather than
+			// a reason to make the sender incorrectly count this peer as covered.
+			if errors.Is(err, consensus.ErrUnknownAncestor) || errors.Is(err, consensus.ErrFutureBlock) {
+				head := h.chain.CurrentBlock().Number.Uint64()
+				number := header.Number.Uint64()
+				ahead := number > head && number-head > chunkDeferredHeaderDistance
+				behind := head > number && head-number > chunkDeferredHeaderDistance
+				if !ahead && !behind {
+					return fmt.Errorf("%w: %v", bsc.ErrDeferredHeaderValidation, err)
+				}
+			}
+			return err
+		}
+		h.chunkPool = bsc.NewChunkPool(poolConfig,
+			func(block *types.Block, source string) bool {
+				block.ReceivedAt = time.Now()
+				if peer := h.peers.peer(source); peer != nil {
+					block.ReceivedFrom = peer.Peer
+				}
+				if !h.synced.Load() {
+					log.Debug("Deferring shard receipt while node is syncing", "hash", block.Hash(), "peer", source)
+					return false
+				}
+				if err := block.SanityCheck(); err != nil {
+					log.Warn("Dropping reassembled block with invalid fields", "hash", block.Hash(), "err", err)
+					return false
+				}
+				if !(block.Header().WithdrawalsHash == nil && block.Withdrawals() == nil) &&
+					!(block.Header().EmptyWithdrawalsHash() && block.Withdrawals() != nil && len(block.Withdrawals()) == 0) {
+					log.Warn("Dropping reassembled block with invalid withdrawals", "hash", block.Hash())
+					return false
+				}
+				if err := core.IsDataAvailable(h.chain, block); err != nil {
+					log.Warn("Dropping reassembled block with invalid sidecars", "hash", block.Hash(), "err", err)
+					return false
+				}
+				if err := h.blockFetcher.Enqueue(source, block); err != nil {
+					log.Debug("Failed to enqueue reassembled block", "hash", block.Hash(), "peer", source, "err", err)
+					return false
+				}
+				return true
 			},
 			func(hash common.Hash, number uint64) bool {
 				return h.chain.HasBlock(hash, number)
-			})
-		log.Info("Bsc3 block chunk propagation enabled", "threshold", h.chunkConfig.Threshold)
+			},
+			chunkHeaderValidator,
+			h.validateChunkOrigin)
+		if h.chunkConfig.Enable {
+			log.Info("Bsc4 block chunk origination enabled", "threshold", h.chunkConfig.Threshold)
+		} else {
+			log.Debug("Bsc4 block chunk receive/relay enabled; origination disabled")
+		}
 	}
 
 	h.chainSync = newChainSyncer(h)
 	return h, nil
 }
 
+func (h *handler) applyValidatorNodes(validatorNodeIDsMap map[common.Address][]enode.ID) {
+	if validatorNodeIDsMap != nil {
+		h.peers.setValidatorNodeIDsMap(validatorNodeIDsMap)
+	}
+	if !h.enableEVNFeatures || !h.synced.Load() {
+		return
+	}
+	if validatorNodeIDsMap == nil {
+		// Before Maxwell the on-chain registry is unavailable, and a transient
+		// post-fork query failure must not erase the last valid validator map.
+		// EVN whitelist peers still need their flags refreshed in both cases.
+		h.peers.lock.RLock()
+		validatorNodeIDsMap = maps.Clone(h.peers.validatorNodeIDsMap)
+		h.peers.lock.RUnlock()
+	}
+	h.peers.enableEVNFeatures(validatorNodeIDsMap, h.evnNodeIdsWhitelistMap)
+}
+
+func (h *handler) refreshValidatorNodes() {
+	if h.chunkPool == nil && !(h.enableEVNFeatures && h.synced.Load()) {
+		return
+	}
+	h.applyValidatorNodes(h.queryValidatorNodeIDsMap())
+}
+
 // protoTracker tracks the number of active protocol handlers.
 func (h *handler) protoTracker() {
 	defer h.wg.Done()
 
-	if h.enableEVNFeatures && h.synced.Load() {
-		h.peers.enableEVNFeatures(h.queryValidatorNodeIDsMap(), h.evnNodeIdsWhitelistMap)
-	}
+	// Manifest authorization is independent of whether this node originates or
+	// applies the other EVN broadcast optimizations, so keep the validator node
+	// map warm for every Bsc4 receiver.
+	h.refreshValidatorNodes()
 	updateTicker := time.NewTicker(10 * time.Second)
 	defer updateTicker.Stop()
 	var active int
@@ -430,11 +527,7 @@ func (h *handler) protoTracker() {
 		case <-h.handlerDoneCh:
 			active--
 		case <-updateTicker.C:
-			if h.enableEVNFeatures && h.synced.Load() {
-				// add onchain validator p2p node list later, it will enable the direct broadcast + no tx broadcast feature
-				// here check & enable peer broadcast features periodically, and it's a simple way to handle the peer change and the list change scenarios.
-				h.peers.enableEVNFeatures(h.queryValidatorNodeIDsMap(), h.evnNodeIdsWhitelistMap)
-			}
+			h.refreshValidatorNodes()
 		case <-h.quitSync:
 			// Wait for all active handlers to finish.
 			for ; active > 0; active-- {
@@ -797,6 +890,8 @@ func (h *handler) Stop() {
 		}
 	}
 	close(h.stopCh)
+	h.stopChunkRepairs()
+	h.stopChunkReceipts()
 	// Quit chainSync and txsync64.
 	// After this is done, no new peers will be accepted.
 	close(h.quitSync)
@@ -841,43 +936,65 @@ func (h *handler) BroadcastBlock(block *types.Block, propagate bool) {
 			transfer = peers[:int(math.Sqrt(float64(len(peers))))]
 		}
 
+		// A bounded outbound queue accepting a full block is the only condition
+		// under which this peer is covered by the full-block path. In
+		// particular, do not let a congested queue exclude an EVN peer from the
+		// shard path (or its full-block fallback) below.
+		transferred := make(map[string]struct{}, len(transfer))
 		for _, peer := range transfer {
 			log.Debug("broadcast block to peer", "hash", hash, "peer", peer.ID(), "EVNPeerFlag", peer.EVNPeerFlag.Load())
-			peer.AsyncSendNewBlock(block, td)
+			if peer.AsyncSendNewBlock(block, td) {
+				transferred[peer.ID()] = struct{}{}
+				continue
+			}
+			// Keep a pull path available when the full-block queue is already
+			// congested. EVN peers are also reconsidered by the paths below.
+			peer.AsyncSendNewBlockHash(block)
 		}
 
 		// check if the block should be broadcast to more peers in EVN
 		var morePeers []*ethPeer
 		if h.needFullBroadcastInEVN(block) {
+			var covered map[string]struct{}
 			chunkPropagated := false
-			// Try the Bsc3 chunk propagation path for large blocks.  If the
+			// Try the Bsc4 chunk propagation path for large blocks. If the
 			// block is big enough and chunking is enabled, distribute chunks
 			// via a deterministic fanout tree among EVN peers instead of
 			// sending full blocks to everyone.
-			if h.chunkPool != nil {
+			if !h.directBroadcast && h.chunkConfig.Enable && h.chunkPool != nil {
 				if pkts, err := bsc.SplitBlock(block, h.chunkConfig); err == nil && pkts != nil {
-					chunkPropagated = h.distributeBlockChunks(peers, pkts)
-					log.Debug("Propagated block via chunk path", "hash", hash, "shards", len(pkts), "recipients", len(transfer), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
+					covered, chunkPropagated = h.distributeBlockChunks(peers, pkts, block, td, transferred)
+					log.Debug("Propagated block via chunk path", "hash", hash, "shards", len(pkts), "recipients", len(covered), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
 				} else if err != nil {
 					log.Debug("Failed to split block for chunk propagation", "hash", hash, "err", err)
 				}
 			}
-			if !chunkPropagated {
-				bsc.BlockChunkFallbackMeter.Mark(1)
-				// Fallback: full-block broadcast to all EVN peers.
-				for i := len(transfer); i < len(peers); i++ {
-					if peers[i].EVNPeerFlag.Load() {
-						morePeers = append(morePeers, peers[i])
+			for _, peer := range peers {
+				if !peer.EVNPeerFlag.Load() {
+					continue
+				}
+				if _, ok := transferred[peer.ID()]; ok {
+					continue
+				}
+				if chunkPropagated {
+					if _, ok := covered[peer.ID()]; ok {
+						continue
 					}
 				}
+				morePeers = append(morePeers, peer)
+			}
+			if len(morePeers) > 0 {
+				bsc.BlockChunkFallbackMeter.Mark(1)
 				for _, peer := range morePeers {
 					log.Debug("broadcast block to extra peer", "hash", hash, "peer", peer.ID(), "EVNPeerFlag", peer.EVNPeerFlag.Load())
-					peer.AsyncSendNewBlock(block, td)
+					if !peer.AsyncSendNewBlock(block, td) {
+						peer.AsyncSendNewBlockHash(block)
+					}
 				}
 			}
 		}
 
-		log.Debug("Propagated block", "hash", hash, "recipients", len(transfer), "extra", len(morePeers), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
+		log.Debug("Propagated block", "hash", hash, "recipients", len(transferred), "extra", len(morePeers), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
 		return
 	}
 	// Otherwise if the block is indeed in our own chain, announce it
@@ -929,6 +1046,25 @@ func (h *handler) queryValidatorNodeIDsMap() map[common.Address][]enode.ID {
 		return nil
 	}
 	return nodeIDsMap
+}
+
+// validateChunkOrigin restricts a Bsc4 encoding to the node IDs registered for
+// the block producer. EVNNodeIdsWhitelist is intentionally not used here: that
+// list grants fast block delivery to sentries/observers, not authority to sign
+// manifests for an arbitrary validator. A proxy without an explicit on-chain
+// producer mapping safely falls back to full-block propagation.
+func (h *handler) validateChunkOrigin(header *types.Header, origin enode.ID) error {
+	if header != nil {
+		h.peers.lock.RLock()
+		nodeIDs := append([]enode.ID(nil), h.peers.validatorNodeIDsMap[header.Coinbase]...)
+		h.peers.lock.RUnlock()
+		for _, nodeID := range nodeIDs {
+			if nodeID == origin {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("node %s is not an authorized block-producer shard origin", origin)
 }
 
 // BroadcastTransactions will propagate a batch of transactions
@@ -1129,6 +1265,7 @@ func (h *handler) voteBroadcastLoop() {
 func (h *handler) enableSyncedFeatures() {
 	// Mark the local node as synced.
 	h.synced.Store(true)
+	h.refreshValidatorNodes()
 	if !h.acceptTxs.Load() {
 		h.acceptTxs.Store(true)
 		log.Info("Enable transaction acceptance when synced.")

@@ -6,60 +6,89 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
-// handleBlockChunk ingests an incoming Bsc3 block chunk.  The chunk is fed to
-// the shared ChunkPool which reassembles the block once all chunks arrive.
+// handleBlockChunk handles authenticated Bsc4 shards. Ingress does not depend
+// on the asynchronously refreshed EVNPeerFlag: the producer manifest and the
+// depth-zero source binding provide stable authentication, while every Bsc4
+// connection is subject to the same wire-rate and pool budgets.
 func handleBlockChunk(backend Backend, msg Decoder, peer *Peer) error {
 	pkt := new(BlockChunkPacket)
 	if err := msg.Decode(pkt); err != nil {
 		return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 	}
-	pool := backend.ChunkPool()
-	if pool == nil {
-		return nil // peer supports Bsc3 but local node does not use chunk path
+	if pkt.ShardRoot == (common.Hash{}) || pkt.RelayDepth > 1 || len(pkt.RelayTargets) > MaxBlockChunkRelayTargets {
+		return nil
 	}
-	// Remember the chunk for this peer to avoid forwarding it back.
-	peer.knownChunks.add(chunkKey{hash: pkt.BlockHash, index: pkt.ChunkIndex})
-	pool.AddChunk(pkt)
-	// Forward the chunk to the backend so it can relay it further down the
-	// fanout tree (best-effort).
+	pool := backend.ChunkPool()
+	if pool == nil || peer.Peer == nil {
+		return nil
+	}
+	sourceIsOrigin := pkt.OriginNodeID == peer.Peer.ID()
+	// Depth-zero traffic is leader-to-relay traffic. The manifest signature
+	// binds OriginNodeID to the leader's devp2p key, so a relay cannot rewrite
+	// the route and re-amplify a packet as depth zero.
+	if pkt.RelayDepth == 0 && !sourceIsOrigin {
+		return nil
+	}
+	// A depth-one relay may only contribute to a root already established by
+	// a direct producer seed. Relay traffic can race ahead and be dropped; the
+	// seed's repair path then recovers any missing early shards.
+	if pkt.RelayDepth == 1 && !sourceIsOrigin && !pool.HasEncoding(pkt.BlockHash, pkt.ShardRoot) {
+		return nil
+	}
+	// Invalid shards are not eligible for any backend work. Valid duplicates
+	// are observed as additional repair sources, but are not relayed again.
+	switch pool.addChunkStatus(pkt, peer.ID()) {
+	case chunkRejected:
+		return nil
+	case chunkDuplicate:
+		if observer, ok := backend.(ChunkObserver); ok {
+			observer.ObserveBlockChunk(peer, pkt)
+		}
+		return nil
+	}
 	return backend.Handle(peer, pkt)
 }
 
-// handleGetBlockChunks serves a request for missing chunks from a remote peer.
-// If the local node has the full block (and therefore can reconstruct the
-// chunks), it replies by re-splitting the block and sending the requested
-// chunk indexes back.
+// Bsc3 chunk packets were never authenticated and are no longer accepted as
+// data. The message is discarded without decoding its potentially large body;
+// peers can still use Bsc2 range requests and the regular eth protocol.
+func handleBlockChunkV3(backend Backend, msg Decoder, peer *Peer) error {
+	return nil
+}
+
 func handleGetBlockChunks(backend Backend, msg Decoder, peer *Peer) error {
+	// EVNPeerFlag is refreshed asynchronously and is not an authorization source.
+	// The pool instead binds repair access to the producer-selected route (or the
+	// producer's explicit recipient set) and applies a node-wide egress budget in
+	// addition to this connection's request rate limit.
 	req := new(GetBlockChunksPacket)
 	if err := msg.Decode(req); err != nil {
 		return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 	}
-	if req.BlockHash == (common.Hash{}) {
+	if req.BlockHash == (common.Hash{}) || req.ShardRoot == (common.Hash{}) ||
+		len(req.MissingIndexes) == 0 || len(req.MissingIndexes) > MaxBlockChunkRequestIndexes {
+		return fmt.Errorf("%w: invalid chunk repair request", errDecode)
+	}
+	if !peer.allowChunkRepairRequest(len(req.MissingIndexes)) {
 		return nil
 	}
-	// Look up the local block.  If we don't have it, there's nothing we can do.
-	block := backend.Chain().GetBlockByHash(req.BlockHash)
-	if block == nil {
+	pool := backend.ChunkPool()
+	if pool == nil {
 		return nil
 	}
-	// Re-split the block to recover the original shards. Use threshold=1 so
-	// even small blocks can serve explicit shard requests.
-	pkts, err := SplitBlock(block, ChunkConfig{Enable: true, Threshold: 1})
-	if err != nil {
-		return err
-	}
-	if pkts == nil {
-		return nil
-	}
-	want := make(map[uint]struct{}, len(req.MissingIndexes))
-	for _, idx := range req.MissingIndexes {
-		want[idx] = struct{}{}
-	}
-	for _, pkt := range pkts {
-		if _, ok := want[pkt.ChunkIndex]; !ok {
-			continue
+	for _, pkt := range pool.GetChunks(req.BlockHash, req.ShardRoot, req.MissingIndexes, peer.ID()) {
+		if !peer.AsyncSendBlockChunkForce(pkt) {
+			// GetChunks reserves the node-wide egress budget before returning a
+			// packet. A full or closed async queue did not accept that packet, so
+			// do not let one slow authorized peer consume capacity for traffic
+			// that can never leave this node.
+			pool.refundRepairEgress(pkt)
 		}
-		peer.AsyncSendBlockChunk(pkt)
 	}
+	return nil
+}
+
+// Bsc3 repair requests are discarded for the same reason as legacy shards.
+func handleGetBlockChunksV3(backend Backend, msg Decoder, peer *Peer) error {
 	return nil
 }

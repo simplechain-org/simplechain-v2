@@ -39,16 +39,33 @@ type Backend interface {
 	// be forwarded to the backend.
 	Handle(peer *Peer, packet Packet) error
 
-	// ChunkPool returns the block chunk pool used by the Bsc3 block chunk
-	// propagation path.  Implementations that do not support Bsc3 may return
-	// nil; callers must guard against that.
+	// ChunkPool returns the bounded Bsc4 receive/repair pool. Implementations
+	// without Bsc4 data-plane support may return nil; callers must guard it.
 	ChunkPool() *ChunkPool
+}
+
+// ChunkObserver is optionally implemented by a backend that wants to record a
+// valid duplicate shard as an additional repair source without relaying that
+// duplicate again.
+type ChunkObserver interface {
+	ObserveBlockChunk(peer *Peer, packet *BlockChunkPacket)
 }
 
 // MakeProtocols constructs the P2P protocol definitions for `bsc`.
 func MakeProtocols(backend Backend) []p2p.Protocol {
-	protocols := make([]p2p.Protocol, len(ProtocolVersions))
-	for i, version := range ProtocolVersions {
+	versions := ProtocolVersions
+	if backend.ChunkPool() == nil {
+		versions = make([]uint, 0, len(ProtocolVersions)-2)
+		for _, version := range ProtocolVersions {
+			// Bsc3 is the legacy unauthenticated chunk protocol and must not
+			// be advertised by nodes that have no authenticated chunk pool.
+			if version < Bsc3 {
+				versions = append(versions, version)
+			}
+		}
+	}
+	protocols := make([]p2p.Protocol, len(versions))
+	for i, version := range versions {
 		version := version // capture for the closure below
 		protocols[i] = p2p.Protocol{
 			Name:    ProtocolName,
@@ -101,8 +118,17 @@ var bsc2 = map[uint64]msgHandler{
 }
 
 var bsc3 = mergeHandlers(bsc2, map[uint64]msgHandler{
+	BlockChunkMsg:     handleBlockChunkV3,
+	GetBlockChunksMsg: handleGetBlockChunksV3,
+})
+
+var bsc4 = mergeHandlers(bsc2, map[uint64]msgHandler{
 	BlockChunkMsg:     handleBlockChunk,
 	GetBlockChunksMsg: handleGetBlockChunks,
+})
+
+var bsc5 = mergeHandlers(bsc4, map[uint64]msgHandler{
+	BlockChunkReceiptMsg: handleBlockChunkReceipt,
 })
 
 // mergeHandlers returns a new map combining base with extra.  It is used to
@@ -127,13 +153,42 @@ func handleMessage(backend Backend, peer *Peer) error {
 	if err != nil {
 		return err
 	}
+	defer msg.Discard()
 	if msg.Size > maxMessageSize {
 		return fmt.Errorf("%w: %v > %v", errMsgTooLarge, msg.Size, maxMessageSize)
 	}
-	defer msg.Discard()
-
+	// Chunk handlers have much tighter wire bounds than the generic protocol
+	// cap. Reject oversized bodies before RLP decoding them into attacker-sized
+	// slices (the payload itself is capped at 64 KiB by ChunkPool).
+	switch msg.Code {
+	case BlockChunkMsg:
+		if msg.Size > maxBlockChunkMessageSize {
+			return fmt.Errorf("%w: block chunk %v > %v", errMsgTooLarge, msg.Size, maxBlockChunkMessageSize)
+		}
+		if !peer.allowChunkIngress(int(msg.Size)) {
+			return nil
+		}
+	case GetBlockChunksMsg:
+		if msg.Size > maxBlockChunkRequestSize {
+			return fmt.Errorf("%w: chunk request %v > %v", errMsgTooLarge, msg.Size, maxBlockChunkRequestSize)
+		}
+		if !peer.allowChunkIngress(int(msg.Size)) {
+			return nil
+		}
+	case BlockChunkReceiptMsg:
+		if msg.Size > maxBlockChunkReceiptSize {
+			return fmt.Errorf("%w: chunk receipt %v > %v", errMsgTooLarge, msg.Size, maxBlockChunkReceiptSize)
+		}
+		if !peer.allowChunkIngress(int(msg.Size)) {
+			return nil
+		}
+	}
 	var handlers map[uint64]msgHandler
 	switch {
+	case peer.Version() >= Bsc5:
+		handlers = bsc5
+	case peer.Version() >= Bsc4:
+		handlers = bsc4
 	case peer.Version() >= Bsc3:
 		handlers = bsc3
 	case peer.Version() >= Bsc2:
@@ -168,6 +223,17 @@ func handleVotes(backend Backend, msg Decoder, peer *Peer) error {
 	// Schedule all the unknown hashes for retrieval
 	peer.markVotes(ann.Votes)
 	return backend.Handle(peer, ann)
+}
+
+func handleBlockChunkReceipt(backend Backend, msg Decoder, peer *Peer) error {
+	receipt := new(BlockChunkReceiptPacket)
+	if err := msg.Decode(receipt); err != nil {
+		return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
+	}
+	if receipt.BlockHash == (common.Hash{}) || receipt.ShardRoot == (common.Hash{}) {
+		return fmt.Errorf("%w: invalid chunk receipt", errDecode)
+	}
+	return backend.Handle(peer, receipt)
 }
 
 func handleGetBlocksByRange(backend Backend, msg Decoder, peer *Peer) error {

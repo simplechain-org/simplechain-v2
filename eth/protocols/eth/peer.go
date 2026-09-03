@@ -318,15 +318,25 @@ func (p *Peer) SendNewBlock(block *types.Block, td *big.Int) error {
 	})
 }
 
-// AsyncSendNewBlock queues an entire block for propagation to a remote peer. If
-// the peer's broadcast queue is full, the event is silently dropped.
-func (p *Peer) AsyncSendNewBlock(block *types.Block, td *big.Int) {
+// AsyncSendNewBlock queues an entire block for propagation to a remote peer.
+// Its result reports whether the bounded queue accepted the propagation. It
+// does not promise a successful network write, but lets callers apply a local
+// fallback instead of treating a full queue as successful delivery.
+func (p *Peer) AsyncSendNewBlock(block *types.Block, td *big.Int) bool {
+	if p == nil || block == nil {
+		return false
+	}
 	select {
 	case p.queuedBlocks <- &blockPropagation{block: block, td: td}:
 		// Mark all the block hash as known, but ensure we don't overflow our limits
 		p.knownBlocks.Add(block.Hash())
+		return true
+	case <-p.term:
+		p.Log().Debug("Dropping block propagation for closed peer", "number", block.NumberU64(), "hash", block.Hash())
+		return false
 	default:
 		p.Log().Debug("Dropping block propagation", "number", block.NumberU64(), "hash", block.Hash())
+		return false
 	}
 }
 

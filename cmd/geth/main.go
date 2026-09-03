@@ -69,6 +69,7 @@ var (
 		utils.DirectBroadcastFlag,
 		utils.BlockChunkEnableFlag,
 		utils.BlockChunkThresholdFlag,
+		utils.BlockChunkParityShardsFlag,
 		utils.DisableSnapProtocolFlag,
 		utils.RangeLimitFlag,
 		utils.USBFlag,

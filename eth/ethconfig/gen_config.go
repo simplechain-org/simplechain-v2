@@ -33,6 +33,9 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		DirectBroadcast         bool
 		DisableSnapProtocol     bool
 		RangeLimit              bool
+		BlockChunkEnable        bool
+		BlockChunkThreshold     int
+		BlockChunkParityShards  int
 		TxLookupLimit           uint64 `toml:",omitempty"`
 		TransactionHistory      uint64 `toml:",omitempty"`
 		BlockHistory            uint64 `toml:",omitempty"`
@@ -99,6 +102,9 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.DirectBroadcast = c.DirectBroadcast
 	enc.DisableSnapProtocol = c.DisableSnapProtocol
 	enc.RangeLimit = c.RangeLimit
+	enc.BlockChunkEnable = c.BlockChunkEnable
+	enc.BlockChunkThreshold = c.BlockChunkThreshold
+	enc.BlockChunkParityShards = c.BlockChunkParityShards
 	enc.TxLookupLimit = c.TxLookupLimit
 	enc.TransactionHistory = c.TransactionHistory
 	enc.BlockHistory = c.BlockHistory
@@ -141,13 +147,13 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.OverrideFermi = c.OverrideFermi
 	enc.OverrideOsaka = c.OverrideOsaka
 	enc.OverrideVerkle = c.OverrideVerkle
-	enc.BlobExtraReserve = c.BlobExtraReserve
 	enc.OverrideCopper = c.OverrideCopper
 	enc.OverrideNoBlockReward = c.OverrideNoBlockReward
 	enc.OverrideCopperRemix = c.OverrideCopperRemix
 	enc.OverrideCopperRemixFix = c.OverrideCopperRemixFix
 	enc.OverrideCopperRemix2 = c.OverrideCopperRemix2
 	enc.OverrideCopperAuditFix = c.OverrideCopperAuditFix
+	enc.BlobExtraReserve = c.BlobExtraReserve
 	return &enc, nil
 }
 
@@ -169,6 +175,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		DirectBroadcast         *bool
 		DisableSnapProtocol     *bool
 		RangeLimit              *bool
+		BlockChunkEnable        *bool
+		BlockChunkThreshold     *int
+		BlockChunkParityShards  *int
 		TxLookupLimit           *uint64 `toml:",omitempty"`
 		TransactionHistory      *uint64 `toml:",omitempty"`
 		BlockHistory            *uint64 `toml:",omitempty"`
@@ -267,6 +276,15 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.RangeLimit != nil {
 		c.RangeLimit = *dec.RangeLimit
+	}
+	if dec.BlockChunkEnable != nil {
+		c.BlockChunkEnable = *dec.BlockChunkEnable
+	}
+	if dec.BlockChunkThreshold != nil {
+		c.BlockChunkThreshold = *dec.BlockChunkThreshold
+	}
+	if dec.BlockChunkParityShards != nil {
+		c.BlockChunkParityShards = *dec.BlockChunkParityShards
 	}
 	if dec.TxLookupLimit != nil {
 		c.TxLookupLimit = *dec.TxLookupLimit
@@ -394,9 +412,6 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	if dec.OverrideVerkle != nil {
 		c.OverrideVerkle = dec.OverrideVerkle
 	}
-	if dec.BlobExtraReserve != nil {
-		c.BlobExtraReserve = *dec.BlobExtraReserve
-	}
 	if dec.OverrideCopper != nil {
 		c.OverrideCopper = dec.OverrideCopper
 	}
@@ -414,6 +429,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.OverrideCopperAuditFix != nil {
 		c.OverrideCopperAuditFix = dec.OverrideCopperAuditFix
+	}
+	if dec.BlobExtraReserve != nil {
+		c.BlobExtraReserve = *dec.BlobExtraReserve
 	}
 	return nil
 }

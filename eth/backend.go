@@ -171,6 +171,15 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	if !config.HistoryMode.IsValid() {
 		return nil, fmt.Errorf("invalid history mode %d", config.HistoryMode)
 	}
+	if err := bsc.ValidateChunkConfig(bsc.ChunkConfig{
+		Threshold:    config.BlockChunkThreshold,
+		ParityShards: config.BlockChunkParityShards,
+	}); err != nil {
+		return nil, fmt.Errorf("invalid block chunk configuration: %w", err)
+	}
+	if config.BlockChunkEnable && !stack.Config().EnableEVNFeatures {
+		return nil, errors.New("block chunk origination requires EnableEVNFeatures")
+	}
 	if config.Miner.GasPrice == nil || config.Miner.GasPrice.Sign() <= 0 {
 		log.Warn("Sanitizing invalid miner gas price", "provided", config.Miner.GasPrice, "updated", ethconfig.Defaults.Miner.GasPrice)
 		config.Miner.GasPrice = new(big.Int).Set(ethconfig.Defaults.Miner.GasPrice)
@@ -446,6 +455,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	cacheLimit := options.TrieCleanLimit + options.TrieDirtyLimit + options.SnapshotLimit
 	if eth.handler, err = newHandler(&handlerConfig{
 		NodeID:                    eth.p2pServer.Self().ID(),
+		NodeKey:                   eth.p2pServer.PrivateKey,
 		Database:                  chainDb,
 		Chain:                     eth.blockchain,
 		TxPool:                    eth.txPool,
@@ -460,8 +470,9 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		ProxyedValidatorAddresses: stack.Config().P2P.ProxyedValidatorAddresses,
 		DisablePeerTxBroadcast:    config.DisablePeerTxBroadcast,
 		ChunkConfig: bsc.ChunkConfig{
-			Enable:    config.BlockChunkEnable,
-			Threshold: config.BlockChunkThreshold,
+			Enable:       config.BlockChunkEnable,
+			Threshold:    config.BlockChunkThreshold,
+			ParityShards: config.BlockChunkParityShards,
 		},
 		PeerSet:                  newPeerSet(),
 		EnableQuickBlockFetching: stack.Config().EnableQuickBlockFetching,

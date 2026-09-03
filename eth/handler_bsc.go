@@ -59,6 +59,20 @@ func (h *bscHandler) Handle(peer *bsc.Peer, packet bsc.Packet) error {
 		handler := (*handler)(h)
 		handler.relayBlockChunk(peer, packet)
 		handler.requestMissingChunks(peer, packet)
+		// A Bsc5 receipt is emitted only after the reconstructed block is already
+		// local or has entered the normal block fetcher. RS completion by itself
+		// must not suppress the producer's full-block fallback.
+		if h.chunkPool != nil && h.chunkPool.HasUsableEncoding(packet.BlockHash, packet.ShardRoot) {
+			handler.clearChunkRepair(chunkRepairKey{hash: packet.BlockHash, root: packet.ShardRoot})
+			if origin := h.peers.peer(packet.OriginNodeID.String()); origin != nil &&
+				origin.bscExt != nil && origin.bscExt.Version() >= bsc.Bsc5 {
+				origin.bscExt.AsyncSendBlockChunkReceipt(packet.BlockHash, packet.ShardRoot)
+			}
+		}
+		return nil
+
+	case *bsc.BlockChunkReceiptPacket:
+		(*handler)(h).acknowledgeChunkReceipt(peer, packet)
 		return nil
 
 	default:
@@ -70,6 +84,12 @@ func (h *bscHandler) Handle(peer *bsc.Peer, packet bsc.Packet) error {
 // pool to the protocol handler.
 func (h *bscHandler) ChunkPool() *bsc.ChunkPool {
 	return h.chunkPool
+}
+
+// ObserveBlockChunk records another peer that supplied a valid duplicate. It
+// improves repair source diversity without forwarding the duplicate again.
+func (h *bscHandler) ObserveBlockChunk(peer *bsc.Peer, packet *bsc.BlockChunkPacket) {
+	(*handler)(h).observeChunkSource(peer, packet, false)
 }
 
 // handleVotesBroadcast is invoked from a peer's message handler when it transmits a

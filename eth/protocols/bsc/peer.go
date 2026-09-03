@@ -1,13 +1,14 @@
 package bsc
 
 import (
-	"time"
-
 	"errors"
+	"sync"
+	"time"
 
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p"
 )
@@ -33,12 +34,38 @@ const (
 
 	// the time span of one period
 	secondsPerPeriod = float64(30)
+
+	chunkQueueSize               = maxShardCount * 2
+	chunkRequestQueueSize        = 32
+	chunkReceiptQueueSize        = 64
+	chunkIngressPerSecond        = maxShardCount * 2
+	chunkIngressBytesPerSecond   = 32 * 1024 * 1024
+	chunkRepairRequestsPerSecond = 32
+	chunkRepairIndexesPerSecond  = maxShardCount * 2
 )
 
 // chunkKey uniquely identifies a single chunk of a block on the wire.
 type chunkKey struct {
 	hash  common.Hash
+	root  common.Hash
 	index uint
+	depth uint8
+	route common.Hash
+}
+
+func makeChunkKey(pkt *BlockChunkPacket) chunkKey {
+	route := make([]byte, 1, 1+len(pkt.RelayTargets)*len(common.Hash{}))
+	route[0] = pkt.RelayDepth
+	for _, target := range pkt.RelayTargets {
+		route = append(route, target[:]...)
+	}
+	return chunkKey{
+		hash:  pkt.BlockHash,
+		root:  pkt.ShardRoot,
+		index: pkt.ChunkIndex,
+		depth: pkt.RelayDepth,
+		route: crypto.Keccak256Hash(route),
+	}
 }
 
 // Peer is a collection of relevant information we have about a `bsc` peer.
@@ -50,18 +77,29 @@ type Peer struct {
 	periodCounter uint                       // Votes number in the latest period
 	dispatcher    *Dispatcher                // Message request-response dispatcher
 
-	// Bsc3 block chunk propagation state.  `chunkBroadcast` queues outbound
+	// Bsc4 block chunk propagation state.  `chunkBroadcast` queues outbound
 	// chunks to be written asynchronously so the leader path never blocks on
 	// a slow peer.  `knownChunks` records chunks already sent / acknowledged
 	// to avoid redundant transfers.
-	chunkBroadcast chan *BlockChunkPacket
-	knownChunks    *knownChunkCache
+	chunkBroadcast  chan *BlockChunkPacket
+	chunkRequests   chan *GetBlockChunksPacket
+	chunkReceipts   chan *BlockChunkReceiptPacket
+	knownChunks     *knownChunkCache
+	knownReceipts   *knownChunkReceiptCache
+	chunkRateMu     sync.Mutex
+	chunkRateAt     time.Time
+	chunkRateCount  int
+	chunkRateBytes  int
+	repairRateAt    time.Time
+	repairRateCount int
+	repairRateIndex int
 
 	*p2p.Peer                   // The embedded P2P package peer
 	rw        p2p.MsgReadWriter // Input/output streams for bsc
 	version   uint              // Protocol version negotiated
 	logger    log.Logger        // Contextual logger with the peer id injected
 	term      chan struct{}     // Termination channel to stop the broadcasters
+	termOnce  sync.Once
 }
 
 // NewPeer create a wrapper for a network connection and negotiated protocol
@@ -74,8 +112,11 @@ func NewPeer(version uint, p *p2p.Peer, rw p2p.MsgReadWriter) *Peer {
 		voteBroadcast:  make(chan []*types.VoteEnvelope, voteBufferSize),
 		periodBegin:    time.Now(),
 		periodCounter:  0,
-		chunkBroadcast: make(chan *BlockChunkPacket, 64),
+		chunkBroadcast: make(chan *BlockChunkPacket, chunkQueueSize),
+		chunkRequests:  make(chan *GetBlockChunksPacket, chunkRequestQueueSize),
+		chunkReceipts:  make(chan *BlockChunkReceiptPacket, chunkReceiptQueueSize),
 		knownChunks:    newKnownChunkCache(maxKnownChunks),
+		knownReceipts:  newKnownChunkReceiptCache(maxKnownChunks),
 		Peer:           p,
 		rw:             rw,
 		version:        version,
@@ -84,7 +125,7 @@ func NewPeer(version uint, p *p2p.Peer, rw p2p.MsgReadWriter) *Peer {
 	}
 	peer.dispatcher = NewDispatcher(peer)
 	go peer.broadcastVotes()
-	if version >= Bsc3 {
+	if version >= Bsc4 {
 		go peer.broadcastChunks()
 	}
 	return peer
@@ -109,7 +150,7 @@ func (p *Peer) Log() log.Logger {
 // you created the peer yourself via NewPeer. Otherwise let whoever created it
 // clean it up!
 func (p *Peer) Close() {
-	close(p.term)
+	p.termOnce.Do(func() { close(p.term) })
 }
 
 // KnownVote returns whether peer is known to already have a vote.
@@ -180,24 +221,44 @@ func (p *Peer) broadcastVotes() {
 	}
 }
 
-// AsyncSendBlockChunk queues a block chunk for propagation to the remote peer.
-// If the peer's broadcast queue is full, the event is silently dropped.
-func (p *Peer) AsyncSendBlockChunk(pkt *BlockChunkPacket) {
-	if p.version < Bsc3 {
-		return
+// AsyncSendBlockChunk queues a Bsc4 shard. The return value reports whether it
+// was accepted by the bounded queue, allowing the caller to fall back to a
+// regular full-block broadcast when a peer is congested.
+func (p *Peer) AsyncSendBlockChunk(pkt *BlockChunkPacket) bool {
+	return p.enqueueBlockChunk(pkt, false)
+}
+
+// AsyncSendBlockChunkForce bypasses the known cache for an explicit repair
+// response. A previously sent shard may have been lost in transit.
+func (p *Peer) AsyncSendBlockChunkForce(pkt *BlockChunkPacket) bool {
+	return p.enqueueBlockChunk(pkt, true)
+}
+
+func (p *Peer) enqueueBlockChunk(pkt *BlockChunkPacket, force bool) bool {
+	if p == nil || pkt == nil || p.version < Bsc4 {
+		return false
 	}
-	if p.knownChunks.contains(chunkKey{hash: pkt.BlockHash, index: pkt.ChunkIndex}) {
-		return
+	select {
+	case <-p.term:
+		return false
+	default:
+	}
+	key := makeChunkKey(pkt)
+	if !force && p.knownChunks.contains(key) {
+		return true
 	}
 	select {
 	case p.chunkBroadcast <- pkt:
-		p.knownChunks.add(chunkKey{hash: pkt.BlockHash, index: pkt.ChunkIndex})
+		p.knownChunks.add(key)
+		return true
 	case <-p.term:
 		p.Log().Debug("Dropping chunk propagation for closed peer", "hash", pkt.BlockHash, "index", pkt.ChunkIndex)
 		BlockChunkShardDropMeter.Mark(1)
+		return false
 	default:
-		p.Log().Debug("Dropping chunk propagation for abnormal peer", "hash", pkt.BlockHash, "index", pkt.ChunkIndex)
+		p.Log().Debug("Dropping chunk propagation for full peer queue", "hash", pkt.BlockHash, "index", pkt.ChunkIndex)
 		BlockChunkShardDropMeter.Mark(1)
+		return false
 	}
 }
 
@@ -218,28 +279,125 @@ func (p *Peer) broadcastChunks() {
 		select {
 		case pkt := <-p.chunkBroadcast:
 			if err := p.sendBlockChunk(pkt); err != nil {
+				p.Close()
 				return
 			}
 			p.Log().Trace("Sent block chunk", "hash", pkt.BlockHash, "index", pkt.ChunkIndex, "total", pkt.ChunkCount)
+		case req := <-p.chunkRequests:
+			if err := p2p.Send(p.rw, GetBlockChunksMsg, req); err != nil {
+				p.Close()
+				return
+			}
+		case receipt := <-p.chunkReceipts:
+			if err := p2p.Send(p.rw, BlockChunkReceiptMsg, receipt); err != nil {
+				p.Close()
+				return
+			}
 		case <-p.term:
 			return
 		}
 	}
 }
 
-// RequestMissingChunks requests the missing chunks for a block from the remote
-// peer using the Bsc3 GetBlockChunks message.  This is a best-effort fire-and-
+// RequestMissingChunks requests the missing shards for a block from the remote
+// peer using the Bsc4 GetBlockChunks message. This is a best-effort fire-and-
 // forget call: it does not block waiting for a response.  The reply arrives as
 // regular BlockChunkMsg packets which are handled by the message handler.
-func (p *Peer) RequestMissingChunks(blockHash common.Hash, indexes []uint) error {
-	if p.version < Bsc3 {
-		return errors.New("peer does not support Bsc3 chunk protocol")
+func (p *Peer) RequestMissingChunks(blockHash, shardRoot common.Hash, indexes []uint) error {
+	if p == nil || p.version < Bsc4 {
+		return errors.New("peer does not support Bsc4 chunk protocol")
 	}
-	BlockChunkMissingReqMeter.Mark(int64(len(indexes)))
-	return p2p.Send(p.rw, GetBlockChunksMsg, &GetBlockChunksPacket{
+	if shardRoot == (common.Hash{}) || len(indexes) == 0 || len(indexes) > MaxBlockChunkRequestIndexes {
+		return errors.New("invalid missing chunk request")
+	}
+	req := &GetBlockChunksPacket{
 		BlockHash:      blockHash,
-		MissingIndexes: indexes,
-	})
+		ShardRoot:      shardRoot,
+		MissingIndexes: append([]uint(nil), indexes...),
+	}
+	select {
+	case <-p.term:
+		return errors.New("peer is closed")
+	default:
+	}
+	select {
+	case p.chunkRequests <- req:
+		BlockChunkMissingReqMeter.Mark(int64(len(indexes)))
+		return nil
+	case <-p.term:
+		return errors.New("peer is closed")
+	default:
+		return errors.New("chunk repair request queue is full")
+	}
+}
+
+// AsyncSendBlockChunkReceipt confirms a usable Bsc5 encoding to its producer.
+// The receipt is deliberately bounded and deduplicated for the lifetime of the
+// authenticated peer connection; repeated confirmation of the same block/root
+// is idempotent on that connection.
+func (p *Peer) AsyncSendBlockChunkReceipt(blockHash, shardRoot common.Hash) bool {
+	if p == nil || p.version < Bsc5 || blockHash == (common.Hash{}) || shardRoot == (common.Hash{}) {
+		return false
+	}
+	select {
+	case <-p.term:
+		return false
+	default:
+	}
+	key := chunkReceiptKey{hash: blockHash, root: shardRoot}
+	if p.knownReceipts.contains(key) {
+		return true
+	}
+	select {
+	case p.chunkReceipts <- &BlockChunkReceiptPacket{BlockHash: blockHash, ShardRoot: shardRoot}:
+		p.knownReceipts.add(key)
+		return true
+	case <-p.term:
+		return false
+	default:
+		return false
+	}
+}
+
+func (p *Peer) allowChunkIngress(bytes int) bool {
+	p.chunkRateMu.Lock()
+	defer p.chunkRateMu.Unlock()
+	if bytes < 0 {
+		return false
+	}
+	now := time.Now()
+	if p.chunkRateAt.IsZero() || now.Sub(p.chunkRateAt) >= time.Second {
+		p.chunkRateAt = now
+		p.chunkRateCount = 0
+		p.chunkRateBytes = 0
+	}
+	if p.chunkRateCount >= chunkIngressPerSecond || p.chunkRateBytes > chunkIngressBytesPerSecond-bytes {
+		return false
+	}
+	p.chunkRateCount++
+	p.chunkRateBytes += bytes
+	return true
+}
+
+func (p *Peer) allowChunkRepairRequest(indexes int) bool {
+	p.chunkRateMu.Lock()
+	defer p.chunkRateMu.Unlock()
+	if indexes <= 0 {
+		return false
+	}
+	now := time.Now()
+	if p.repairRateAt.IsZero() || now.Sub(p.repairRateAt) >= time.Second {
+		p.repairRateAt = now
+		p.repairRateCount = 0
+		p.repairRateIndex = 0
+	}
+	if p.repairRateCount >= chunkRepairRequestsPerSecond ||
+		p.repairRateIndex > chunkRepairIndexesPerSecond-indexes {
+		return false
+	}
+	p.repairRateCount++
+	p.repairRateIndex += indexes
+	return true
 }
 
 // knownCache is a cache for known hashes.
@@ -275,6 +433,36 @@ func (k *knownCache) contains(hash common.Hash) bool {
 type knownChunkCache struct {
 	keys mapset.Set[chunkKey]
 	max  int
+}
+
+type chunkReceiptKey struct {
+	hash common.Hash
+	root common.Hash
+}
+
+type knownChunkReceiptCache struct {
+	keys mapset.Set[chunkReceiptKey]
+	max  int
+}
+
+func newKnownChunkReceiptCache(max int) *knownChunkReceiptCache {
+	return &knownChunkReceiptCache{
+		max:  max,
+		keys: mapset.NewSet[chunkReceiptKey](),
+	}
+}
+
+func (k *knownChunkReceiptCache) add(keys ...chunkReceiptKey) {
+	for k.keys.Cardinality() > max(0, k.max-len(keys)) {
+		k.keys.Pop()
+	}
+	for _, key := range keys {
+		k.keys.Add(key)
+	}
+}
+
+func (k *knownChunkReceiptCache) contains(key chunkReceiptKey) bool {
+	return k.keys.Contains(key)
 }
 
 // newKnownChunkCache creates a new knownChunkCache with a max capacity.

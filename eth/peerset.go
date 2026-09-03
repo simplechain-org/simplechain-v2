@@ -328,6 +328,15 @@ func (ps *peerSet) peer(id string) *ethPeer {
 	return ps.peers[id]
 }
 
+func (ps *peerSet) setValidatorNodeIDsMap(validatorNodeIDsMap map[common.Address][]enode.ID) {
+	if validatorNodeIDsMap == nil {
+		return
+	}
+	ps.lock.Lock()
+	ps.validatorNodeIDsMap = validatorNodeIDsMap
+	ps.lock.Unlock()
+}
+
 // enableEVNFeatures enables the given features for the given peers.
 func (ps *peerSet) enableEVNFeatures(validatorNodeIDsMap map[common.Address][]enode.ID, evnWhitelistMap map[enode.ID]struct{}) {
 	// clone current all peers, and update the validatorNodeIDsMap

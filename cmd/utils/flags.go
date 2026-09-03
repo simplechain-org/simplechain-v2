@@ -53,6 +53,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/eth/filters"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
+	"github.com/ethereum/go-ethereum/eth/protocols/bsc"
 	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/remotedb"
@@ -110,12 +111,17 @@ var (
 	}
 	BlockChunkEnableFlag = &cli.BoolFlag{
 		Name:     "blockchunk",
-		Usage:    "Enable Bsc3 block chunk propagation for large blocks (distributes big blocks as chunks via a fanout tree among EVN peers)",
+		Usage:    "Enable originating authenticated Bsc4 chunks for large blocks (requires EnableEVNFeatures; all Bsc4 nodes keep bounded receive/relay support)",
 		Category: flags.EthCategory,
 	}
 	BlockChunkThresholdFlag = &cli.IntFlag{
 		Name:     "blockchunk.threshold",
 		Usage:    "Minimum RLP-encoded block body size in bytes to trigger chunk propagation (0 = use default 512KB)",
+		Category: flags.EthCategory,
+	}
+	BlockChunkParityShardsFlag = &cli.IntFlag{
+		Name:     "blockchunk.parity",
+		Usage:    "Number of Reed-Solomon parity shards for Bsc4 block propagation (0 = use default 4; must leave capacity above blockchunk.threshold)",
 		Category: flags.EthCategory,
 	}
 	DisableSnapProtocolFlag = &cli.BoolFlag{
@@ -2090,6 +2096,15 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	}
 	if ctx.IsSet(BlockChunkThresholdFlag.Name) {
 		cfg.BlockChunkThreshold = ctx.Int(BlockChunkThresholdFlag.Name)
+	}
+	if ctx.IsSet(BlockChunkParityShardsFlag.Name) {
+		cfg.BlockChunkParityShards = ctx.Int(BlockChunkParityShardsFlag.Name)
+	}
+	if err := bsc.ValidateChunkConfig(bsc.ChunkConfig{
+		Threshold:    cfg.BlockChunkThreshold,
+		ParityShards: cfg.BlockChunkParityShards,
+	}); err != nil {
+		Fatalf("invalid block chunk configuration: %v", err)
 	}
 	if ctx.IsSet(CacheNoPrefetchFlag.Name) {
 		cfg.NoPrefetch = ctx.Bool(CacheNoPrefetchFlag.Name)
